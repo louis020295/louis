@@ -25,6 +25,10 @@ import { RadarDatabase } from '../server/db/RadarDatabase.ts';
 import { BacktestEngine } from '../server/engine/BacktestEngine.ts';
 import { evaluateCrossExchangeDivergence } from '../server/engine/CrossExchangeDivergenceEngine.ts';
 import {
+  classifyFromExchangeFields,
+  InstrumentIdentity,
+} from '../server/engine/InstrumentIdentity.ts';
+import {
   LOW_LIQUIDITY_POLICY,
   MAX_ALLOWED_SPREAD_PERCENT,
   MIN_QUOTE_VOLUME_24H,
@@ -910,6 +914,12 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
             nextFundingTime: Date.now(),
             openInterest: 1_000_000,
             openInterestValue: 200_000_000,
+            instrument: {
+              assetClass: 'crypto',
+              underlying: 'SOL',
+              symbolType: 'COIN',
+              metadataAvailable: true,
+            },
             provenance: binanceProv,
           },
         ],
@@ -933,6 +943,12 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
             nextFundingTime: Date.now(),
             openInterest: 800_000,
             openInterestValue: 160_960_000,
+            instrument: {
+              assetClass: 'crypto',
+              underlying: 'SOL',
+              symbolType: 'crypto',
+              metadataAvailable: true,
+            },
             provenance: bybitProv,
           },
         ],
@@ -956,6 +972,12 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
             nextFundingTime: Date.now(),
             openInterest: 300_000,
             openInterestValue: 59_940_000,
+            instrument: {
+              assetClass: 'crypto',
+              underlying: 'SOL',
+              symbolType: 'COIN',
+              metadataAvailable: true,
+            },
             provenance: bingxProv,
           },
         ],
@@ -980,6 +1002,157 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
     assert.equal(sol.legs.binance_usdm.provenance.isDemo, false);
     assert.equal(sol.legs.bybit_linear.provenance.isDemo, false);
     assert.equal(sol.legs.bingx_swap.provenance.isDemo, false);
+    assert.equal(sol.legs.bybit_linear.comparisonIncluded, true);
+  });
+
+  it('Bybit 股票永續 ONUSDT 不與 Binance/BingX 加密 ON 比較（mock 身分，非即時端點）', () => {
+    const cryptoOn = {
+      assetClass: 'crypto' as const,
+      underlying: 'ON',
+      symbolType: 'COIN',
+      metadataAvailable: true,
+    };
+    const stockOn = classifyFromExchangeFields({
+      symbolType: 'stock',
+      underlying: 'ON Semiconductor Corp',
+      baseAsset: 'ON',
+    });
+    assert.equal(stockOn.assetClass, 'tradfi');
+    assert.equal(stockOn.metadataAvailable, true);
+    assert.equal(
+      classifyFromExchangeFields({
+        underlyingType: 'COIN',
+        underlyingSubType: ['Layer-1'],
+        baseAsset: 'ON',
+      }).assetClass,
+      'crypto'
+    );
+    assert.equal(
+      classifyFromExchangeFields({ baseAsset: 'ON', underlying: 'ON' })
+        .metadataAvailable,
+      false
+    );
+
+    const prov = (source: string): DataProvenance => ({
+      source,
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [],
+      isDemo: false,
+    });
+    const leg = (
+      symbol: string,
+      price: number,
+      instrument: InstrumentIdentity
+    ) => ({
+      symbol,
+      baseAsset: 'ON',
+      quoteAsset: 'USDT',
+      lastPrice: price,
+      bidPrice: price - 0.01,
+      askPrice: price + 0.01,
+      priceChangePercent24h: 1,
+      quoteVolume24h: 1_000_000,
+      fundingRate: 0.0001,
+      nextFundingTime: Date.now(),
+      openInterest: 10,
+      openInterestValue: price * 10,
+      instrument,
+      provenance: prov('mock'),
+    });
+
+    const divRes = evaluateCrossExchangeDivergence({
+      binance_usdm: {
+        exchange: 'binance_usdm',
+        displayName: 'Binance',
+        available: true,
+        provenance: prov('binance'),
+        tickers: [leg('ONUSDT', 0.1896, cryptoOn)],
+      },
+      bybit_linear: {
+        exchange: 'bybit_linear',
+        displayName: 'Bybit',
+        available: true,
+        provenance: prov('bybit'),
+        tickers: [leg('ONUSDT', 63.21, stockOn)],
+      },
+      bingx_swap: {
+        exchange: 'bingx_swap',
+        displayName: 'BingX',
+        available: true,
+        provenance: prov('bingx'),
+        tickers: [leg('ONUSDT', 0.1883, cryptoOn)],
+      },
+    });
+
+    assert.equal(divRes.items.length, 1);
+    const on = divRes.items[0];
+    assert.equal(on.legs.bybit_linear.comparisonIncluded, false);
+    assert.equal(on.legs.bybit_linear.assetClass, 'tradfi');
+    assert.equal(on.legs.bybit_linear.underlying, 'ON Semiconductor Corp');
+    assert.equal(on.legs.binance_usdm.comparisonIncluded, true);
+    assert.equal(on.legs.bingx_swap.comparisonIncluded, true);
+    assert.ok(
+      on.priceDivergencePercent !== null && on.priceDivergencePercent < 1
+    );
+    assert.ok(
+      on.divergenceFlags.some((flag) => flag.includes('標的類型不同'))
+    );
+    assert.ok(!on.maxPriceExchange || on.maxPriceExchange !== 'bybit_linear');
+  });
+
+  it('缺少交易所中繼資料時標成未驗證，不計算跨所價差（mock）', () => {
+    const prov: DataProvenance = {
+      source: 'mock',
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [],
+      isDemo: false,
+    };
+    const bare = (price: number) => ({
+      symbol: 'ONUSDT',
+      baseAsset: 'ON',
+      quoteAsset: 'USDT',
+      lastPrice: price,
+      bidPrice: price,
+      askPrice: price,
+      priceChangePercent24h: 0,
+      quoteVolume24h: 1,
+      fundingRate: 0.0001,
+      nextFundingTime: Date.now(),
+      openInterest: null,
+      openInterestValue: null,
+      provenance: prov,
+    });
+    const divRes = evaluateCrossExchangeDivergence({
+      binance_usdm: {
+        exchange: 'binance_usdm',
+        displayName: 'Binance',
+        available: true,
+        provenance: prov,
+        tickers: [bare(0.19)],
+      },
+      bybit_linear: {
+        exchange: 'bybit_linear',
+        displayName: 'Bybit',
+        available: true,
+        provenance: prov,
+        tickers: [bare(63.21)],
+      },
+      bingx_swap: {
+        exchange: 'bingx_swap',
+        displayName: 'BingX',
+        available: false,
+        provenance: prov,
+        tickers: [],
+      },
+    });
+    assert.equal(divRes.items.length, 1);
+    assert.equal(divRes.items[0].priceDivergencePercent, null);
+    assert.equal(divRes.items[0].legs.binance_usdm.assetClass, 'unverified');
+    assert.equal(divRes.items[0].legs.bybit_linear.comparisonIncluded, false);
   });
 });
 

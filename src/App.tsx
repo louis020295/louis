@@ -64,6 +64,27 @@ type ActiveSection =
 const WATCHLIST_STORAGE_KEY = 'crypto_radar_watchlist_v1';
 const THEME_STORAGE_KEY = 'crypto_radar_theme_v1';
 
+function legAssetLabel(leg: {
+  available: boolean;
+  assetClass?: 'crypto' | 'tradfi' | 'unverified';
+  underlying?: string | null;
+  symbolType?: string | null;
+  comparisonIncluded?: boolean;
+}): string | null {
+  if (!leg.available) return null;
+  const kind =
+    leg.assetClass === 'tradfi'
+      ? 'TradFi'
+      : leg.assetClass === 'crypto'
+        ? 'Crypto'
+        : '未驗證';
+  const parts = [kind];
+  if (leg.underlying) parts.push(leg.underlying);
+  if (leg.symbolType) parts.push(leg.symbolType);
+  if (leg.comparisonIncluded === false) parts.push('不納入價差');
+  return parts.join(' · ');
+}
+
 export default function App() {
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>(() => {
     try {
@@ -6411,6 +6432,11 @@ export default function App() {
                               {b.available && b.lastPrice !== null ? (
                                 <>
                                   <div>${formatPriceDynamic(b.lastPrice)}</div>
+                                  {legAssetLabel(b) && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {legAssetLabel(b)}
+                                    </div>
+                                  )}
                                   <div className="text-[10px] text-slate-400">
                                     F:{' '}
                                     {b.fundingRate !== null
@@ -6430,6 +6456,11 @@ export default function App() {
                               {y.available && y.lastPrice !== null ? (
                                 <>
                                   <div>${formatPriceDynamic(y.lastPrice)}</div>
+                                  {legAssetLabel(y) && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {legAssetLabel(y)}
+                                    </div>
+                                  )}
                                   <div className="text-[10px] text-slate-400">
                                     F:{' '}
                                     {y.fundingRate !== null
@@ -6449,6 +6480,11 @@ export default function App() {
                               {x.available && x.lastPrice !== null ? (
                                 <>
                                   <div>${formatPriceDynamic(x.lastPrice)}</div>
+                                  {legAssetLabel(x) && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {legAssetLabel(x)}
+                                    </div>
+                                  )}
                                   <div className="text-[10px] text-slate-400">
                                     F:{' '}
                                     {x.fundingRate !== null
