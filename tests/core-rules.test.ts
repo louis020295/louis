@@ -13,6 +13,8 @@ import {
   fetchWithResilience,
   generateDeterministicHistoricalOiAndFunding,
   generateDeterministicSmcKlines,
+  resetSharedHttpLimiter,
+  sharedHttpBudget,
   SlidingWindowRateLimiter,
 } from '../server/adapters/ExchangeAdapter.ts';
 import {
@@ -1175,6 +1177,218 @@ describe('5. 斷線重試、Rate Limit、Timeout 與 API Failure 測試 (Failure
       }
     );
     assert.equal(calls, 2);
+  });
+
+  it('共享限制器計算每一次真實 HTTP，超額時不再送出（mock）', async () => {
+    resetSharedHttpLimiter({
+      enabled: true,
+      maxRequestsPerWindow: 2,
+      windowMs: 60_000,
+    });
+    let calls = 0;
+    const mockFetch: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    try {
+      await fetchWithResilience({
+        endpoints: ['https://example.test'],
+        path: '/a',
+        sourceLabel: 'LIMIT_A',
+        maxRetriesPerEndpoint: 0,
+        customFetch: mockFetch,
+      });
+      await fetchWithResilience({
+        endpoints: ['https://example.test'],
+        path: '/b',
+        sourceLabel: 'LIMIT_B',
+        maxRetriesPerEndpoint: 0,
+        customFetch: mockFetch,
+      });
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://example.test'],
+            path: '/c',
+            sourceLabel: 'LIMIT_C',
+            maxRetriesPerEndpoint: 2,
+            retryBaseDelayMs: 5,
+            customFetch: mockFetch,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.statusCode, 429);
+          assert.equal(err.isRateLimited, true);
+          assert.match(err.message, /共享請求預算已滿/);
+          return true;
+        }
+      );
+      assert.equal(calls, 2);
+      assert.equal(sharedHttpBudget.requestCount, 2);
+    } finally {
+      resetSharedHttpLimiter();
+    }
+  });
+
+  it('HTTP 451 與地區封鎖 403 不重試、不改打備援 host（mock）', async () => {
+    resetSharedHttpLimiter();
+    let calls = 0;
+    const blocked: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          msg: "Service unavailable from a restricted location according to 'b. Eligibility'",
+        }),
+        { status: 451 }
+      );
+    };
+    try {
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: [
+              'https://fapi.binance.com',
+              'https://fapi1.binance.com',
+            ],
+            path: '/fapi/v1/ticker/24hr',
+            sourceLabel: 'Binance USDⓈ-M Futures REST',
+            maxRetriesPerEndpoint: 3,
+            retryBaseDelayMs: 5,
+            customFetch: blocked,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.statusCode, 451);
+          assert.match(err.message, /HTTP 451/);
+          assert.match(err.message, /https:\/\/fapi\.binance\.com/);
+          return true;
+        }
+      );
+      assert.equal(calls, 1);
+    } finally {
+      resetSharedHttpLimiter();
+    }
+  });
+
+  it('Bybit 403 access too frequent 視為限流並進入約 10 分鐘冷卻，後續請求不再送出（mock）', async () => {
+    resetSharedHttpLimiter({ bybitBanCooldownMs: 10 * 60 * 1000 });
+    let calls = 0;
+    const banned: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response('403, access too frequent', { status: 403 });
+    };
+    try {
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://api.bybit.com', 'https://api.bytick.com'],
+            path: '/v5/market/tickers?category=linear',
+            sourceLabel: 'Bybit V5 Linear REST',
+            maxRetriesPerEndpoint: 2,
+            retryBaseDelayMs: 5,
+            customFetch: banned,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.statusCode, 403);
+          assert.equal(err.isRateLimited, true);
+          assert.match(err.message, /access too frequent/);
+          return true;
+        }
+      );
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://api.bybit.com'],
+            path: '/v5/market/kline',
+            sourceLabel: 'Bybit V5 Linear REST',
+            maxRetriesPerEndpoint: 1,
+            customFetch: banned,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.match(err.message, /Bybit access too frequent cooldown/);
+          return true;
+        }
+      );
+      assert.equal(calls, 1);
+    } finally {
+      resetSharedHttpLimiter();
+    }
+  });
+
+  it('Retry-After 超過上限時不在請求內空等，並保留標頭秒數；Binance 權重標頭會暫停後續 Binance 請求（mock）', async () => {
+    resetSharedHttpLimiter({
+      maxRetryAfterMs: 1000,
+      binanceWeightSoftLimit: 1800,
+      binanceWeightCooldownMs: 60_000,
+      maxRequestsPerWindow: 50,
+    });
+    let calls = 0;
+    const limited: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response('slow down', {
+        status: 429,
+        headers: { 'Retry-After': '120' },
+      });
+    };
+    try {
+      const started = Date.now();
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://fapi.binance.com'],
+            path: '/fapi/v1/klines',
+            sourceLabel: 'Binance USDⓈ-M Futures REST',
+            maxRetriesPerEndpoint: 3,
+            retryBaseDelayMs: 5,
+            customFetch: limited,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.isRateLimited, true);
+          assert.match(err.message, /Retry-After 120/);
+          return true;
+        }
+      );
+      assert.ok(Date.now() - started < 500);
+      assert.equal(calls, 1);
+
+      calls = 0;
+      const weighted: typeof globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'X-MBX-USED-WEIGHT-1M': '1800' },
+        });
+      };
+      await fetchWithResilience({
+        endpoints: ['https://fapi.binance.com'],
+        path: '/fapi/v1/premiumIndex',
+        sourceLabel: 'Binance USDⓈ-M Futures REST',
+        maxRetriesPerEndpoint: 0,
+        customFetch: weighted,
+      });
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://fapi.binance.com'],
+            path: '/fapi/v1/ticker/24hr',
+            sourceLabel: 'Binance USDⓈ-M Futures REST',
+            maxRetriesPerEndpoint: 1,
+            customFetch: weighted,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.match(err.message, /X-MBX-USED-WEIGHT-1M/);
+          return true;
+        }
+      );
+      assert.equal(calls, 1);
+    } finally {
+      resetSharedHttpLimiter();
+    }
   });
 });
 

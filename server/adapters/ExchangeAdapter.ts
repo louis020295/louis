@@ -43,6 +43,205 @@ export class ExchangeApiUnavailableError extends Error {
   }
 }
 
+export interface SharedHttpLimiterConfig {
+  enabled: boolean;
+  maxRequestsPerWindow: number;
+  windowMs: number;
+  binanceWeightSoftLimit: number;
+  binanceWeightCooldownMs: number;
+  bybitBanCooldownMs: number;
+  maxRetryAfterMs: number;
+}
+
+function positiveEnvNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function defaultSharedHttpLimiterConfig(): SharedHttpLimiterConfig {
+  return {
+    enabled: true,
+    maxRequestsPerWindow: positiveEnvNumber('RADAR_HTTP_MAX_REQUESTS', 80),
+    windowMs: positiveEnvNumber('RADAR_HTTP_WINDOW_MS', 10_000),
+    binanceWeightSoftLimit: positiveEnvNumber(
+      'RADAR_BINANCE_WEIGHT_SOFT_LIMIT',
+      1800
+    ),
+    binanceWeightCooldownMs: positiveEnvNumber(
+      'RADAR_BINANCE_WEIGHT_COOLDOWN_MS',
+      15_000
+    ),
+    bybitBanCooldownMs: positiveEnvNumber(
+      'RADAR_BYBIT_BAN_COOLDOWN_MS',
+      10 * 60 * 1000
+    ),
+    maxRetryAfterMs: positiveEnvNumber('RADAR_HTTP_MAX_RETRY_AFTER_MS', 30_000),
+  };
+}
+
+/**
+ * 全程序共用的對外 HTTP 預算。SMC 佇列、Paper 影子監控、背景排程與跨所請求
+ * 都經過 fetchWithResilience，因此每一次真正送出的請求都記在這裡。
+ */
+export class SharedHttpBudget {
+  private timestamps: number[] = [];
+  private bybitBanUntilMs = 0;
+  private binanceWeightPauseUntilMs = 0;
+  public config: SharedHttpLimiterConfig;
+
+  constructor(config?: Partial<SharedHttpLimiterConfig>) {
+    this.config = { ...defaultSharedHttpLimiterConfig(), ...config };
+  }
+
+  public configure(partial: Partial<SharedHttpLimiterConfig>): void {
+    this.config = { ...this.config, ...partial };
+  }
+
+  public reset(partial?: Partial<SharedHttpLimiterConfig>): void {
+    this.timestamps = [];
+    this.bybitBanUntilMs = 0;
+    this.binanceWeightPauseUntilMs = 0;
+    this.config = { ...defaultSharedHttpLimiterConfig(), ...partial };
+  }
+
+  public reserve(
+    host: string,
+    now = Date.now()
+  ): { allowed: boolean; retryAfterMs: number; reason: string } {
+    if (!this.config.enabled) {
+      return { allowed: true, retryAfterMs: 0, reason: '' };
+    }
+    const hostLc = host.toLowerCase();
+    if (
+      (hostLc.includes('bybit') || hostLc.includes('bytick')) &&
+      now < this.bybitBanUntilMs
+    ) {
+      return {
+        allowed: false,
+        retryAfterMs: this.bybitBanUntilMs - now,
+        reason: 'Bybit access too frequent cooldown',
+      };
+    }
+    if (hostLc.includes('binance') && now < this.binanceWeightPauseUntilMs) {
+      return {
+        allowed: false,
+        retryAfterMs: this.binanceWeightPauseUntilMs - now,
+        reason: 'Binance X-MBX-USED-WEIGHT-1M soft limit',
+      };
+    }
+    this.timestamps = this.timestamps.filter(
+      (t) => now - t < this.config.windowMs
+    );
+    if (this.timestamps.length >= this.config.maxRequestsPerWindow) {
+      const oldest = this.timestamps[0];
+      return {
+        allowed: false,
+        retryAfterMs: Math.max(10, this.config.windowMs - (now - oldest)),
+        reason: `${this.config.maxRequestsPerWindow} req / ${this.config.windowMs}ms`,
+      };
+    }
+    this.timestamps.push(now);
+    return { allowed: true, retryAfterMs: 0, reason: '' };
+  }
+
+  public noteBybitBan(now = Date.now()): void {
+    this.bybitBanUntilMs = Math.max(
+      this.bybitBanUntilMs,
+      now + this.config.bybitBanCooldownMs
+    );
+  }
+
+  public noteBinanceUsedWeight(usedWeight: number, now = Date.now()): void {
+    if (
+      Number.isFinite(usedWeight) &&
+      usedWeight >= this.config.binanceWeightSoftLimit
+    ) {
+      this.binanceWeightPauseUntilMs = Math.max(
+        this.binanceWeightPauseUntilMs,
+        now + this.config.binanceWeightCooldownMs
+      );
+    }
+  }
+
+  public get requestCount(): number {
+    return this.timestamps.length;
+  }
+}
+
+export const sharedHttpBudget = new SharedHttpBudget();
+
+export function configureSharedHttpLimiter(
+  partial: Partial<SharedHttpLimiterConfig>
+): void {
+  sharedHttpBudget.configure(partial);
+}
+
+export function resetSharedHttpLimiter(
+  partial?: Partial<SharedHttpLimiterConfig>
+): void {
+  sharedHttpBudget.reset(partial);
+}
+
+function hostLooksBinance(host: string): boolean {
+  return host.toLowerCase().includes('binance');
+}
+
+function readBinanceUsedWeight(headers: {
+  get?: (name: string) => string | null;
+}): number | null {
+  const raw =
+    headers?.get?.('x-mbx-used-weight-1m') ??
+    headers?.get?.('X-MBX-USED-WEIGHT-1M');
+  if (raw == null || raw === '') return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseRetryAfterMs(
+  headers: { get?: (name: string) => string | null },
+  capMs: number,
+  fallbackMs: number,
+  now = Date.now()
+): { waitMs: number; exceededCap: boolean; header: string | null } {
+  const header = headers?.get?.('retry-after') ?? null;
+  if (header == null || header.trim() === '') {
+    return { waitMs: fallbackMs, exceededCap: false, header };
+  }
+  const asSeconds = Number(header);
+  let ms = Number.NaN;
+  if (Number.isFinite(asSeconds) && asSeconds >= 0) {
+    ms = asSeconds * 1000;
+  } else {
+    const dateMs = Date.parse(header);
+    if (Number.isFinite(dateMs)) ms = Math.max(0, dateMs - now);
+  }
+  if (!Number.isFinite(ms)) {
+    return { waitMs: fallbackMs, exceededCap: false, header };
+  }
+  if (ms > capMs) {
+    return { waitMs: ms, exceededCap: true, header };
+  }
+  return { waitMs: ms, exceededCap: false, header };
+}
+
+function isGeoBlockedStatus(status: number, body: string): boolean {
+  if (status === 451) return true;
+  if (status !== 403) return false;
+  const text = body.toLowerCase();
+  if (text.includes('access too frequent')) return false;
+  return (
+    text.includes('restricted location') ||
+    text.includes('block access from your country') ||
+    (text.includes('cloudfront') && text.includes('country'))
+  );
+}
+
+function isBybitAccessTooFrequent(status: number, body: string): boolean {
+  return status === 403 && /access too frequent/i.test(body);
+}
+
 export class SlidingWindowRateLimiter {
   private readonly timestamps: number[] = [];
   private readonly maxRequests: number;
@@ -107,17 +306,22 @@ export async function fetchWithResilience<T>(
   let totalRetries = 0;
   let sawTimeout = false;
   let sawRateLimit = false;
+  let stopAllEndpoints = false;
 
-  for (let epIdx = 0; epIdx < endpoints.length; epIdx++) {
+  for (let epIdx = 0; epIdx < endpoints.length && !stopAllEndpoints; epIdx++) {
     const base = endpoints[epIdx].replace(/\/$/, '');
     const url = `${base}${path}`;
+    let skipBackoff = false;
 
     for (let attempt = 0; attempt <= maxRetriesPerEndpoint; attempt++) {
       if (attempt > 0) {
         totalRetries++;
-        const delay = retryBaseDelayMs * Math.pow(2, attempt - 1);
-        await new Promise((r) => setTimeout(r, delay));
+        if (!skipBackoff) {
+          const delay = retryBaseDelayMs * Math.pow(2, attempt - 1);
+          await new Promise((r) => setTimeout(r, delay));
+        }
       }
+      skipBackoff = false;
 
       if (rateLimiter) {
         rateLimiter.checkAndRecord(`${sourceLabel} (${base})`);
@@ -127,6 +331,21 @@ export async function fetchWithResilience<T>(
       const timer = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
+        const slot = sharedHttpBudget.reserve(base);
+        if (!slot.allowed) {
+          sawRateLimit = true;
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP 429 ${base} 共享請求預算已滿 (${slot.reason})，${slot.retryAfterMs}ms 後再試`,
+            base,
+            429,
+            {
+              retryAttempts: totalRetries,
+              isRateLimited: true,
+              doNotRetry: true,
+            }
+          );
+        }
+
         const res = await customFetch(url, {
           signal: controller.signal,
           redirect: 'manual',
@@ -136,6 +355,10 @@ export async function fetchWithResilience<T>(
           },
         });
         clearTimeout(timer);
+        const usedWeight = readBinanceUsedWeight(res.headers);
+        if (usedWeight !== null && hostLooksBinance(base)) {
+          sharedHttpBudget.noteBinanceUsedWeight(usedWeight);
+        }
 
         if (res.status >= 300 && res.status < 400) {
           const location = res.headers?.get?.('location') || '';
@@ -152,27 +375,65 @@ export async function fetchWithResilience<T>(
           );
         }
 
-        if (res.status === 429) {
+        if (res.status === 429 || res.status === 418) {
           sawRateLimit = true;
-          lastStatusCode = 429;
+          lastStatusCode = res.status;
           const text = await res.text().catch(() => '');
-          lastError = new ExchangeApiUnavailableError(
-            `${sourceLabel} HTTP 429 ${base} Rate Limited: ${text.slice(0, 120) || 'Too Many Requests'}`,
-            base,
-            429,
-            {
+          const parsed = parseRetryAfterMs(
+            res.headers,
+            sharedHttpBudget.config.maxRetryAfterMs,
+            retryBaseDelayMs * Math.pow(2, attempt)
+          );
+          const message = `${sourceLabel} HTTP ${res.status} ${base} Rate Limited (Retry-After ${parsed.header ?? 'n/a'}): ${text.slice(0, 80) || 'Too Many Requests'}`;
+          if (parsed.exceededCap || attempt >= maxRetriesPerEndpoint) {
+            lastError = new ExchangeApiUnavailableError(message, base, res.status, {
               retryAttempts: totalRetries,
               isRateLimited: true,
-              isTimeout: false,
-            }
-          );
-          // Retry on 429 if attempts remain
+              doNotRetry: true,
+            });
+            break;
+          }
+          lastError = new ExchangeApiUnavailableError(message, base, res.status, {
+            retryAttempts: totalRetries,
+            isRateLimited: true,
+          });
+          if (parsed.waitMs > 0) {
+            await new Promise((r) => setTimeout(r, parsed.waitMs));
+          }
+          skipBackoff = true;
           continue;
         }
 
         if (!res.ok) {
           lastStatusCode = res.status;
           const text = await res.text().catch(() => '');
+          if (isGeoBlockedStatus(res.status, text)) {
+            stopAllEndpoints = true;
+            throw new ExchangeApiUnavailableError(
+              `${sourceLabel} HTTP ${res.status} ${base}: ${text.slice(0, 140) || res.statusText}`,
+              base,
+              res.status,
+              {
+                retryAttempts: totalRetries,
+                doNotRetry: true,
+              }
+            );
+          }
+          if (isBybitAccessTooFrequent(res.status, text)) {
+            sharedHttpBudget.noteBybitBan();
+            stopAllEndpoints = true;
+            sawRateLimit = true;
+            throw new ExchangeApiUnavailableError(
+              `${sourceLabel} HTTP 403 ${base} access too frequent（Bybit IP 限制，冷卻 ${sharedHttpBudget.config.bybitBanCooldownMs}ms）`,
+              base,
+              403,
+              {
+                retryAttempts: totalRetries,
+                isRateLimited: true,
+                doNotRetry: true,
+              }
+            );
+          }
           const terminalClientError = res.status < 500;
           lastError = new ExchangeApiUnavailableError(
             `${sourceLabel} HTTP ${res.status} ${base}: ${text.slice(0, 140) || res.statusText}`,

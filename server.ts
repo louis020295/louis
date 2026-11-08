@@ -364,9 +364,13 @@ export async function createApp(options: CreateAppOptions = {}) {
         currentQueueStats.totalJobs > 0 &&
         req.query.forceRefreshSmc !== 'true';
 
+      // Page load sends autoStartSmc=false. Omitted (API and existing tests)
+      // still enqueues. Explicit true is the manual full-market SMC trigger.
+      const autoStartSmc = req.query.autoStartSmc !== 'false';
       if (
-        (!monitorWindowCompleted && !shouldPreserveLiveCycleSnapshot) ||
-        req.query.forceRefreshSmc === 'true'
+        autoStartSmc &&
+        ((!monitorWindowCompleted && !shouldPreserveLiveCycleSnapshot) ||
+          req.query.forceRefreshSmc === 'true')
       ) {
         smcBatchScanner.enqueueMarketUniverse({
           exchange: exchangeId,
@@ -381,7 +385,6 @@ export async function createApp(options: CreateAppOptions = {}) {
           resolvedMode === 'live' &&
           !options.skipViteMiddleware &&
           process.env.NODE_ENV !== 'test' &&
-          req.query.autoStartSmc !== 'false' &&
           smcBatchScanner.getStatus(exchangeId, resolvedMode).workerState ===
             'IDLE'
         ) {

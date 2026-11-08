@@ -225,7 +225,11 @@ export default function App() {
 
   // 1. Execute Full Market Scan
   const executeMarketScan = useCallback(
-    async (overrideMode?: 'live' | 'demo', overrideExchange?: ExchangeId) => {
+    async (
+      overrideMode?: 'live' | 'demo',
+      overrideExchange?: ExchangeId,
+      enqueueSmc = false
+    ) => {
       const targetMode = overrideMode ?? dataMode;
       const targetExchange = overrideExchange ?? selectedExchange;
 
@@ -237,6 +241,8 @@ export default function App() {
           mode: targetMode,
           exchange: targetExchange,
           minQuoteVolume24h: String(minQuoteVolume24h),
+          // 頁面載入與切換交易所只拉行情。全市場 SMC 要由手動掃描或 SMC 啟動鈕觸發。
+          autoStartSmc: enqueueSmc ? 'true' : 'false',
         });
         const res = await fetch(`/api/scan?${params.toString()}`);
         setLastHttpStatus(res.status);
@@ -818,7 +824,7 @@ export default function App() {
           const status = (await res.json()) as SmcScanStatusResponse;
           setSmcScanStatus(status);
           if (action === 'step' || action === 'start') {
-            await executeMarketScan(dataMode, selectedExchange);
+            await executeMarketScan(dataMode, selectedExchange, true);
           }
         }
       } finally {
@@ -1333,7 +1339,7 @@ export default function App() {
         <div className="flex items-center shrink-0">
           <button
             type="button"
-            onClick={() => executeMarketScan()}
+            onClick={() => executeMarketScan(undefined, undefined, true)}
             disabled={scanLoading}
             className="flex items-center gap-2 rounded-full bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 shadow-sm hover:bg-amber-400 disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
           >
