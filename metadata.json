@@ -1,0 +1,6 @@
+{
+  "name": "加密貨幣全市場行情雷達",
+  "description": "自動化加密貨幣全市場行情掃描、SMC/ICT 結構觀察、可解釋規則引擎與無前視偏差回測系統（僅供紙上觀察，禁用實盤下單）。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

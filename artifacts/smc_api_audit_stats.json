@@ -1,0 +1,1134 @@
+{
+  "generatedAt": "2026-10-20T19:54:24.946Z",
+  "demoMarketScanSummary": {
+    "totalContracts": 18,
+    "layer1MarketRadarCounts": {
+      "雷達多頭觀察": 6,
+      "雷達空頭觀察": 4,
+      "準備觀察": 5,
+      "高風險": 3
+    },
+    "finalCategorySummaryCounts": {
+      "多頭候選": 6,
+      "空頭候選": 4,
+      "準備觀察": 5,
+      "高風險": 3
+    },
+    "layer2SmcStateCounts": {
+      "WAIT": 7,
+      "WATCH": 3,
+      "LONG CANDIDATE": 3,
+      "SHORT CANDIDATE": 2,
+      "HIGH RISK": 3
+    },
+    "smcLongCandidateCount": 3,
+    "smcShortCandidateCount": 2,
+    "smcWaitCount": 7,
+    "smcWatchCount": 3,
+    "smcHighRiskCount": 3,
+    "smcGateNotConfirmedCount": 13,
+    "klineVerification15m": {
+      "totalKlinesPerSymbol": 90,
+      "isClosedTrueCount": 89,
+      "isClosedFalseIgnoredCount": 1,
+      "unclosedKlinesEnteredSmcEngine": false
+    },
+    "perSymbolBreakdown": [
+      {
+        "symbol": "SUIUSDT",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "smcActionState": "LONG CANDIDATE",
+        "smcPassed": true,
+        "smcReason": "已確認完整 LONG CANDIDATE 結構與多週期共振",
+        "downgradeReasons": []
+      },
+      {
+        "symbol": "ARBUSDT",
+        "marketRadarCategory": "雷達空頭觀察",
+        "finalCategory": "空頭候選",
+        "smcActionState": "SHORT CANDIDATE",
+        "smcPassed": true,
+        "smcReason": "已確認完整 SHORT CANDIDATE 結構與多週期共振",
+        "downgradeReasons": []
+      },
+      {
+        "symbol": "SOLUSDT",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "smcActionState": "LONG CANDIDATE",
+        "smcPassed": true,
+        "smcReason": "已確認完整 LONG CANDIDATE 結構與多週期共振",
+        "downgradeReasons": []
+      },
+      {
+        "symbol": "TAOUSDT",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "smcActionState": "LONG CANDIDATE",
+        "smcPassed": true,
+        "smcReason": "已確認完整 LONG CANDIDATE 結構與多週期共振",
+        "downgradeReasons": []
+      },
+      {
+        "symbol": "AAVEUSDT",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "smcActionState": "WATCH",
+        "smcPassed": false,
+        "smcReason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認",
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WATCH（已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認）"
+        ]
+      },
+      {
+        "symbol": "APTUSDT",
+        "marketRadarCategory": "雷達空頭觀察",
+        "finalCategory": "空頭候選",
+        "smcActionState": "SHORT CANDIDATE",
+        "smcPassed": true,
+        "smcReason": "已確認完整 SHORT CANDIDATE 結構與多週期共振",
+        "downgradeReasons": []
+      },
+      {
+        "symbol": "LINKUSDT",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)",
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)）"
+        ]
+      },
+      {
+        "symbol": "ETHUSDT",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "smcActionState": "WATCH",
+        "smcPassed": false,
+        "smcReason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認",
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WATCH（已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認）"
+        ]
+      },
+      {
+        "symbol": "TIAUSDT",
+        "marketRadarCategory": "雷達空頭觀察",
+        "finalCategory": "空頭候選",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)",
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)）"
+        ]
+      },
+      {
+        "symbol": "OPUSDT",
+        "marketRadarCategory": "雷達空頭觀察",
+        "finalCategory": "空頭候選",
+        "smcActionState": "WATCH",
+        "smcPassed": false,
+        "smcReason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認",
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WATCH（已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認）"
+        ]
+      },
+      {
+        "symbol": "BTCUSDT",
+        "marketRadarCategory": "準備觀察",
+        "finalCategory": "準備觀察",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認）",
+        "downgradeReasons": [
+          "MOMENTUM_GATE_REJECTED: 24h 漲跌幅 (2.45%) 未達 ±3.0% 趨勢動能門檻",
+          "RELATIVE_BTC_GATE_REJECTED: 相對 BTC 強弱 (+0.00%) 未達 ±1.2% 同向超額強弱門檻",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認））"
+        ]
+      },
+      {
+        "symbol": "DOGEUSDT",
+        "marketRadarCategory": "準備觀察",
+        "finalCategory": "準備觀察",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認）",
+        "downgradeReasons": [
+          "RELATIVE_BTC_GATE_REJECTED: 相對 BTC 強弱 (+0.67%) 未達 ±1.2% 同向超額強弱門檻",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認））"
+        ]
+      },
+      {
+        "symbol": "XRPUSDT",
+        "marketRadarCategory": "準備觀察",
+        "finalCategory": "準備觀察",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)",
+        "downgradeReasons": [
+          "MOMENTUM_GATE_REJECTED: 24h 漲跌幅 (1.92%) 未達 ±3.0% 趨勢動能門檻",
+          "RELATIVE_BTC_GATE_REJECTED: 相對 BTC 強弱 (-0.53%) 未達 ±1.2% 同向超額強弱門檻",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)）"
+        ]
+      },
+      {
+        "symbol": "PEPEUSDT",
+        "marketRadarCategory": "高風險",
+        "finalCategory": "高風險",
+        "smcActionState": "HIGH RISK",
+        "smcPassed": false,
+        "smcReason": "高風險擠壓或波動異常",
+        "downgradeReasons": [
+          "FUNDING_GATE_REJECTED: 資金費率處於極端區間 (0.0820% >= 0.05%)，列為高風險",
+          "SCORE_CAP_48_APPLIED: 原始加總分數 60 被限制在 48 分 (MarketScanner.ts Score Cap 48 Rule: Math.min(60, 48) triggered by [extremeFunding === true, category === '高風險'])",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 HIGH RISK（高風險擠壓或波動異常）"
+        ]
+      },
+      {
+        "symbol": "BNBUSDT",
+        "marketRadarCategory": "準備觀察",
+        "finalCategory": "準備觀察",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認）",
+        "downgradeReasons": [
+          "MOMENTUM_GATE_REJECTED: 24h 漲跌幅 (1.85%) 未達 ±3.0% 趨勢動能門檻",
+          "RELATIVE_BTC_GATE_REJECTED: 相對 BTC 強弱 (-0.60%) 未達 ±1.2% 同向超額強弱門檻",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認））"
+        ]
+      },
+      {
+        "symbol": "AVAXUSDT",
+        "marketRadarCategory": "準備觀察",
+        "finalCategory": "準備觀察",
+        "smcActionState": "WAIT",
+        "smcPassed": false,
+        "smcReason": "基礎欄位缺失：BID_ASK_SPREAD；Open Interest (OI 未平倉量) 資料缺失，觸發 WAIT 安全閘門；歷史成交量樣本不足 (29/30，status=INSUFFICIENT_HISTORY)，觸發 WAIT 安全閘門",
+        "downgradeReasons": [
+          "MOMENTUM_GATE_REJECTED: 24h 漲跌幅 (2.10%) 未達 ±3.0% 趨勢動能門檻",
+          "RELATIVE_BTC_GATE_REJECTED: 相對 BTC 強弱 (-0.35%) 未達 ±1.2% 同向超額強弱門檻",
+          "HISTORY_GATE_INSUFFICIENT_SAMPLES: 歷史成交量樣本數 (29/30, timeframe=15m, window=15m_CONFIRMED_KLINE_30_BARS) 未滿 MIN_HISTORY_SAMPLES=30 或缺少同週期 currentVolume，status=INSUFFICIENT_HISTORY，由 準備觀察 降級為 準備觀察",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（基礎欄位缺失：BID_ASK_SPREAD；Open Interest (OI 未平倉量) 資料缺失，觸發 WAIT 安全閘門；歷史成交量樣本不足 (29/30，status=INSUFFICIENT_HISTORY)，觸發 WAIT 安全閘門）"
+        ]
+      },
+      {
+        "symbol": "ORDIUSDT",
+        "marketRadarCategory": "高風險",
+        "finalCategory": "高風險",
+        "smcActionState": "HIGH RISK",
+        "smcPassed": false,
+        "smcReason": "高風險擠壓或波動異常",
+        "downgradeReasons": [
+          "LIQUIDITY_GATE_REJECTED: 24h 成交額 ($9.8M) 低於最低流動性門檻 ($15.0M)",
+          "SPREAD_GATE_REJECTED: 真實盤口價差 (0.7246%) 高於上限 (0.15%)",
+          "FUNDING_GATE_REJECTED: 資金費率處於極端區間 (-0.0950% >= 0.05%)，列為高風險",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 HIGH RISK（高風險擠壓或波動異常）"
+        ]
+      },
+      {
+        "symbol": "TRUMPUSDT",
+        "marketRadarCategory": "高風險",
+        "finalCategory": "高風險",
+        "smcActionState": "HIGH RISK",
+        "smcPassed": false,
+        "smcReason": "高風險擠壓或波動異常",
+        "downgradeReasons": [
+          "LIQUIDITY_GATE_REJECTED: 24h 成交額 ($11.5M) 低於最低流動性門檻 ($15.0M)",
+          "SPREAD_GATE_REJECTED: 真實盤口價差 (0.7588%) 高於上限 (0.15%)",
+          "FUNDING_GATE_REJECTED: 資金費率處於極端區間 (0.1450% >= 0.05%)，列為高風險",
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 HIGH RISK（高風險擠壓或波動異常）"
+        ]
+      }
+    ]
+  },
+  "liveBinanceMarketScanSummary": {
+    "totalContracts": 524,
+    "layer1MarketRadarCounts": {
+      "雷達多頭觀察": 57,
+      "雷達空頭觀察": 6,
+      "準備觀察": 425,
+      "高風險": 36
+    },
+    "finalCategorySummaryCounts": {
+      "多頭候選": 47,
+      "空頭候選": 4,
+      "準備觀察": 437,
+      "高風險": 36
+    },
+    "layer2SmcStateCounts": {
+      "WAIT": 522,
+      "WATCH": 2,
+      "LONG CANDIDATE": 0,
+      "SHORT CANDIDATE": 0,
+      "HIGH RISK": 0
+    },
+    "smcLongCandidateCount": 0,
+    "smcShortCandidateCount": 0,
+    "smcWaitCount": 522,
+    "smcWatchCount": 2,
+    "smcHighRiskCount": 0,
+    "smcGateNotConfirmedCount": 524
+  },
+  "representativeDecisionTraces": {
+    "SOLUSDT_DEMO_LONG_CANDIDATE": {
+      "decisionTrace": {
+        "symbol": "SOLUSDT",
+        "categoryBeforeGates": "多頭候選",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "score": 78,
+        "rawScoreBeforeCap": 78,
+        "scoreCapApplied": false,
+        "scoreCapRule": null,
+        "scoreBreakdown": {
+          "volumeAnomaly": 14,
+          "auxiliaryVolumeRank": 7,
+          "volumeProxy": 21,
+          "momentum": 16,
+          "relativeBtcStrength": 13,
+          "fundingRisk": 6,
+          "liquidityRisk": 12,
+          "dataQuality": 10
+        },
+        "gates": {
+          "history": {
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "sampleCount": 30,
+            "minRequiredSamples": 30,
+            "status": "READY",
+            "passed": true,
+            "currentVolume": 51250000,
+            "rollingMedian": 22416928.5,
+            "mad": 3371453,
+            "madToMedianRatio": 0.1504,
+            "rawRobustZScore": 5.77,
+            "unstableReason": null,
+            "timeframeMismatchRejected": false,
+            "rejectionReason": null
+          },
+          "liquidity": {
+            "quoteVolume24h": 4920000000,
+            "spreadPercent": 0.02795,
+            "passed": true
+          },
+          "momentum": {
+            "change24h": 8.72,
+            "passed": true
+          },
+          "relativeBtc": {
+            "value": 6.27,
+            "passed": true
+          },
+          "funding": {
+            "value": 0.00021,
+            "passed": true
+          },
+          "smc": {
+            "actionState": "LONG CANDIDATE",
+            "passed": true,
+            "reason": "已確認完整 LONG CANDIDATE 結構與多週期共振",
+            "waitReasons": []
+          }
+        },
+        "downgradeReasons": [],
+        "safety": {
+          "mode": "PAPER ONLY",
+          "liveOrders": "LIVE ORDERS DISABLED",
+          "executionPolicy": "NEVER AUTO-PLACE ORDERS"
+        },
+        "mode": "demo",
+        "exchange": "demo_synthetic",
+        "isDemo": true,
+        "fallback": false,
+        "twoLayerResult": {
+          "marketRadar": "多頭觀察",
+          "marketRadarCategory": "雷達多頭觀察",
+          "smcIctState": "LONG CANDIDATE",
+          "reason": "已確認完整 LONG CANDIDATE 結構與多週期共振"
+        },
+        "diagnostics": {
+          "why30Of30NotReady": "已採用方案 A 一致 15m 量能模型 (volumeTimeframe=\"15m\", aggregationWindow=\"15m_CONFIRMED_KLINE_30_BARS\")：currentVolume 使用最新已確認 15m K 線 quoteVolume ($51,250,000)，對比過去 30/30 根已確認 15m K 線基線 (rollingMedian=$22,416,928.5, MAD=$3,371,453, MAD/Median=15.04% >= 3%)，算出合理 15m Robust Z-Score=5.77 (|Z| <= 8)，status=\"READY\"，不再因 24h vs 15m 週期混用產生假異常。",
+          "isBaselineUnstable": false,
+          "madToRollingMedianRatio": 0.1504,
+          "madToRollingMedianPercent": "15.04%",
+          "blockedByLowLiquidityGate": false,
+          "downgradedOnlyBySmcWait": false,
+          "score48Rule": "未觸發 48 分上限規則 (historicalVolume.status === READY 且無高風險/低流動性)",
+          "categoryBeforeGates": "多頭候選",
+          "marketRadarCategory": "雷達多頭觀察",
+          "finalCategory": "多頭候選",
+          "kline15mVolumeDiagnostic": {
+            "symbol": "SOLUSDT",
+            "exchange": "demo_synthetic",
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "sampleCount": 30,
+            "minRequiredSamples": 30,
+            "currentVolume": 51250000,
+            "historicalSamples": [
+              19708333,
+              24753704,
+              27281848,
+              26487337,
+              23824261,
+              15298646,
+              16490517,
+              20784407,
+              26174121,
+              29908267,
+              23642546,
+              21420177,
+              18947492,
+              18819795,
+              22037720,
+              20608014,
+              25285245,
+              27083783,
+              25694357,
+              22975619,
+              14971448,
+              16907268,
+              21661702,
+              26915370,
+              30009396,
+              23034783,
+              20516821,
+              18362856,
+              18951451,
+              22796137
+            ],
+            "rollingMedian": 22416928.5,
+            "mad": 3371453,
+            "madToMedianRatio": 0.1504,
+            "rawRobustZScore": 5.77,
+            "unstableReason": null,
+            "timeframeMismatchRejected": false,
+            "rejectionReason": null,
+            "robustZScore": 5.77,
+            "zScore": 5.77,
+            "rvol": 2.29,
+            "isHistoricalAnomaly": true,
+            "baselineUnstable": false,
+            "status": "READY",
+            "provenance": {
+              "source": "DEMO_SYNTHETIC_DATASET",
+              "fetchedAt": "2026-10-20T19:54:24.407Z",
+              "stale": false,
+              "fallback": false,
+              "missingData": [],
+              "isDemo": true,
+              "volumeTimeframe": "15m",
+              "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+              "volumeMetric": "quoteVolume",
+              "isTestFixture": true
+            }
+          }
+        },
+        "provenance": {
+          "source": "DEMO_SYNTHETIC_DATASET",
+          "fetchedAt": "2026-10-20T19:54:24.408Z",
+          "stale": false,
+          "fallback": false,
+          "missingData": [],
+          "isDemo": true,
+          "volumeTimeframe": "15m",
+          "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+          "volumeMetric": "quoteVolume"
+        }
+      },
+      "smcAnalysisSummary": {
+        "actionState": "LONG CANDIDATE",
+        "confirmedKlineCount": 89,
+        "unclosedKlineIgnoredCount": 1,
+        "bosOrMss": {
+          "detected": true,
+          "type": "MSS_BULL",
+          "brokenLevel": 208.621,
+          "candleTime": 1792524600000,
+          "description": "已確認收盤突破前波結構高點 208.621 (MSS 多頭結構轉換)"
+        },
+        "liquiditySweep": {
+          "detected": true,
+          "side": "SELL_SIDE_SWEPT",
+          "sweptLevel": 206.198,
+          "candleTime": 1792521900000,
+          "description": "下影線刺穿前波低點流動性池 (206.198) 後實體收回其上方 (Sell-Side Liquidity Sweep)"
+        },
+        "displacement": {
+          "detected": true,
+          "direction": "BULL",
+          "bodyToAtrRatio": 1.76,
+          "candleTime": 1792523700000,
+          "description": "已確認 多頭位移 K 線 (實體為 1.76x ATR，實體佔比 92%)"
+        },
+        "fvg": {
+          "detected": true,
+          "direction": "BULL",
+          "top": 213.025,
+          "bottom": 210.406,
+          "mitigated": false,
+          "candleTime": 1792523700000,
+          "description": "多頭 FVG 失衡區 [210.406 – 213.025] (尚未完全回補 Unmitigated)"
+        },
+        "orderBlock": {
+          "detected": true,
+          "direction": "BULL",
+          "high": 208.303,
+          "low": 205.64,
+          "candleTime": 1792521900000,
+          "description": "於位移前確認 多頭需求 Order Block 區間 [205.64 – 208.303]"
+        },
+        "mtfAlignment": {
+          "aligned": true,
+          "dominantDirection": "BULL",
+          "byTimeframe": {
+            "5m": "BULL",
+            "15m": "BULL",
+            "1h": "BULL",
+            "4h": "BULL"
+          },
+          "description": "多週期結構偏多一致 (4/4 週期多頭共振)"
+        },
+        "waitReasons": []
+      }
+    },
+    "ETHUSDT_DEMO_RADAR_LONG_BUT_SMC_WATCH": {
+      "decisionTrace": {
+        "symbol": "ETHUSDT",
+        "categoryBeforeGates": "多頭候選",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "score": 71,
+        "rawScoreBeforeCap": 71,
+        "scoreCapApplied": false,
+        "scoreCapRule": null,
+        "scoreBreakdown": {
+          "volumeAnomaly": 12,
+          "auxiliaryVolumeRank": 8,
+          "volumeProxy": 20,
+          "momentum": 9,
+          "relativeBtcStrength": 8,
+          "fundingRisk": 12,
+          "liquidityRisk": 12,
+          "dataQuality": 10
+        },
+        "gates": {
+          "history": {
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "sampleCount": 30,
+            "minRequiredSamples": 30,
+            "status": "READY",
+            "passed": true,
+            "currentVolume": 85833333,
+            "rollingMedian": 50047097,
+            "mad": 7526964.5,
+            "madToMedianRatio": 0.1504,
+            "rawRobustZScore": 3.21,
+            "unstableReason": null,
+            "timeframeMismatchRejected": false,
+            "rejectionReason": null
+          },
+          "liquidity": {
+            "quoteVolume24h": 8240000000,
+            "spreadPercent": 0.01256,
+            "passed": true
+          },
+          "momentum": {
+            "change24h": 4.18,
+            "passed": true
+          },
+          "relativeBtc": {
+            "value": 1.73,
+            "passed": true
+          },
+          "funding": {
+            "value": 0.00014,
+            "passed": true
+          },
+          "smc": {
+            "actionState": "WATCH",
+            "passed": false,
+            "reason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認",
+            "waitReasons": [
+              "已偵測部分多頭結構證據，但尚未完成全部 SMC 必要確認條件（缺少：Sell-Side Liquidity Sweep、多頭 Displacement 位移 K 線），維持 WATCH"
+            ]
+          }
+        },
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WATCH（已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認）"
+        ],
+        "safety": {
+          "mode": "PAPER ONLY",
+          "liveOrders": "LIVE ORDERS DISABLED",
+          "executionPolicy": "NEVER AUTO-PLACE ORDERS"
+        },
+        "mode": "demo",
+        "exchange": "demo_synthetic",
+        "isDemo": true,
+        "fallback": false,
+        "twoLayerResult": {
+          "marketRadar": "多頭觀察",
+          "marketRadarCategory": "雷達多頭觀察",
+          "smcIctState": "WATCH",
+          "reason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認"
+        },
+        "diagnostics": {
+          "why30Of30NotReady": "已採用方案 A 一致 15m 量能模型 (volumeTimeframe=\"15m\", aggregationWindow=\"15m_CONFIRMED_KLINE_30_BARS\")：currentVolume 使用最新已確認 15m K 線 quoteVolume ($85,833,333)，對比過去 30/30 根已確認 15m K 線基線 (rollingMedian=$50,047,097, MAD=$7,526,964.5, MAD/Median=15.04% >= 3%)，算出合理 15m Robust Z-Score=3.21 (|Z| <= 8)，status=\"READY\"，不再因 24h vs 15m 週期混用產生假異常。",
+          "isBaselineUnstable": false,
+          "madToRollingMedianRatio": 0.1504,
+          "madToRollingMedianPercent": "15.04%",
+          "blockedByLowLiquidityGate": false,
+          "downgradedOnlyBySmcWait": true,
+          "score48Rule": "未觸發 48 分上限規則 (historicalVolume.status === READY 且無高風險/低流動性)",
+          "categoryBeforeGates": "多頭候選",
+          "marketRadarCategory": "雷達多頭觀察",
+          "finalCategory": "多頭候選",
+          "kline15mVolumeDiagnostic": {
+            "symbol": "ETHUSDT",
+            "exchange": "demo_synthetic",
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "sampleCount": 30,
+            "minRequiredSamples": 30,
+            "currentVolume": 85833333,
+            "historicalSamples": [
+              44000000,
+              55264084,
+              60908313,
+              59134521,
+              53189048,
+              34155117,
+              36816038,
+              46402397,
+              58435247,
+              66771946,
+              52783358,
+              47821791,
+              42301378,
+              42016288,
+              49200492,
+              46008590,
+              56450780,
+              60466121,
+              57364146,
+              51294406,
+              33424628,
+              37746459,
+              48361011,
+              60090130,
+              66997722,
+              51426492,
+              45804997,
+              40996145,
+              42310217,
+              50893702
+            ],
+            "rollingMedian": 50047097,
+            "mad": 7526964.5,
+            "madToMedianRatio": 0.1504,
+            "rawRobustZScore": 3.21,
+            "unstableReason": null,
+            "timeframeMismatchRejected": false,
+            "rejectionReason": null,
+            "robustZScore": 3.21,
+            "zScore": 3.21,
+            "rvol": 1.72,
+            "isHistoricalAnomaly": true,
+            "baselineUnstable": false,
+            "status": "READY",
+            "provenance": {
+              "source": "DEMO_SYNTHETIC_DATASET",
+              "fetchedAt": "2026-10-20T19:54:24.422Z",
+              "stale": false,
+              "fallback": false,
+              "missingData": [],
+              "isDemo": true,
+              "volumeTimeframe": "15m",
+              "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+              "volumeMetric": "quoteVolume",
+              "isTestFixture": true
+            }
+          }
+        },
+        "provenance": {
+          "source": "DEMO_SYNTHETIC_DATASET",
+          "fetchedAt": "2026-10-20T19:54:24.425Z",
+          "stale": false,
+          "fallback": false,
+          "missingData": [],
+          "isDemo": true,
+          "volumeTimeframe": "15m",
+          "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+          "volumeMetric": "quoteVolume"
+        }
+      },
+      "smcAnalysisSummary": {
+        "actionState": "WATCH",
+        "confirmedKlineCount": 89,
+        "unclosedKlineIgnoredCount": 1,
+        "bosOrMss": {
+          "detected": true,
+          "type": "MSS_BULL",
+          "brokenLevel": 3368.29,
+          "candleTime": 1792524600000,
+          "description": "已確認收盤突破前波結構高點 3368.29 (MSS 多頭結構轉換)"
+        },
+        "liquiditySweep": {
+          "detected": false,
+          "side": "NONE",
+          "sweptLevel": null,
+          "candleTime": null,
+          "description": "近期已確認 K 線未偵測到高低點流動性掃單 (Liquidity Sweep)"
+        },
+        "displacement": {
+          "detected": false,
+          "direction": "NONE",
+          "bodyToAtrRatio": null,
+          "candleTime": null,
+          "description": "未出現實體大於 1.3 倍 ATR 之位移 K 線"
+        },
+        "fvg": {
+          "detected": true,
+          "direction": "BULL",
+          "top": 3381.79,
+          "bottom": 3378.73,
+          "mitigated": false,
+          "candleTime": 1792523700000,
+          "description": "多頭 FVG 失衡區 [3378.73 – 3381.79] (尚未完全回補 Unmitigated)"
+        },
+        "orderBlock": {
+          "detected": false,
+          "direction": "NONE",
+          "high": null,
+          "low": null,
+          "candleTime": null,
+          "description": "未確認有效機構訂單塊 (Order Block)"
+        },
+        "mtfAlignment": {
+          "aligned": true,
+          "dominantDirection": "BULL",
+          "byTimeframe": {
+            "5m": "BULL",
+            "15m": "BULL",
+            "1h": "BULL",
+            "4h": "BULL"
+          },
+          "description": "多週期結構偏多一致 (4/4 週期多頭共振)"
+        },
+        "waitReasons": [
+          "已偵測部分多頭結構證據，但尚未完成全部 SMC 必要確認條件（缺少：Sell-Side Liquidity Sweep、多頭 Displacement 位移 K 線），維持 WATCH"
+        ]
+      }
+    },
+    "LINKUSDT_DEMO_RADAR_LONG_BUT_SMC_WAIT": {
+      "decisionTrace": {
+        "symbol": "LINKUSDT",
+        "categoryBeforeGates": "多頭候選",
+        "marketRadarCategory": "雷達多頭觀察",
+        "finalCategory": "多頭候選",
+        "score": 72,
+        "rawScoreBeforeCap": 72,
+        "scoreCapApplied": false,
+        "scoreCapRule": null,
+        "scoreBreakdown": {
+          "volumeAnomaly": 13,
+          "auxiliaryVolumeRank": 4,
+          "volumeProxy": 17,
+          "momentum": 11,
+          "relativeBtcStrength": 10,
+          "fundingRisk": 12,
+          "liquidityRisk": 12,
+          "dataQuality": 10
+        },
+        "gates": {
+          "history": {
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "sampleCount": 30,
+            "minRequiredSamples": 30,
+            "status": "READY",
+            "passed": true,
+            "currentVolume": 8229167,
+            "rollingMedian": 4274856,
+            "mad": 642928.5,
+            "madToMedianRatio": 0.1504,
+            "rawRobustZScore": 4.15,
+            "unstableReason": null,
+            "timeframeMismatchRejected": false,
+            "rejectionReason": null
+          },
+          "liquidity": {
+            "quoteVolume24h": 790000000,
+            "spreadPercent": 0.04378,
+            "passed": true
+          },
+          "momentum": {
+            "change24h": 5.62,
+            "passed": true
+          },
+          "relativeBtc": {
+            "value": 3.17,
+            "passed": true
+          },
+          "funding": {
+            "value": 0.00011,
+            "passed": true
+          },
+          "smc": {
+            "actionState": "WAIT",
+            "passed": false,
+            "reason": "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)",
+            "waitReasons": [
+              "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)"
+            ]
+          }
+        },
+        "downgradeReasons": [
+          "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WAIT（多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)）"
+        ],
+        "safety": {
+          "mode": "PAPER ONLY",
+          "liveOrders": "LIVE ORDERS DISABLED",
+          "executionPolicy": "NEVER AUTO-PLACE ORDERS"
+        },
+        "mode": "demo",
+        "exchange": "demo_synthetic",
+        "isDemo": true,
+        "fallback": false,
+        "twoLayerResult": {
+          "marketRadar": "多頭觀察",
+          "marketRadarCategory": "雷達多頭觀察",
+          "smcIctState": "WAIT",
+          "reason": "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)"
+        },
+        "diagnostics": {
+          "why30Of30NotReady": "已採用方案 A 一致 15m 量能模型 (volumeTimeframe=\"15m\", aggregationWindow=\"15m_CONFIRMED_KLINE_30_BARS\")：currentVolume 使用最新已確認 15m K 線 quoteVolume ($8,229,167)，對比過去 30/30 根已確認 15m K 線基線 (rollingMedian=$4,274,856, MAD=$642,928.5, MAD/Median=15.04% >= 3%)，算出合理 15m Robust Z-Score=4.15 (|Z| <= 8)，status=\"READY\"，不再因 24h vs 15m 週期混用產生假異常。",
+          "isBaselineUnstable": false,
+          "madToRollingMedianRatio": 0.1504,
+          "madToRollingMedianPercent": "15.04%",
+          "blockedByLowLiquidityGate": false,
+          "downgradedOnlyBySmcWait": true,
+          "score48Rule": "未觸發 48 分上限規則 (historicalVolume.status === READY 且無高風險/低流動性)",
+          "categoryBeforeGates": "多頭候選",
+          "marketRadarCategory": "雷達多頭觀察",
+          "finalCategory": "多頭候選",
+          "kline15mVolumeDiagnostic": {
+            "symbol": "LINKUSDT",
+            "exchange": "demo_synthetic",
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "sampleCount": 30,
+            "minRequiredSamples": 30,
+            "currentVolume": 8229167,
+            "historicalSamples": [
+              3758333,
+              4720474,
+              5202585,
+              5051073,
+              4543231,
+              2917416,
+              3144703,
+              3963538,
+              4991344,
+              5703437,
+              4508578,
+              4084778,
+              3613242,
+              3588891,
+              4202542,
+              3929900,
+              4821837,
+              5164814,
+              4899854,
+              4381397,
+              2855020,
+              3224176,
+              4130836,
+              5132698,
+              5722722,
+              4392679,
+              3912510,
+              3501754,
+              3613997,
+              4347170
+            ],
+            "rollingMedian": 4274856,
+            "mad": 642928.5,
+            "madToMedianRatio": 0.1504,
+            "rawRobustZScore": 4.15,
+            "unstableReason": null,
+            "timeframeMismatchRejected": false,
+            "rejectionReason": null,
+            "robustZScore": 4.15,
+            "zScore": 4.15,
+            "rvol": 1.93,
+            "isHistoricalAnomaly": true,
+            "baselineUnstable": false,
+            "status": "READY",
+            "provenance": {
+              "source": "DEMO_SYNTHETIC_DATASET",
+              "fetchedAt": "2026-10-20T19:54:24.409Z",
+              "stale": false,
+              "fallback": false,
+              "missingData": [],
+              "isDemo": true,
+              "volumeTimeframe": "15m",
+              "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+              "volumeMetric": "quoteVolume",
+              "isTestFixture": true
+            }
+          }
+        },
+        "provenance": {
+          "source": "DEMO_SYNTHETIC_DATASET",
+          "fetchedAt": "2026-10-20T19:54:24.411Z",
+          "stale": false,
+          "fallback": false,
+          "missingData": [],
+          "isDemo": true,
+          "volumeTimeframe": "15m",
+          "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+          "volumeMetric": "quoteVolume"
+        }
+      },
+      "smcAnalysisSummary": {
+        "actionState": "WAIT",
+        "confirmedKlineCount": 89,
+        "unclosedKlineIgnoredCount": 1,
+        "bosOrMss": {
+          "detected": true,
+          "type": "MSS_BULL",
+          "brokenLevel": 22.1985,
+          "candleTime": 1792524600000,
+          "description": "已確認收盤突破前波結構高點 22.1985 (MSS 多頭結構轉換)"
+        },
+        "liquiditySweep": {
+          "detected": true,
+          "side": "SELL_SIDE_SWEPT",
+          "sweptLevel": 21.9406,
+          "candleTime": 1792521900000,
+          "description": "下影線刺穿前波低點流動性池 (21.9406) 後實體收回其上方 (Sell-Side Liquidity Sweep)"
+        },
+        "displacement": {
+          "detected": true,
+          "direction": "BULL",
+          "bodyToAtrRatio": 1.76,
+          "candleTime": 1792523700000,
+          "description": "已確認 多頭位移 K 線 (實體為 1.76x ATR，實體佔比 92%)"
+        },
+        "fvg": {
+          "detected": true,
+          "direction": "BULL",
+          "top": 22.6671,
+          "bottom": 22.3884,
+          "mitigated": false,
+          "candleTime": 1792523700000,
+          "description": "多頭 FVG 失衡區 [22.3884 – 22.6671] (尚未完全回補 Unmitigated)"
+        },
+        "orderBlock": {
+          "detected": true,
+          "direction": "BULL",
+          "high": 22.1646,
+          "low": 21.8812,
+          "candleTime": 1792521900000,
+          "description": "於位移前確認 多頭需求 Order Block 區間 [21.8812 – 22.1646]"
+        },
+        "mtfAlignment": {
+          "aligned": false,
+          "dominantDirection": "CONFLICT",
+          "byTimeframe": {
+            "5m": "BULL",
+            "15m": "BULL",
+            "1h": "BEAR",
+            "4h": "BEAR"
+          },
+          "description": "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)"
+        },
+        "waitReasons": [
+          "多週期結構方向分歧 (多頭週期: 2, 空頭週期: 2)"
+        ]
+      }
+    },
+    "QUSDT_LIVE_BINANCE": {
+      "symbol": "QUSDT",
+      "categoryBeforeGates": "空頭候選",
+      "marketRadarCategory": "雷達空頭觀察",
+      "finalCategory": "空頭候選",
+      "score": 72,
+      "rawScoreBeforeCap": 72,
+      "scoreCapApplied": false,
+      "scoreCapRule": null,
+      "scoreBreakdown": {
+        "volumeAnomaly": 0,
+        "auxiliaryVolumeRank": 8,
+        "volumeProxy": 8,
+        "momentum": 18,
+        "relativeBtcStrength": 18,
+        "fundingRisk": 6,
+        "liquidityRisk": 12,
+        "dataQuality": 10
+      },
+      "gates": {
+        "history": {
+          "volumeTimeframe": "15m",
+          "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+          "volumeMetric": "quoteVolume",
+          "sampleCount": 30,
+          "minRequiredSamples": 30,
+          "status": "READY",
+          "passed": true,
+          "currentVolume": 976416.608314,
+          "rollingMedian": 1647480.07,
+          "mad": 798527.02,
+          "madToMedianRatio": 0.4847,
+          "rawRobustZScore": -0.57,
+          "unstableReason": null,
+          "timeframeMismatchRejected": false,
+          "rejectionReason": null
+        },
+        "liquidity": {
+          "quoteVolume24h": 368755285.021041,
+          "spreadPercent": 0.01416,
+          "passed": true
+        },
+        "momentum": {
+          "change24h": -9.561,
+          "passed": true
+        },
+        "relativeBtc": {
+          "value": -10.62,
+          "passed": true
+        },
+        "funding": {
+          "value": -0.00043766,
+          "passed": true
+        },
+        "smc": {
+          "actionState": "WATCH",
+          "passed": false,
+          "reason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認",
+          "waitReasons": [
+            "已偵測部分多頭結構證據，但尚未完成全部 SMC 必要確認條件（缺少：Sell-Side Liquidity Sweep、多頭 Displacement 位移 K 線、多頭未回補 FVG 或 Order Block、多週期多頭一致性 (MTF Alignment)），維持 WATCH"
+          ]
+        }
+      },
+      "downgradeReasons": [
+        "SMC_GATE_NOT_CONFIRMED: 第二層 SMC/ICT 狀態為 WATCH（已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認）"
+      ],
+      "safety": {
+        "mode": "PAPER ONLY",
+        "liveOrders": "LIVE ORDERS DISABLED",
+        "executionPolicy": "NEVER AUTO-PLACE ORDERS"
+      },
+      "mode": "live",
+      "exchange": "binance_usdm",
+      "isDemo": false,
+      "fallback": false,
+      "twoLayerResult": {
+        "marketRadar": "空頭觀察",
+        "marketRadarCategory": "雷達空頭觀察",
+        "smcIctState": "WATCH",
+        "reason": "已偵測部分結構證據（如 FVG 或多週期方向一致），等待完整 BOS/MSS 與位移確認"
+      },
+      "diagnostics": {
+        "why30Of30NotReady": "已採用方案 A 一致 15m 量能模型 (volumeTimeframe=\"15m\", aggregationWindow=\"15m_CONFIRMED_KLINE_30_BARS\")：currentVolume 使用最新已確認 15m K 線 quoteVolume ($976,416.608)，對比過去 30/30 根已確認 15m K 線基線 (rollingMedian=$1,647,480.07, MAD=$798,527.02, MAD/Median=48.47% >= 3%)，算出合理 15m Robust Z-Score=-0.57 (|Z| <= 8)，status=\"READY\"，不再因 24h vs 15m 週期混用產生假異常。",
+        "isBaselineUnstable": false,
+        "madToRollingMedianRatio": 0.4847,
+        "madToRollingMedianPercent": "48.47%",
+        "blockedByLowLiquidityGate": false,
+        "downgradedOnlyBySmcWait": true,
+        "score48Rule": "未觸發 48 分上限規則 (historicalVolume.status === READY 且無高風險/低流動性)",
+        "categoryBeforeGates": "空頭候選",
+        "marketRadarCategory": "雷達空頭觀察",
+        "finalCategory": "空頭候選",
+        "kline15mVolumeDiagnostic": {
+          "symbol": "QUSDT",
+          "exchange": "binance_usdm",
+          "volumeTimeframe": "15m",
+          "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+          "volumeMetric": "quoteVolume",
+          "sampleCount": 30,
+          "minRequiredSamples": 30,
+          "currentVolume": 976416.608314,
+          "historicalSamples": [
+            11770610.952128,
+            3709363.252289,
+            2462594.049496,
+            2234498.094692,
+            4723135.777636,
+            1729065.681111,
+            1491354.362428,
+            1235926.069269,
+            2588446.407014,
+            7360348.526866,
+            4286179.682859,
+            1800003.979673,
+            5015465.963072,
+            2355999.073886,
+            2250036.036632,
+            1565894.451566,
+            1919703.245502,
+            1090753.393291,
+            865540.003514,
+            522011.723583,
+            1082676.888245,
+            942369.626583,
+            620507.331641,
+            634315.652978,
+            794335.079708,
+            491079.271465,
+            476815.813759,
+            685424.768068,
+            997171.237996,
+            1924284.102256
+          ],
+          "rollingMedian": 1647480.07,
+          "mad": 798527.02,
+          "madToMedianRatio": 0.4847,
+          "rawRobustZScore": -0.57,
+          "unstableReason": null,
+          "timeframeMismatchRejected": false,
+          "rejectionReason": null,
+          "robustZScore": -0.57,
+          "zScore": -0.57,
+          "rvol": 0.59,
+          "isHistoricalAnomaly": false,
+          "baselineUnstable": false,
+          "status": "READY",
+          "provenance": {
+            "source": "Binance USDⓈ-M Futures REST (https://fapi.binance.com/fapi/v1/klines)",
+            "fetchedAt": "2026-10-20T19:54:24.503Z",
+            "stale": false,
+            "fallback": false,
+            "missingData": [],
+            "isDemo": false,
+            "volumeTimeframe": "15m",
+            "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+            "volumeMetric": "quoteVolume",
+            "isTestFixture": false
+          }
+        }
+      },
+      "provenance": {
+        "source": "Binance USDⓈ-M Futures REST (https://fapi.binance.com: /fapi/v1/ticker/24hr, /fapi/v1/premiumIndex, /fapi/v1/ticker/bookTicker)",
+        "fetchedAt": "2026-10-20T19:54:24.701Z",
+        "stale": false,
+        "fallback": false,
+        "missingData": [],
+        "isDemo": false,
+        "volumeTimeframe": "15m",
+        "aggregationWindow": "15m_CONFIRMED_KLINE_30_BARS",
+        "volumeMetric": "quoteVolume"
+      }
+    }
+  }
+}

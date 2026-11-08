@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-Hant" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>加密貨幣全市場行情雷達 — 永續合約掃描與 SMC/ICT 觀察系統</title>
+    <meta name="description" content="自動化加密貨幣全市場行情掃描、SMC/ICT 結構觀察、可解釋規則引擎與無前視偏差回測系統（僅供紙上觀察，禁用實盤下單）。" />
+    <meta property="og:title" content="加密貨幣全市場行情雷達" />
+    <meta property="og:description" content="自動化加密貨幣全市場行情掃描、SMC/ICT 結構觀察、可解釋規則引擎與無前視偏差回測系統（僅供紙上觀察，禁用實盤下單）。" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
+    <script>
+      window.addEventListener('unhandledrejection', function (event) {
+        var msg = event && event.reason && (event.reason.message || String(event.reason));
+        if (typeof msg === 'string' && msg.indexOf('WebSocket closed without opened') !== -1) {
+          event.preventDefault();
+        }
+      });
+    </script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 antialiased selection:bg-amber-500/30 selection:text-amber-200">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

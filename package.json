@@ -1,0 +1,40 @@
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "start": "tsx server.ts",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-concurrency=1 tests/core-rules.test.ts tests/api-integration.test.ts tests/phase3-smc-batch-scan.test.ts tests/phase4-backtest-walkforward.test.ts tests/phase5-shadow-monitor.test.ts tests/phase6-zero-candidate-diagnostics.test.ts tests/phase7-24h-shadow-monitoring.test.ts tests/phase8-smc-latency-optimization.test.ts tests/phase9-persistent-cache-prewarm.test.ts tests/phase10-scan-semantics-http-cost.test.ts tests/phase11-smc-quality-gate-analysis.test.ts tests/phase12-long-term-paper-quality.test.ts tests/phase13-statistical-consistency.test.ts tests/phase14-aggregation-cycles-lifecycle.test.ts tests/phase16-pending-progress-worker-health.test.ts tests/phase17-long-run-stability-recovery-sqlite.test.ts tests/phase18-funnel-nearmiss-shadow-latency.test.ts tests/phase18-1-funnel-scope-consistency.test.ts",
+    "test:e2e": "tsx --test tests/browser-e2e.test.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^8.3.0",
+    "express": "^4.21.2",
+    "dotenv": "^17.2.3",
+    "motion": "^12.23.24"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2",
+    "@types/express": "^4.17.21"
+  }
+}
