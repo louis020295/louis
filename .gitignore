@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Local market databases. History may still contain copies that were committed earlier.
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.sqlite.backup.sqlite
+data/*.backup.sqlite
+data/*.window-checkpoint.json
+data/*.db
