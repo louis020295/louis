@@ -14,6 +14,8 @@ export interface ExchangeErrorMetadata {
   retryAttempts?: number;
   isTimeout?: boolean;
   isRateLimited?: boolean;
+  /** 4xx、空本文、重新導向與無法解析的 JSON 不在同一端點重試。 */
+  doNotRetry?: boolean;
 }
 
 export class ExchangeApiUnavailableError extends Error {
@@ -22,6 +24,7 @@ export class ExchangeApiUnavailableError extends Error {
   public readonly retryAttempts: number;
   public readonly isTimeout: boolean;
   public readonly isRateLimited: boolean;
+  public readonly doNotRetry: boolean;
 
   constructor(
     message: string,
@@ -36,6 +39,7 @@ export class ExchangeApiUnavailableError extends Error {
     this.retryAttempts = meta.retryAttempts ?? 0;
     this.isTimeout = meta.isTimeout ?? false;
     this.isRateLimited = meta.isRateLimited ?? statusCode === 429;
+    this.doNotRetry = meta.doNotRetry ?? false;
   }
 }
 
@@ -125,6 +129,7 @@ export async function fetchWithResilience<T>(
       try {
         const res = await customFetch(url, {
           signal: controller.signal,
+          redirect: 'manual',
           headers: {
             Accept: 'application/json',
             'User-Agent': 'CryptoMarketRadar/2.0',
@@ -132,12 +137,27 @@ export async function fetchWithResilience<T>(
         });
         clearTimeout(timer);
 
+        if (res.status >= 300 && res.status < 400) {
+          const location = res.headers?.get?.('location') || '';
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP ${res.status} ${base} 重新導向未跟隨${
+              location ? ` (Location: ${location.slice(0, 80)})` : ''
+            }`,
+            base,
+            res.status,
+            {
+              retryAttempts: totalRetries,
+              doNotRetry: true,
+            }
+          );
+        }
+
         if (res.status === 429) {
           sawRateLimit = true;
           lastStatusCode = 429;
           const text = await res.text().catch(() => '');
           lastError = new ExchangeApiUnavailableError(
-            `${sourceLabel} HTTP 429 Rate Limited: ${text.slice(0, 120) || 'Too Many Requests'}`,
+            `${sourceLabel} HTTP 429 ${base} Rate Limited: ${text.slice(0, 120) || 'Too Many Requests'}`,
             base,
             429,
             {
@@ -153,14 +173,16 @@ export async function fetchWithResilience<T>(
         if (!res.ok) {
           lastStatusCode = res.status;
           const text = await res.text().catch(() => '');
+          const terminalClientError = res.status < 500;
           lastError = new ExchangeApiUnavailableError(
-            `${sourceLabel} HTTP ${res.status}: ${text.slice(0, 140) || res.statusText}`,
+            `${sourceLabel} HTTP ${res.status} ${base}: ${text.slice(0, 140) || res.statusText}`,
             base,
             res.status,
             {
               retryAttempts: totalRetries,
               isRateLimited: false,
               isTimeout: false,
+              doNotRetry: terminalClientError,
             }
           );
           // Retry on transient 5xx errors
@@ -170,7 +192,34 @@ export async function fetchWithResilience<T>(
           break;
         }
 
-        const data = (await res.json()) as T;
+        const rawText = await res.text();
+        if (!rawText.trim()) {
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP ${res.status} ${base} 回應本文為空，無法解析 JSON`,
+            base,
+            res.status,
+            {
+              retryAttempts: totalRetries,
+              doNotRetry: true,
+            }
+          );
+        }
+        let data: T;
+        try {
+          data = JSON.parse(rawText) as T;
+        } catch (parseErr) {
+          const reason =
+            parseErr instanceof Error ? parseErr.message : 'invalid JSON';
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP ${res.status} ${base} 回應無法解析為 JSON (${reason})`,
+            base,
+            res.status,
+            {
+              retryAttempts: totalRetries,
+              doNotRetry: true,
+            }
+          );
+        }
         return {
           data,
           endpointUsed: base,
@@ -179,6 +228,11 @@ export async function fetchWithResilience<T>(
         };
       } catch (err) {
         clearTimeout(timer);
+        if (err instanceof ExchangeApiUnavailableError && err.doNotRetry) {
+          lastError = err;
+          lastStatusCode = err.statusCode ?? lastStatusCode;
+          break;
+        }
         if (err instanceof ExchangeApiUnavailableError && err.isRateLimited) {
           throw err;
         }

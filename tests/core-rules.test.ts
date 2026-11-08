@@ -1086,6 +1086,96 @@ describe('5. 斷線重試、Rate Limit、Timeout 與 API Failure 測試 (Failure
       }
     );
   });
+
+  it('空本文與無法解析的 JSON 保留上游 HTTP 狀態與 host，且不把錯誤收成單純的 Unexpected end of JSON input', async () => {
+    let emptyCalls = 0;
+    const emptyFetch: typeof globalThis.fetch = async () => {
+      emptyCalls += 1;
+      return new Response('', { status: 200, statusText: 'OK' });
+    };
+
+    await assert.rejects(
+      async () => {
+        await fetchWithResilience({
+          endpoints: ['https://fapi1.binance.com'],
+          path: '/fapi/v1/exchangeInfo',
+          sourceLabel: 'Binance USDⓈ-M Futures REST',
+          timeoutMs: 2000,
+          maxRetriesPerEndpoint: 2,
+          retryBaseDelayMs: 5,
+          customFetch: emptyFetch,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ExchangeApiUnavailableError);
+        assert.equal(err.statusCode, 200);
+        assert.match(err.message, /HTTP 200/);
+        assert.match(err.message, /https:\/\/fapi1\.binance\.com/);
+        assert.match(err.message, /回應本文為空/);
+        assert.doesNotMatch(err.message, /^Unexpected end of JSON input$/);
+        return true;
+      }
+    );
+    assert.equal(emptyCalls, 1);
+
+    const badJsonFetch: typeof globalThis.fetch = async () =>
+      new Response('not-json', { status: 202 });
+    await assert.rejects(
+      async () => {
+        await fetchWithResilience({
+          endpoints: ['https://fapi2.binance.com'],
+          path: '/fapi/v1/ticker/24hr',
+          sourceLabel: 'Binance USDⓈ-M Futures REST',
+          maxRetriesPerEndpoint: 2,
+          retryBaseDelayMs: 5,
+          customFetch: badJsonFetch,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ExchangeApiUnavailableError);
+        assert.equal(err.statusCode, 202);
+        assert.match(err.message, /HTTP 202/);
+        assert.match(err.message, /https:\/\/fapi2\.binance\.com/);
+        assert.match(err.message, /無法解析為 JSON/);
+        return true;
+      }
+    );
+  });
+
+  it('3xx 重新導向不跟隨，錯誤訊息含狀態碼、host 與 Location', async () => {
+    let calls = 0;
+    const redirectFetch: typeof globalThis.fetch = async (_url, init) => {
+      calls += 1;
+      assert.equal(init?.redirect, 'manual');
+      return new Response('', {
+        status: 302,
+        headers: { Location: 'https://www.binance.com/en' },
+      });
+    };
+
+    await assert.rejects(
+      async () => {
+        await fetchWithResilience({
+          endpoints: ['https://fapi1.binance.com', 'https://fapi2.binance.com'],
+          path: '/fapi/v1/ticker/24hr',
+          sourceLabel: 'Binance USDⓈ-M Futures REST',
+          maxRetriesPerEndpoint: 3,
+          retryBaseDelayMs: 5,
+          customFetch: redirectFetch,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ExchangeApiUnavailableError);
+        assert.equal(err.statusCode, 302);
+        assert.match(err.message, /HTTP 302/);
+        assert.match(err.message, /binance\.com/);
+        assert.match(err.message, /重新導向未跟隨/);
+        assert.match(err.message, /Location: https:\/\/www\.binance\.com\/en/);
+        return true;
+      }
+    );
+    assert.equal(calls, 2);
+  });
 });
 
 describe('6. SQLite 持久化資料庫、歷史量能 Collector、紙上交易 Ledger 與背景排程器 (Persistence & Scheduler)', () => {
