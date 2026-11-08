@@ -8,12 +8,19 @@ import {
   MarketTicker,
   Timeframe,
 } from '../../src/types/market.ts';
+import {
+  classifyFromExchangeFields,
+  InstrumentIdentity,
+  unverifiedInstrument,
+} from '../engine/InstrumentIdentity.ts';
 
 export interface ExchangeErrorMetadata {
   statusCode?: number;
   retryAttempts?: number;
   isTimeout?: boolean;
   isRateLimited?: boolean;
+  /** 4xx、空本文、重新導向與無法解析的 JSON 不在同一端點重試。 */
+  doNotRetry?: boolean;
 }
 
 export class ExchangeApiUnavailableError extends Error {
@@ -22,6 +29,7 @@ export class ExchangeApiUnavailableError extends Error {
   public readonly retryAttempts: number;
   public readonly isTimeout: boolean;
   public readonly isRateLimited: boolean;
+  public readonly doNotRetry: boolean;
 
   constructor(
     message: string,
@@ -36,7 +44,207 @@ export class ExchangeApiUnavailableError extends Error {
     this.retryAttempts = meta.retryAttempts ?? 0;
     this.isTimeout = meta.isTimeout ?? false;
     this.isRateLimited = meta.isRateLimited ?? statusCode === 429;
+    this.doNotRetry = meta.doNotRetry ?? false;
   }
+}
+
+export interface SharedHttpLimiterConfig {
+  enabled: boolean;
+  maxRequestsPerWindow: number;
+  windowMs: number;
+  binanceWeightSoftLimit: number;
+  binanceWeightCooldownMs: number;
+  bybitBanCooldownMs: number;
+  maxRetryAfterMs: number;
+}
+
+function positiveEnvNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function defaultSharedHttpLimiterConfig(): SharedHttpLimiterConfig {
+  return {
+    enabled: true,
+    maxRequestsPerWindow: positiveEnvNumber('RADAR_HTTP_MAX_REQUESTS', 80),
+    windowMs: positiveEnvNumber('RADAR_HTTP_WINDOW_MS', 10_000),
+    binanceWeightSoftLimit: positiveEnvNumber(
+      'RADAR_BINANCE_WEIGHT_SOFT_LIMIT',
+      1800
+    ),
+    binanceWeightCooldownMs: positiveEnvNumber(
+      'RADAR_BINANCE_WEIGHT_COOLDOWN_MS',
+      15_000
+    ),
+    bybitBanCooldownMs: positiveEnvNumber(
+      'RADAR_BYBIT_BAN_COOLDOWN_MS',
+      10 * 60 * 1000
+    ),
+    maxRetryAfterMs: positiveEnvNumber('RADAR_HTTP_MAX_RETRY_AFTER_MS', 30_000),
+  };
+}
+
+/**
+ * 全程序共用的對外 HTTP 預算。SMC 佇列、Paper 影子監控、背景排程與跨所請求
+ * 都經過 fetchWithResilience，因此每一次真正送出的請求都記在這裡。
+ */
+export class SharedHttpBudget {
+  private timestamps: number[] = [];
+  private bybitBanUntilMs = 0;
+  private binanceWeightPauseUntilMs = 0;
+  public config: SharedHttpLimiterConfig;
+
+  constructor(config?: Partial<SharedHttpLimiterConfig>) {
+    this.config = { ...defaultSharedHttpLimiterConfig(), ...config };
+  }
+
+  public configure(partial: Partial<SharedHttpLimiterConfig>): void {
+    this.config = { ...this.config, ...partial };
+  }
+
+  public reset(partial?: Partial<SharedHttpLimiterConfig>): void {
+    this.timestamps = [];
+    this.bybitBanUntilMs = 0;
+    this.binanceWeightPauseUntilMs = 0;
+    this.config = { ...defaultSharedHttpLimiterConfig(), ...partial };
+  }
+
+  public reserve(
+    host: string,
+    now = Date.now()
+  ): { allowed: boolean; retryAfterMs: number; reason: string } {
+    if (!this.config.enabled) {
+      return { allowed: true, retryAfterMs: 0, reason: '' };
+    }
+    const hostLc = host.toLowerCase();
+    if (
+      (hostLc.includes('bybit') || hostLc.includes('bytick')) &&
+      now < this.bybitBanUntilMs
+    ) {
+      return {
+        allowed: false,
+        retryAfterMs: this.bybitBanUntilMs - now,
+        reason: 'Bybit access too frequent cooldown',
+      };
+    }
+    if (hostLc.includes('binance') && now < this.binanceWeightPauseUntilMs) {
+      return {
+        allowed: false,
+        retryAfterMs: this.binanceWeightPauseUntilMs - now,
+        reason: 'Binance X-MBX-USED-WEIGHT-1M soft limit',
+      };
+    }
+    this.timestamps = this.timestamps.filter(
+      (t) => now - t < this.config.windowMs
+    );
+    if (this.timestamps.length >= this.config.maxRequestsPerWindow) {
+      const oldest = this.timestamps[0];
+      return {
+        allowed: false,
+        retryAfterMs: Math.max(10, this.config.windowMs - (now - oldest)),
+        reason: `${this.config.maxRequestsPerWindow} req / ${this.config.windowMs}ms`,
+      };
+    }
+    this.timestamps.push(now);
+    return { allowed: true, retryAfterMs: 0, reason: '' };
+  }
+
+  public noteBybitBan(now = Date.now()): void {
+    this.bybitBanUntilMs = Math.max(
+      this.bybitBanUntilMs,
+      now + this.config.bybitBanCooldownMs
+    );
+  }
+
+  public noteBinanceUsedWeight(usedWeight: number, now = Date.now()): void {
+    if (
+      Number.isFinite(usedWeight) &&
+      usedWeight >= this.config.binanceWeightSoftLimit
+    ) {
+      this.binanceWeightPauseUntilMs = Math.max(
+        this.binanceWeightPauseUntilMs,
+        now + this.config.binanceWeightCooldownMs
+      );
+    }
+  }
+
+  public get requestCount(): number {
+    return this.timestamps.length;
+  }
+}
+
+export const sharedHttpBudget = new SharedHttpBudget();
+
+export function configureSharedHttpLimiter(
+  partial: Partial<SharedHttpLimiterConfig>
+): void {
+  sharedHttpBudget.configure(partial);
+}
+
+export function resetSharedHttpLimiter(
+  partial?: Partial<SharedHttpLimiterConfig>
+): void {
+  sharedHttpBudget.reset(partial);
+}
+
+function hostLooksBinance(host: string): boolean {
+  return host.toLowerCase().includes('binance');
+}
+
+function readBinanceUsedWeight(headers: {
+  get?: (name: string) => string | null;
+}): number | null {
+  const raw =
+    headers?.get?.('x-mbx-used-weight-1m') ??
+    headers?.get?.('X-MBX-USED-WEIGHT-1M');
+  if (raw == null || raw === '') return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseRetryAfterMs(
+  headers: { get?: (name: string) => string | null },
+  capMs: number,
+  fallbackMs: number,
+  now = Date.now()
+): { waitMs: number; exceededCap: boolean; header: string | null } {
+  const header = headers?.get?.('retry-after') ?? null;
+  if (header == null || header.trim() === '') {
+    return { waitMs: fallbackMs, exceededCap: false, header };
+  }
+  const asSeconds = Number(header);
+  let ms = Number.NaN;
+  if (Number.isFinite(asSeconds) && asSeconds >= 0) {
+    ms = asSeconds * 1000;
+  } else {
+    const dateMs = Date.parse(header);
+    if (Number.isFinite(dateMs)) ms = Math.max(0, dateMs - now);
+  }
+  if (!Number.isFinite(ms)) {
+    return { waitMs: fallbackMs, exceededCap: false, header };
+  }
+  if (ms > capMs) {
+    return { waitMs: ms, exceededCap: true, header };
+  }
+  return { waitMs: ms, exceededCap: false, header };
+}
+
+function isGeoBlockedStatus(status: number, body: string): boolean {
+  if (status === 451) return true;
+  if (status !== 403) return false;
+  const text = body.toLowerCase();
+  if (text.includes('access too frequent')) return false;
+  return (
+    text.includes('restricted location') ||
+    text.includes('block access from your country') ||
+    (text.includes('cloudfront') && text.includes('country'))
+  );
+}
+
+function isBybitAccessTooFrequent(status: number, body: string): boolean {
+  return status === 403 && /access too frequent/i.test(body);
 }
 
 export class SlidingWindowRateLimiter {
@@ -103,17 +311,22 @@ export async function fetchWithResilience<T>(
   let totalRetries = 0;
   let sawTimeout = false;
   let sawRateLimit = false;
+  let stopAllEndpoints = false;
 
-  for (let epIdx = 0; epIdx < endpoints.length; epIdx++) {
+  for (let epIdx = 0; epIdx < endpoints.length && !stopAllEndpoints; epIdx++) {
     const base = endpoints[epIdx].replace(/\/$/, '');
     const url = `${base}${path}`;
+    let skipBackoff = false;
 
     for (let attempt = 0; attempt <= maxRetriesPerEndpoint; attempt++) {
       if (attempt > 0) {
         totalRetries++;
-        const delay = retryBaseDelayMs * Math.pow(2, attempt - 1);
-        await new Promise((r) => setTimeout(r, delay));
+        if (!skipBackoff) {
+          const delay = retryBaseDelayMs * Math.pow(2, attempt - 1);
+          await new Promise((r) => setTimeout(r, delay));
+        }
       }
+      skipBackoff = false;
 
       if (rateLimiter) {
         rateLimiter.checkAndRecord(`${sourceLabel} (${base})`);
@@ -123,44 +336,119 @@ export async function fetchWithResilience<T>(
       const timer = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
+        const slot = sharedHttpBudget.reserve(base);
+        if (!slot.allowed) {
+          sawRateLimit = true;
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP 429 ${base} 共享請求預算已滿 (${slot.reason})，${slot.retryAfterMs}ms 後再試`,
+            base,
+            429,
+            {
+              retryAttempts: totalRetries,
+              isRateLimited: true,
+              doNotRetry: true,
+            }
+          );
+        }
+
         const res = await customFetch(url, {
           signal: controller.signal,
+          redirect: 'manual',
           headers: {
             Accept: 'application/json',
             'User-Agent': 'CryptoMarketRadar/2.0',
           },
         });
         clearTimeout(timer);
+        const usedWeight = readBinanceUsedWeight(res.headers);
+        if (usedWeight !== null && hostLooksBinance(base)) {
+          sharedHttpBudget.noteBinanceUsedWeight(usedWeight);
+        }
 
-        if (res.status === 429) {
-          sawRateLimit = true;
-          lastStatusCode = 429;
-          const text = await res.text().catch(() => '');
-          lastError = new ExchangeApiUnavailableError(
-            `${sourceLabel} HTTP 429 Rate Limited: ${text.slice(0, 120) || 'Too Many Requests'}`,
+        if (res.status >= 300 && res.status < 400) {
+          const location = res.headers?.get?.('location') || '';
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP ${res.status} ${base} 重新導向未跟隨${
+              location ? ` (Location: ${location.slice(0, 80)})` : ''
+            }`,
             base,
-            429,
+            res.status,
             {
               retryAttempts: totalRetries,
-              isRateLimited: true,
-              isTimeout: false,
+              doNotRetry: true,
             }
           );
-          // Retry on 429 if attempts remain
+        }
+
+        if (res.status === 429 || res.status === 418) {
+          sawRateLimit = true;
+          lastStatusCode = res.status;
+          const text = await res.text().catch(() => '');
+          const parsed = parseRetryAfterMs(
+            res.headers,
+            sharedHttpBudget.config.maxRetryAfterMs,
+            retryBaseDelayMs * Math.pow(2, attempt)
+          );
+          const message = `${sourceLabel} HTTP ${res.status} ${base} Rate Limited (Retry-After ${parsed.header ?? 'n/a'}): ${text.slice(0, 80) || 'Too Many Requests'}`;
+          if (parsed.exceededCap || attempt >= maxRetriesPerEndpoint) {
+            lastError = new ExchangeApiUnavailableError(message, base, res.status, {
+              retryAttempts: totalRetries,
+              isRateLimited: true,
+              doNotRetry: true,
+            });
+            break;
+          }
+          lastError = new ExchangeApiUnavailableError(message, base, res.status, {
+            retryAttempts: totalRetries,
+            isRateLimited: true,
+          });
+          if (parsed.waitMs > 0) {
+            await new Promise((r) => setTimeout(r, parsed.waitMs));
+          }
+          skipBackoff = true;
           continue;
         }
 
         if (!res.ok) {
           lastStatusCode = res.status;
           const text = await res.text().catch(() => '');
+          if (isGeoBlockedStatus(res.status, text)) {
+            stopAllEndpoints = true;
+            throw new ExchangeApiUnavailableError(
+              `${sourceLabel} HTTP ${res.status} ${base}: ${text.slice(0, 140) || res.statusText}`,
+              base,
+              res.status,
+              {
+                retryAttempts: totalRetries,
+                doNotRetry: true,
+              }
+            );
+          }
+          if (isBybitAccessTooFrequent(res.status, text)) {
+            sharedHttpBudget.noteBybitBan();
+            stopAllEndpoints = true;
+            sawRateLimit = true;
+            throw new ExchangeApiUnavailableError(
+              `${sourceLabel} HTTP 403 ${base} access too frequent（Bybit IP 限制，冷卻 ${sharedHttpBudget.config.bybitBanCooldownMs}ms）`,
+              base,
+              403,
+              {
+                retryAttempts: totalRetries,
+                isRateLimited: true,
+                doNotRetry: true,
+              }
+            );
+          }
+          const terminalClientError = res.status < 500;
           lastError = new ExchangeApiUnavailableError(
-            `${sourceLabel} HTTP ${res.status}: ${text.slice(0, 140) || res.statusText}`,
+            `${sourceLabel} HTTP ${res.status} ${base}: ${text.slice(0, 140) || res.statusText}`,
             base,
             res.status,
             {
               retryAttempts: totalRetries,
               isRateLimited: false,
               isTimeout: false,
+              doNotRetry: terminalClientError,
             }
           );
           // Retry on transient 5xx errors
@@ -170,7 +458,34 @@ export async function fetchWithResilience<T>(
           break;
         }
 
-        const data = (await res.json()) as T;
+        const rawText = await res.text();
+        if (!rawText.trim()) {
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP ${res.status} ${base} 回應本文為空，無法解析 JSON`,
+            base,
+            res.status,
+            {
+              retryAttempts: totalRetries,
+              doNotRetry: true,
+            }
+          );
+        }
+        let data: T;
+        try {
+          data = JSON.parse(rawText) as T;
+        } catch (parseErr) {
+          const reason =
+            parseErr instanceof Error ? parseErr.message : 'invalid JSON';
+          throw new ExchangeApiUnavailableError(
+            `${sourceLabel} HTTP ${res.status} ${base} 回應無法解析為 JSON (${reason})`,
+            base,
+            res.status,
+            {
+              retryAttempts: totalRetries,
+              doNotRetry: true,
+            }
+          );
+        }
         return {
           data,
           endpointUsed: base,
@@ -179,6 +494,11 @@ export async function fetchWithResilience<T>(
         };
       } catch (err) {
         clearTimeout(timer);
+        if (err instanceof ExchangeApiUnavailableError && err.doNotRetry) {
+          lastError = err;
+          lastStatusCode = err.statusCode ?? lastStatusCode;
+          break;
+        }
         if (err instanceof ExchangeApiUnavailableError && err.isRateLimited) {
           throw err;
         }
@@ -293,8 +613,16 @@ interface BinanceExchangeInfoResponse {
     status: string;
     baseAsset: string;
     quoteAsset: string;
+    underlyingType?: string;
+    underlyingSubType?: string[];
   }>;
 }
+
+type SymbolMeta = {
+  baseAsset: string;
+  quoteAsset: string;
+  instrument: InstrumentIdentity;
+};
 
 interface Binance24hrTickerRaw {
   symbol: string;
@@ -349,7 +677,7 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
   public readonly status: ExchangeStatus = 'LIVE';
 
   private readonly config: AdapterClientConfig;
-  private cachedSymbols: Map<string, { baseAsset: string; quoteAsset: string }> | null = null;
+  private cachedSymbols: Map<string, SymbolMeta> | null = null;
   private cachedSymbolsTimestamp = 0;
 
   constructor(config: AdapterClientConfig = {}) {
@@ -370,7 +698,7 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
   }
 
   private async getTradingUsdtPerpetualMap(): Promise<{
-    map: Map<string, { baseAsset: string; quoteAsset: string }>;
+    map: Map<string, SymbolMeta>;
     endpointUsed: string;
     usedFallback: boolean;
   }> {
@@ -387,7 +715,7 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
     const { data, endpointUsed, usedFallbackEndpoint } =
       await this.request<BinanceExchangeInfoResponse>('/fapi/v1/exchangeInfo');
 
-    const map = new Map<string, { baseAsset: string; quoteAsset: string }>();
+    const map = new Map<string, SymbolMeta>();
     for (const s of data.symbols || []) {
       if (
         s.contractType === 'PERPETUAL' &&
@@ -397,6 +725,12 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
         map.set(s.symbol, {
           baseAsset: s.baseAsset,
           quoteAsset: s.quoteAsset,
+          instrument: classifyFromExchangeFields({
+            underlyingType: s.underlyingType,
+            underlyingSubType: s.underlyingSubType,
+            underlying: s.baseAsset,
+            baseAsset: s.baseAsset,
+          }),
         });
       }
     }
@@ -517,6 +851,7 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
         nextFundingTime: funding?.nextTime ?? null,
         openInterest: null,
         openInterestValue: null,
+        instrument: meta.instrument,
         provenance: {
           source: sourceLabel,
           fetchedAt,
@@ -844,6 +1179,14 @@ const BYBIT_INTERVAL_MAP: Record<Timeframe, string> = {
   '4h': '240',
 };
 
+interface BybitInstrumentRaw {
+  symbol: string;
+  baseCoin?: string;
+  quoteCoin?: string;
+  contractType?: string;
+  symbolType?: string;
+}
+
 export class BybitFuturesAdapter implements ExchangeAdapter {
   public readonly id: ExchangeId = 'bybit_linear';
   public readonly displayName = 'Bybit USDT Perpetual (Public REST V5)';
@@ -852,6 +1195,8 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
   public readonly status: ExchangeStatus = 'LIVE';
 
   private readonly config: AdapterClientConfig;
+  private instrumentCache: Map<string, InstrumentIdentity> | null = null;
+  private instrumentCacheAt = 0;
 
   constructor(config: AdapterClientConfig = {}) {
     this.config = config;
@@ -870,15 +1215,65 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
     });
   }
 
+  private async getLinearInstrumentMap(): Promise<Map<
+    string,
+    InstrumentIdentity
+  > | null> {
+    const now = Date.now();
+    if (this.instrumentCache && now - this.instrumentCacheAt < 10 * 60 * 1000) {
+      return this.instrumentCache;
+    }
+    try {
+      const map = new Map<string, InstrumentIdentity>();
+      let cursor = '';
+      for (let page = 0; page < 20; page++) {
+        const query = `/v5/market/instruments-info?category=linear&limit=1000${
+          cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''
+        }`;
+        const { data } = await this.request<{
+          category: string;
+          list: BybitInstrumentRaw[];
+          nextPageCursor?: string;
+        }>(query);
+        if (data.retCode !== 0 || !Array.isArray(data.result?.list)) {
+          return null;
+        }
+        for (const item of data.result.list) {
+          if (!item.symbol?.endsWith('USDT')) continue;
+          map.set(
+            item.symbol,
+            classifyFromExchangeFields({
+              symbolType: item.symbolType,
+              underlying: item.baseCoin,
+              baseAsset: item.baseCoin,
+            })
+          );
+        }
+        const next = data.result.nextPageCursor || '';
+        if (!next || next === cursor) break;
+        cursor = next;
+      }
+      this.instrumentCache = map;
+      this.instrumentCacheAt = now;
+      return map;
+    } catch {
+      return null;
+    }
+  }
+
   public async fetchMarketSnapshot(): Promise<{
     tickers: MarketTicker[];
     provenance: DataProvenance;
   }> {
     const fetchedAt = new Date().toISOString();
-    const { data, endpointUsed, usedFallbackEndpoint } = await this.request<{
-      category: string;
-      list: BybitLinearTickerRaw[];
-    }>('/v5/market/tickers?category=linear');
+    const [{ data, endpointUsed, usedFallbackEndpoint }, instrumentMap] =
+      await Promise.all([
+        this.request<{
+          category: string;
+          list: BybitLinearTickerRaw[];
+        }>('/v5/market/tickers?category=linear'),
+        this.getLinearInstrumentMap(),
+      ]);
 
     if (data.retCode !== 0 || !data.result?.list) {
       throw new ExchangeApiUnavailableError(
@@ -956,6 +1351,8 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
         nextFundingTime,
         openInterest,
         openInterestValue,
+        instrument:
+          instrumentMap?.get(raw.symbol) ?? unverifiedInstrument(baseAsset),
         provenance: {
           source: sourceLabel,
           fetchedAt,
@@ -974,7 +1371,7 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
         fetchedAt,
         stale: isStale,
         fallback: usedFallbackEndpoint,
-        missingData: [],
+        missingData: instrumentMap ? [] : ['INSTRUMENT_METADATA'],
         isDemo: false,
       },
     };
@@ -1306,6 +1703,13 @@ export function fromBingXSymbol(bingxSymbol: string): string {
   return bingxSymbol.replace('-', '').toUpperCase();
 }
 
+interface BingXContractRaw {
+  symbol: string;
+  asset?: string;
+  currency?: string;
+  displayName?: string;
+}
+
 export class BingXFuturesAdapter implements ExchangeAdapter {
   public readonly id: ExchangeId = 'bingx_swap';
   public readonly displayName = 'BingX Perpetual Swap (Public REST V2/V3)';
@@ -1314,6 +1718,8 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
   public readonly status: ExchangeStatus = 'LIVE';
 
   private readonly config: AdapterClientConfig;
+  private contractCache: Map<string, InstrumentIdentity> | null = null;
+  private contractCacheAt = 0;
 
   constructor(config: AdapterClientConfig = {}) {
     this.config = config;
@@ -1332,6 +1738,39 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
     });
   }
 
+  private async getContractIdentityMap(): Promise<Map<
+    string,
+    InstrumentIdentity
+  > | null> {
+    const now = Date.now();
+    if (this.contractCache && now - this.contractCacheAt < 10 * 60 * 1000) {
+      return this.contractCache;
+    }
+    try {
+      const { data } = await this.request<BingXContractRaw[]>(
+        '/openApi/swap/v2/quote/contracts'
+      );
+      if (data.code !== 0 || !Array.isArray(data.data)) return null;
+      const map = new Map<string, InstrumentIdentity>();
+      for (const row of data.data) {
+        if (!row.symbol) continue;
+        const symbol = fromBingXSymbol(row.symbol);
+        map.set(
+          symbol,
+          classifyFromExchangeFields({
+            underlying: row.asset || row.displayName,
+            baseAsset: row.asset,
+          })
+        );
+      }
+      this.contractCache = map;
+      this.contractCacheAt = now;
+      return map;
+    } catch {
+      return null;
+    }
+  }
+
   public async fetchMarketSnapshot(): Promise<{
     tickers: MarketTicker[];
     provenance: DataProvenance;
@@ -1339,11 +1778,12 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
     const fetchedAt = new Date().toISOString();
     const nowMs = Date.now();
 
-    const [tickerRes, premiumRes] = await Promise.all([
+    const [tickerRes, premiumRes, contractMap] = await Promise.all([
       this.request<BingXTickerRaw[]>('/openApi/swap/v2/quote/ticker'),
       this.request<BingXPremiumRaw[]>(
         '/openApi/swap/v2/quote/premiumIndex'
       ).catch(() => null),
+      this.getContractIdentityMap(),
     ]);
 
     if (tickerRes.data.code !== 0 || !Array.isArray(tickerRes.data.data)) {
@@ -1429,6 +1869,8 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
         nextFundingTime: funding?.nextTime ?? null,
         openInterest: null,
         openInterestValue: null,
+        instrument:
+          contractMap?.get(symbol) ?? unverifiedInstrument(baseAsset),
         provenance: {
           source: sourceLabel,
           fetchedAt,
@@ -1924,6 +2366,12 @@ export class DemoExchangeAdapter implements ExchangeAdapter {
         openInterest: seed.openInterest,
         openInterestValue:
           seed.openInterest !== null ? seed.openInterest * seed.lastPrice : null,
+        instrument: classifyFromExchangeFields({
+          symbolType: 'crypto',
+          underlyingType: 'COIN',
+          underlying: seed.baseAsset,
+          baseAsset: seed.baseAsset,
+        }),
         provenance: {
           source: 'DEMO_SYNTHETIC_DATASET',
           fetchedAt,

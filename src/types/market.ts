@@ -59,6 +59,13 @@ export interface MarketTicker {
   symbol: string;
   baseAsset: string;
   quoteAsset: string;
+  /** Present when the adapter attached venue instrument metadata. */
+  instrument?: {
+    assetClass: 'crypto' | 'tradfi' | 'unverified';
+    underlying: string | null;
+    symbolType: string | null;
+    metadataAvailable: boolean;
+  };
   lastPrice: number;
   priceChangePercent24h: number;
   quoteVolume24h: number;
@@ -641,6 +648,11 @@ export interface CrossExchangeVenueLeg {
   exchange: ExchangeId;
   displayName: string;
   available: boolean;
+  assetClass?: 'crypto' | 'tradfi' | 'unverified';
+  underlying?: string | null;
+  symbolType?: string | null;
+  /** False when this leg is shown but excluded from price/funding/OI math. */
+  comparisonIncluded?: boolean;
   lastPrice: number | null;
   bidPrice: number | null;
   askPrice: number | null;

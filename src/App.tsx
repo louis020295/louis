@@ -64,6 +64,27 @@ type ActiveSection =
 const WATCHLIST_STORAGE_KEY = 'crypto_radar_watchlist_v1';
 const THEME_STORAGE_KEY = 'crypto_radar_theme_v1';
 
+function legAssetLabel(leg: {
+  available: boolean;
+  assetClass?: 'crypto' | 'tradfi' | 'unverified';
+  underlying?: string | null;
+  symbolType?: string | null;
+  comparisonIncluded?: boolean;
+}): string | null {
+  if (!leg.available) return null;
+  const kind =
+    leg.assetClass === 'tradfi'
+      ? 'TradFi'
+      : leg.assetClass === 'crypto'
+        ? 'Crypto'
+        : '未驗證';
+  const parts = [kind];
+  if (leg.underlying) parts.push(leg.underlying);
+  if (leg.symbolType) parts.push(leg.symbolType);
+  if (leg.comparisonIncluded === false) parts.push('不納入價差');
+  return parts.join(' · ');
+}
+
 export default function App() {
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>(() => {
     try {
@@ -225,7 +246,11 @@ export default function App() {
 
   // 1. Execute Full Market Scan
   const executeMarketScan = useCallback(
-    async (overrideMode?: 'live' | 'demo', overrideExchange?: ExchangeId) => {
+    async (
+      overrideMode?: 'live' | 'demo',
+      overrideExchange?: ExchangeId,
+      enqueueSmc = false
+    ) => {
       const targetMode = overrideMode ?? dataMode;
       const targetExchange = overrideExchange ?? selectedExchange;
 
@@ -237,6 +262,8 @@ export default function App() {
           mode: targetMode,
           exchange: targetExchange,
           minQuoteVolume24h: String(minQuoteVolume24h),
+          // 頁面載入與切換交易所只拉行情。全市場 SMC 要由手動掃描或 SMC 啟動鈕觸發。
+          autoStartSmc: enqueueSmc ? 'true' : 'false',
         });
         const res = await fetch(`/api/scan?${params.toString()}`);
         setLastHttpStatus(res.status);
@@ -818,7 +845,7 @@ export default function App() {
           const status = (await res.json()) as SmcScanStatusResponse;
           setSmcScanStatus(status);
           if (action === 'step' || action === 'start') {
-            await executeMarketScan(dataMode, selectedExchange);
+            await executeMarketScan(dataMode, selectedExchange, true);
           }
         }
       } finally {
@@ -1333,7 +1360,7 @@ export default function App() {
         <div className="flex items-center shrink-0">
           <button
             type="button"
-            onClick={() => executeMarketScan()}
+            onClick={() => executeMarketScan(undefined, undefined, true)}
             disabled={scanLoading}
             className="flex items-center gap-2 rounded-full bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 shadow-sm hover:bg-amber-400 disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
           >
@@ -6405,6 +6432,11 @@ export default function App() {
                               {b.available && b.lastPrice !== null ? (
                                 <>
                                   <div>${formatPriceDynamic(b.lastPrice)}</div>
+                                  {legAssetLabel(b) && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {legAssetLabel(b)}
+                                    </div>
+                                  )}
                                   <div className="text-[10px] text-slate-400">
                                     F:{' '}
                                     {b.fundingRate !== null
@@ -6424,6 +6456,11 @@ export default function App() {
                               {y.available && y.lastPrice !== null ? (
                                 <>
                                   <div>${formatPriceDynamic(y.lastPrice)}</div>
+                                  {legAssetLabel(y) && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {legAssetLabel(y)}
+                                    </div>
+                                  )}
                                   <div className="text-[10px] text-slate-400">
                                     F:{' '}
                                     {y.fundingRate !== null
@@ -6443,6 +6480,11 @@ export default function App() {
                               {x.available && x.lastPrice !== null ? (
                                 <>
                                   <div>${formatPriceDynamic(x.lastPrice)}</div>
+                                  {legAssetLabel(x) && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {legAssetLabel(x)}
+                                    </div>
+                                  )}
                                   <div className="text-[10px] text-slate-400">
                                     F:{' '}
                                     {x.fundingRate !== null

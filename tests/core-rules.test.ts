@@ -13,6 +13,8 @@ import {
   fetchWithResilience,
   generateDeterministicHistoricalOiAndFunding,
   generateDeterministicSmcKlines,
+  resetSharedHttpLimiter,
+  sharedHttpBudget,
   SlidingWindowRateLimiter,
 } from '../server/adapters/ExchangeAdapter.ts';
 import {
@@ -22,6 +24,10 @@ import {
 import { RadarDatabase } from '../server/db/RadarDatabase.ts';
 import { BacktestEngine } from '../server/engine/BacktestEngine.ts';
 import { evaluateCrossExchangeDivergence } from '../server/engine/CrossExchangeDivergenceEngine.ts';
+import {
+  classifyFromExchangeFields,
+  InstrumentIdentity,
+} from '../server/engine/InstrumentIdentity.ts';
 import {
   LOW_LIQUIDITY_POLICY,
   MAX_ALLOWED_SPREAD_PERCENT,
@@ -908,6 +914,12 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
             nextFundingTime: Date.now(),
             openInterest: 1_000_000,
             openInterestValue: 200_000_000,
+            instrument: {
+              assetClass: 'crypto',
+              underlying: 'SOL',
+              symbolType: 'COIN',
+              metadataAvailable: true,
+            },
             provenance: binanceProv,
           },
         ],
@@ -931,6 +943,12 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
             nextFundingTime: Date.now(),
             openInterest: 800_000,
             openInterestValue: 160_960_000,
+            instrument: {
+              assetClass: 'crypto',
+              underlying: 'SOL',
+              symbolType: 'crypto',
+              metadataAvailable: true,
+            },
             provenance: bybitProv,
           },
         ],
@@ -954,6 +972,12 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
             nextFundingTime: Date.now(),
             openInterest: 300_000,
             openInterestValue: 59_940_000,
+            instrument: {
+              assetClass: 'crypto',
+              underlying: 'SOL',
+              symbolType: 'COIN',
+              metadataAvailable: true,
+            },
             provenance: bingxProv,
           },
         ],
@@ -978,6 +1002,157 @@ describe('4. 多交易所 Provenance 與跨交易所背離引擎 (Multi-Exchange
     assert.equal(sol.legs.binance_usdm.provenance.isDemo, false);
     assert.equal(sol.legs.bybit_linear.provenance.isDemo, false);
     assert.equal(sol.legs.bingx_swap.provenance.isDemo, false);
+    assert.equal(sol.legs.bybit_linear.comparisonIncluded, true);
+  });
+
+  it('Bybit 股票永續 ONUSDT 不與 Binance/BingX 加密 ON 比較（mock 身分，非即時端點）', () => {
+    const cryptoOn = {
+      assetClass: 'crypto' as const,
+      underlying: 'ON',
+      symbolType: 'COIN',
+      metadataAvailable: true,
+    };
+    const stockOn = classifyFromExchangeFields({
+      symbolType: 'stock',
+      underlying: 'ON Semiconductor Corp',
+      baseAsset: 'ON',
+    });
+    assert.equal(stockOn.assetClass, 'tradfi');
+    assert.equal(stockOn.metadataAvailable, true);
+    assert.equal(
+      classifyFromExchangeFields({
+        underlyingType: 'COIN',
+        underlyingSubType: ['Layer-1'],
+        baseAsset: 'ON',
+      }).assetClass,
+      'crypto'
+    );
+    assert.equal(
+      classifyFromExchangeFields({ baseAsset: 'ON', underlying: 'ON' })
+        .metadataAvailable,
+      false
+    );
+
+    const prov = (source: string): DataProvenance => ({
+      source,
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [],
+      isDemo: false,
+    });
+    const leg = (
+      symbol: string,
+      price: number,
+      instrument: InstrumentIdentity
+    ) => ({
+      symbol,
+      baseAsset: 'ON',
+      quoteAsset: 'USDT',
+      lastPrice: price,
+      bidPrice: price - 0.01,
+      askPrice: price + 0.01,
+      priceChangePercent24h: 1,
+      quoteVolume24h: 1_000_000,
+      fundingRate: 0.0001,
+      nextFundingTime: Date.now(),
+      openInterest: 10,
+      openInterestValue: price * 10,
+      instrument,
+      provenance: prov('mock'),
+    });
+
+    const divRes = evaluateCrossExchangeDivergence({
+      binance_usdm: {
+        exchange: 'binance_usdm',
+        displayName: 'Binance',
+        available: true,
+        provenance: prov('binance'),
+        tickers: [leg('ONUSDT', 0.1896, cryptoOn)],
+      },
+      bybit_linear: {
+        exchange: 'bybit_linear',
+        displayName: 'Bybit',
+        available: true,
+        provenance: prov('bybit'),
+        tickers: [leg('ONUSDT', 63.21, stockOn)],
+      },
+      bingx_swap: {
+        exchange: 'bingx_swap',
+        displayName: 'BingX',
+        available: true,
+        provenance: prov('bingx'),
+        tickers: [leg('ONUSDT', 0.1883, cryptoOn)],
+      },
+    });
+
+    assert.equal(divRes.items.length, 1);
+    const on = divRes.items[0];
+    assert.equal(on.legs.bybit_linear.comparisonIncluded, false);
+    assert.equal(on.legs.bybit_linear.assetClass, 'tradfi');
+    assert.equal(on.legs.bybit_linear.underlying, 'ON Semiconductor Corp');
+    assert.equal(on.legs.binance_usdm.comparisonIncluded, true);
+    assert.equal(on.legs.bingx_swap.comparisonIncluded, true);
+    assert.ok(
+      on.priceDivergencePercent !== null && on.priceDivergencePercent < 1
+    );
+    assert.ok(
+      on.divergenceFlags.some((flag) => flag.includes('標的類型不同'))
+    );
+    assert.ok(!on.maxPriceExchange || on.maxPriceExchange !== 'bybit_linear');
+  });
+
+  it('缺少交易所中繼資料時標成未驗證，不計算跨所價差（mock）', () => {
+    const prov: DataProvenance = {
+      source: 'mock',
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [],
+      isDemo: false,
+    };
+    const bare = (price: number) => ({
+      symbol: 'ONUSDT',
+      baseAsset: 'ON',
+      quoteAsset: 'USDT',
+      lastPrice: price,
+      bidPrice: price,
+      askPrice: price,
+      priceChangePercent24h: 0,
+      quoteVolume24h: 1,
+      fundingRate: 0.0001,
+      nextFundingTime: Date.now(),
+      openInterest: null,
+      openInterestValue: null,
+      provenance: prov,
+    });
+    const divRes = evaluateCrossExchangeDivergence({
+      binance_usdm: {
+        exchange: 'binance_usdm',
+        displayName: 'Binance',
+        available: true,
+        provenance: prov,
+        tickers: [bare(0.19)],
+      },
+      bybit_linear: {
+        exchange: 'bybit_linear',
+        displayName: 'Bybit',
+        available: true,
+        provenance: prov,
+        tickers: [bare(63.21)],
+      },
+      bingx_swap: {
+        exchange: 'bingx_swap',
+        displayName: 'BingX',
+        available: false,
+        provenance: prov,
+        tickers: [],
+      },
+    });
+    assert.equal(divRes.items.length, 1);
+    assert.equal(divRes.items[0].priceDivergencePercent, null);
+    assert.equal(divRes.items[0].legs.binance_usdm.assetClass, 'unverified');
+    assert.equal(divRes.items[0].legs.bybit_linear.comparisonIncluded, false);
   });
 });
 
@@ -1085,6 +1260,308 @@ describe('5. 斷線重試、Rate Limit、Timeout 與 API Failure 測試 (Failure
         return true;
       }
     );
+  });
+
+  it('空本文與無法解析的 JSON 保留上游 HTTP 狀態與 host，且不把錯誤收成單純的 Unexpected end of JSON input', async () => {
+    let emptyCalls = 0;
+    const emptyFetch: typeof globalThis.fetch = async () => {
+      emptyCalls += 1;
+      return new Response('', { status: 200, statusText: 'OK' });
+    };
+
+    await assert.rejects(
+      async () => {
+        await fetchWithResilience({
+          endpoints: ['https://fapi1.binance.com'],
+          path: '/fapi/v1/exchangeInfo',
+          sourceLabel: 'Binance USDⓈ-M Futures REST',
+          timeoutMs: 2000,
+          maxRetriesPerEndpoint: 2,
+          retryBaseDelayMs: 5,
+          customFetch: emptyFetch,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ExchangeApiUnavailableError);
+        assert.equal(err.statusCode, 200);
+        assert.match(err.message, /HTTP 200/);
+        assert.match(err.message, /https:\/\/fapi1\.binance\.com/);
+        assert.match(err.message, /回應本文為空/);
+        assert.doesNotMatch(err.message, /^Unexpected end of JSON input$/);
+        return true;
+      }
+    );
+    assert.equal(emptyCalls, 1);
+
+    const badJsonFetch: typeof globalThis.fetch = async () =>
+      new Response('not-json', { status: 202 });
+    await assert.rejects(
+      async () => {
+        await fetchWithResilience({
+          endpoints: ['https://fapi2.binance.com'],
+          path: '/fapi/v1/ticker/24hr',
+          sourceLabel: 'Binance USDⓈ-M Futures REST',
+          maxRetriesPerEndpoint: 2,
+          retryBaseDelayMs: 5,
+          customFetch: badJsonFetch,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ExchangeApiUnavailableError);
+        assert.equal(err.statusCode, 202);
+        assert.match(err.message, /HTTP 202/);
+        assert.match(err.message, /https:\/\/fapi2\.binance\.com/);
+        assert.match(err.message, /無法解析為 JSON/);
+        return true;
+      }
+    );
+  });
+
+  it('3xx 重新導向不跟隨，錯誤訊息含狀態碼、host 與 Location', async () => {
+    let calls = 0;
+    const redirectFetch: typeof globalThis.fetch = async (_url, init) => {
+      calls += 1;
+      assert.equal(init?.redirect, 'manual');
+      return new Response('', {
+        status: 302,
+        headers: { Location: 'https://www.binance.com/en' },
+      });
+    };
+
+    await assert.rejects(
+      async () => {
+        await fetchWithResilience({
+          endpoints: ['https://fapi1.binance.com', 'https://fapi2.binance.com'],
+          path: '/fapi/v1/ticker/24hr',
+          sourceLabel: 'Binance USDⓈ-M Futures REST',
+          maxRetriesPerEndpoint: 3,
+          retryBaseDelayMs: 5,
+          customFetch: redirectFetch,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ExchangeApiUnavailableError);
+        assert.equal(err.statusCode, 302);
+        assert.match(err.message, /HTTP 302/);
+        assert.match(err.message, /binance\.com/);
+        assert.match(err.message, /重新導向未跟隨/);
+        assert.match(err.message, /Location: https:\/\/www\.binance\.com\/en/);
+        return true;
+      }
+    );
+    assert.equal(calls, 2);
+  });
+
+  it('共享限制器計算每一次真實 HTTP，超額時不再送出（mock）', async () => {
+    resetSharedHttpLimiter({
+      enabled: true,
+      maxRequestsPerWindow: 2,
+      windowMs: 60_000,
+    });
+    let calls = 0;
+    const mockFetch: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    try {
+      await fetchWithResilience({
+        endpoints: ['https://example.test'],
+        path: '/a',
+        sourceLabel: 'LIMIT_A',
+        maxRetriesPerEndpoint: 0,
+        customFetch: mockFetch,
+      });
+      await fetchWithResilience({
+        endpoints: ['https://example.test'],
+        path: '/b',
+        sourceLabel: 'LIMIT_B',
+        maxRetriesPerEndpoint: 0,
+        customFetch: mockFetch,
+      });
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://example.test'],
+            path: '/c',
+            sourceLabel: 'LIMIT_C',
+            maxRetriesPerEndpoint: 2,
+            retryBaseDelayMs: 5,
+            customFetch: mockFetch,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.statusCode, 429);
+          assert.equal(err.isRateLimited, true);
+          assert.match(err.message, /共享請求預算已滿/);
+          return true;
+        }
+      );
+      assert.equal(calls, 2);
+      assert.equal(sharedHttpBudget.requestCount, 2);
+    } finally {
+      resetSharedHttpLimiter();
+    }
+  });
+
+  it('HTTP 451 與地區封鎖 403 不重試、不改打備援 host（mock）', async () => {
+    resetSharedHttpLimiter();
+    let calls = 0;
+    const blocked: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          msg: "Service unavailable from a restricted location according to 'b. Eligibility'",
+        }),
+        { status: 451 }
+      );
+    };
+    try {
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: [
+              'https://fapi.binance.com',
+              'https://fapi1.binance.com',
+            ],
+            path: '/fapi/v1/ticker/24hr',
+            sourceLabel: 'Binance USDⓈ-M Futures REST',
+            maxRetriesPerEndpoint: 3,
+            retryBaseDelayMs: 5,
+            customFetch: blocked,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.statusCode, 451);
+          assert.match(err.message, /HTTP 451/);
+          assert.match(err.message, /https:\/\/fapi\.binance\.com/);
+          return true;
+        }
+      );
+      assert.equal(calls, 1);
+    } finally {
+      resetSharedHttpLimiter();
+    }
+  });
+
+  it('Bybit 403 access too frequent 視為限流並進入約 10 分鐘冷卻，後續請求不再送出（mock）', async () => {
+    resetSharedHttpLimiter({ bybitBanCooldownMs: 10 * 60 * 1000 });
+    let calls = 0;
+    const banned: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response('403, access too frequent', { status: 403 });
+    };
+    try {
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://api.bybit.com', 'https://api.bytick.com'],
+            path: '/v5/market/tickers?category=linear',
+            sourceLabel: 'Bybit V5 Linear REST',
+            maxRetriesPerEndpoint: 2,
+            retryBaseDelayMs: 5,
+            customFetch: banned,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.statusCode, 403);
+          assert.equal(err.isRateLimited, true);
+          assert.match(err.message, /access too frequent/);
+          return true;
+        }
+      );
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://api.bybit.com'],
+            path: '/v5/market/kline',
+            sourceLabel: 'Bybit V5 Linear REST',
+            maxRetriesPerEndpoint: 1,
+            customFetch: banned,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.match(err.message, /Bybit access too frequent cooldown/);
+          return true;
+        }
+      );
+      assert.equal(calls, 1);
+    } finally {
+      resetSharedHttpLimiter();
+    }
+  });
+
+  it('Retry-After 超過上限時不在請求內空等，並保留標頭秒數；Binance 權重標頭會暫停後續 Binance 請求（mock）', async () => {
+    resetSharedHttpLimiter({
+      maxRetryAfterMs: 1000,
+      binanceWeightSoftLimit: 1800,
+      binanceWeightCooldownMs: 60_000,
+      maxRequestsPerWindow: 50,
+    });
+    let calls = 0;
+    const limited: typeof globalThis.fetch = async () => {
+      calls += 1;
+      return new Response('slow down', {
+        status: 429,
+        headers: { 'Retry-After': '120' },
+      });
+    };
+    try {
+      const started = Date.now();
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://fapi.binance.com'],
+            path: '/fapi/v1/klines',
+            sourceLabel: 'Binance USDⓈ-M Futures REST',
+            maxRetriesPerEndpoint: 3,
+            retryBaseDelayMs: 5,
+            customFetch: limited,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.equal(err.isRateLimited, true);
+          assert.match(err.message, /Retry-After 120/);
+          return true;
+        }
+      );
+      assert.ok(Date.now() - started < 500);
+      assert.equal(calls, 1);
+
+      calls = 0;
+      const weighted: typeof globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'X-MBX-USED-WEIGHT-1M': '1800' },
+        });
+      };
+      await fetchWithResilience({
+        endpoints: ['https://fapi.binance.com'],
+        path: '/fapi/v1/premiumIndex',
+        sourceLabel: 'Binance USDⓈ-M Futures REST',
+        maxRetriesPerEndpoint: 0,
+        customFetch: weighted,
+      });
+      await assert.rejects(
+        () =>
+          fetchWithResilience({
+            endpoints: ['https://fapi.binance.com'],
+            path: '/fapi/v1/ticker/24hr',
+            sourceLabel: 'Binance USDⓈ-M Futures REST',
+            maxRetriesPerEndpoint: 1,
+            customFetch: weighted,
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ExchangeApiUnavailableError);
+          assert.match(err.message, /X-MBX-USED-WEIGHT-1M/);
+          return true;
+        }
+      );
+      assert.equal(calls, 1);
+    } finally {
+      resetSharedHttpLimiter();
+    }
   });
 });
 

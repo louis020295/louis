@@ -7,6 +7,10 @@ import {
   MarketTicker,
   TRADING_SAFETY_FLAGS,
 } from '../../src/types/market.ts';
+import {
+  comparisonGroupKey,
+  unverifiedInstrument,
+} from './InstrumentIdentity.ts';
 
 export interface VenueSnapshotInput {
   exchange: 'binance_usdm' | 'bybit_linear' | 'bingx_swap';
@@ -109,10 +113,19 @@ export function evaluateCrossExchangeDivergence(
           legMissing.push('BID_ASK_SPREAD');
         }
 
+        const identity = ticker.instrument ?? unverifiedInstrument(ticker.baseAsset);
+        if (!identity.metadataAvailable && !legMissing.includes('INSTRUMENT_METADATA')) {
+          legMissing.push('INSTRUMENT_METADATA');
+        }
+
         legs[vId] = {
           exchange: vId,
           displayName: venueMeta.displayName,
           available: true,
+          assetClass: identity.assetClass,
+          underlying: identity.underlying,
+          symbolType: identity.symbolType,
+          comparisonIncluded: false,
           lastPrice: ticker.lastPrice,
           bidPrice: hasValidBook ? ticker.bidPrice! : null,
           askPrice: hasValidBook ? ticker.askPrice! : null,
@@ -132,6 +145,10 @@ export function evaluateCrossExchangeDivergence(
           exchange: vId,
           displayName: venueMeta.displayName,
           available: false,
+          assetClass: 'unverified',
+          underlying: null,
+          symbolType: null,
+          comparisonIncluded: false,
           lastPrice: null,
           bidPrice: null,
           askPrice: null,
@@ -162,8 +179,31 @@ export function evaluateCrossExchangeDivergence(
       continue;
     }
 
-    // 1. Price Divergence
-    const validPrices = VENUE_IDS.map((vId) => ({
+    const groups = new Map<string, ExchangeId[]>();
+    for (const vId of VENUE_IDS) {
+      const ticker = tickerMaps[vId].get(symbol);
+      const key = legs[vId].available
+        ? comparisonGroupKey(ticker?.instrument, ticker?.baseAsset)
+        : null;
+      if (!key) continue;
+      const list = groups.get(key) ?? [];
+      list.push(vId);
+      groups.set(key, list);
+    }
+    let comparableVenues: ExchangeId[] = [];
+    for (const list of groups.values()) {
+      if (list.length > comparableVenues.length) comparableVenues = list;
+    }
+    if (comparableVenues.length < 2) comparableVenues = [];
+    const compareSet = new Set(comparableVenues);
+    for (const vId of VENUE_IDS) {
+      if (legs[vId].available) {
+        legs[vId].comparisonIncluded = compareSet.has(vId);
+      }
+    }
+
+    // 1. Price Divergence — only venues whose exchange metadata says they are the same asset class and underlying
+    const validPrices = VENUE_IDS.filter((vId) => compareSet.has(vId)).map((vId) => ({
       exchange: vId,
       price: legs[vId].lastPrice,
     })).filter(
@@ -187,7 +227,7 @@ export function evaluateCrossExchangeDivergence(
     }
 
     // 2. Funding Rate Divergence (in bps: 0.01% = 1 bps)
-    const validFundings = VENUE_IDS.map((vId) => ({
+    const validFundings = VENUE_IDS.filter((vId) => compareSet.has(vId)).map((vId) => ({
       exchange: vId,
       funding: legs[vId].fundingRate,
     })).filter(
@@ -211,7 +251,9 @@ export function evaluateCrossExchangeDivergence(
     }
 
     // 3. Spread Divergence
-    const validSpreads = VENUE_IDS.map((vId) => legs[vId].spreadPercent).filter(
+    const validSpreads = VENUE_IDS.filter((vId) => compareSet.has(vId))
+      .map((vId) => legs[vId].spreadPercent)
+      .filter(
       (s): s is number => s !== null && Number.isFinite(s)
     );
     let spreadDivergencePercent: number | null = null;
@@ -222,7 +264,7 @@ export function evaluateCrossExchangeDivergence(
     }
 
     // 4. Open Interest Comparison & Divergence
-    const validOis = VENUE_IDS.map((vId) => ({
+    const validOis = VENUE_IDS.filter((vId) => compareSet.has(vId)).map((vId) => ({
       exchange: vId,
       oiUsd: legs[vId].openInterestValue,
     })).filter(
@@ -258,6 +300,18 @@ export function evaluateCrossExchangeDivergence(
     }
 
     const divergenceFlags: string[] = [];
+    for (const vId of VENUE_IDS) {
+      if (!legs[vId].available || legs[vId].comparisonIncluded) continue;
+      if (legs[vId].assetClass === 'unverified' || !tickerMaps[vId].get(symbol)?.instrument?.metadataAvailable) {
+        divergenceFlags.push(`未驗證標的，不納入價差 (${vId})`);
+      } else {
+        divergenceFlags.push(
+          `標的類型不同，不與其他類別比較 (${vId} ${legs[vId].assetClass}${
+            legs[vId].underlying ? `:${legs[vId].underlying}` : ''
+          })`
+        );
+      }
+    }
     if (priceDivergencePercent !== null && priceDivergencePercent >= 0.25) {
       divergenceFlags.push(
         `跨所價差背離 (${priceDivergencePercent.toFixed(3)}%: ${maxPriceExchange} vs ${minPriceExchange})`
