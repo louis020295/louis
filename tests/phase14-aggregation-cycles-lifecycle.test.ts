@@ -26,8 +26,8 @@ import {
   PaperQualityWindowReportResponse,
   SmcScanResultRecord,
 } from '../src/types/market.ts';
+import { startLocalTestServer } from './helpers/localTestServer.ts';
 
-const TEST_BASE_URL = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
 
 function createTempDb() {
   const tmpDir = fs.mkdtempSync(
@@ -79,7 +79,7 @@ function makeSmcResultRecord(
 }
 
 function seedFourScanCyclesWithLatest236() {
-  const { db } = createTempDb();
+  const { db, dbPath } = createTempDb();
   const monitorDb = new PaperMonitorDatabase(db);
   const tracker = new SignalOutcomeTracker({ paperMonitorDb: monitorDb });
   const adapters = createTestAdapters();
@@ -231,6 +231,7 @@ function seedFourScanCyclesWithLatest236() {
 
   return {
     db,
+    dbPath,
     monitorDb,
     monitor,
     anchorIso,
@@ -567,6 +568,11 @@ test('Phase 14 (8, 9 & 10): signal-history 完整保存候選訊號 8 階段生�
 });
 
 test('Phase 14 (11): 實機 HTTP 整合驗證 — /api/paper-quality/cycles、/cycles/:cycleId、/signal-history、/status、/report、/gate-drift 一致性，下單 API 皆為 404，外部通知請求數為 0', async () => {
+  const { db, dbPath } = seedFourScanCyclesWithLatest236();
+  db.close();
+  const httpServer = await startLocalTestServer({ customDbPath: dbPath });
+  const TEST_BASE_URL = httpServer.baseUrl;
+  try {
   const statusRes = await fetch(`${TEST_BASE_URL}/api/paper-quality/status`);
   assert.equal(statusRes.status, 200);
   const statusBody = (await statusRes.json()) as PaperQualityStatusResponse;
@@ -645,5 +651,8 @@ test('Phase 14 (11): 實機 HTTP 整合驗證 — /api/paper-quality/cycles、/c
       404,
       `Order endpoint ${endpoint} must return HTTP 404`
     );
+  }
+  } finally {
+    await httpServer.close();
   }
 });

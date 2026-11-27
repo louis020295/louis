@@ -19,6 +19,7 @@ import {
   SmcDisplacementEvidence,
   SmcEvaluationStatus,
   SmcFvgEvidence,
+  SmcFvgZone,
   SmcGateDiagnosticsSummary,
   SmcLiquiditySweepEvidence,
   SmcMtfAlignment,
@@ -29,11 +30,29 @@ import {
   SymbolSmcGateEvaluation,
   Timeframe,
 } from '../../src/types/market.ts';
-import { MIN_HISTORY_SAMPLES } from './VolumeAnomalyEngine.ts';
+import {
+  evaluateHistoricalVolumeAnomaly,
+  extractPriorConfirmedBaselineWindow,
+  MIN_HISTORY_SAMPLES,
+} from './VolumeAnomalyEngine.ts';
 import { enforceProvenanceIntegrity } from '../utils/provenanceQuarantine.ts';
 import { classifyTradeHorizon } from './TradeHorizonClassifier.ts';
 
 export const SMC_RULE_VERSION = 'v1.0.0-smc-ict-deterministic';
+
+/** Provenance gaps that must not by themselves block WAIT / formal SMC candidates. */
+export const OPTIONAL_PROVENANCE_GAPS = new Set([
+  'BID_ASK_SPREAD',
+  'HISTORICAL_VOLUME_BASELINE',
+]);
+
+export function coreMissingData(missing: string[] | undefined | null): string[] {
+  return (missing ?? []).filter((item) => !OPTIONAL_PROVENANCE_GAPS.has(item));
+}
+
+/** Confirmed bars required on each side of a pivot (classic 5-bar / 2-2 fractal). */
+export const SWING_CONFIRMATION_BARS = 2;
+
 
 export function normalizeSmcRuleProfile(profile?: unknown): SmcRuleProfile {
   if (profile === 'RELAXED_MTF_DISP' || profile === 'TREND_NO_SWEEP') {
@@ -88,18 +107,22 @@ interface SwingPoints {
 export function findConfirmedSwingPoints(confirmed: Kline[]): SwingPoints {
   const swingHighs: Array<{ index: number; price: number; time: number }> = [];
   const swingLows: Array<{ index: number; price: number; time: number }> = [];
+  const n = SWING_CONFIRMATION_BARS;
 
-  // 5-bar or 3-bar pivot on confirmed candles (exclude last 2 bars so swing itself is confirmed)
-  for (let i = 2; i < confirmed.length - 2; i++) {
+  // Classic 5-bar fractal: 2 confirmed bars on the left AND 2 on the right.
+  // The last `n` confirmed bars are excluded so a forming high/low cannot be a pivot.
+  for (let i = n; i < confirmed.length - n; i++) {
     const c = confirmed[i];
-    const isSwingHigh =
-      c.high >= confirmed[i - 1].high &&
-      c.high >= confirmed[i - 2].high &&
-      c.high > confirmed[i + 1].high;
-    const isSwingLow =
-      c.low <= confirmed[i - 1].low &&
-      c.low <= confirmed[i - 2].low &&
-      c.low < confirmed[i + 1].low;
+    let isSwingHigh = true;
+    let isSwingLow = true;
+    for (let offset = 1; offset <= n; offset++) {
+      if (c.high < confirmed[i - offset].high || c.high <= confirmed[i + offset].high) {
+        isSwingHigh = false;
+      }
+      if (c.low > confirmed[i - offset].low || c.low >= confirmed[i + offset].low) {
+        isSwingLow = false;
+      }
+    }
 
     if (isSwingHigh) {
       swingHighs.push({ index: i, price: c.high, time: c.openTime });
@@ -112,27 +135,385 @@ export function findConfirmedSwingPoints(confirmed: Kline[]): SwingPoints {
   return { swingHighs, swingLows };
 }
 
-export function detectTimeframeBias(klines: Kline[] | undefined): 'BULL' | 'BEAR' | 'NEUTRAL' | 'MISSING' {
+/**
+ * Share of an FVG that later confirmed bars have retraced.
+ * 0 = untouched, 1 = price has reached the far side of the gap (fully filled).
+ */
+export function computeFvgFillRatio(
+  direction: 'BULL' | 'BEAR',
+  gapTop: number,
+  gapBottom: number,
+  subsequent: Kline[]
+): number {
+  const size = Math.max(gapTop - gapBottom, 1e-12);
+  if (subsequent.length === 0) return 0;
+  if (direction === 'BULL') {
+    const extreme = subsequent.reduce((min, k) => Math.min(min, k.low), Infinity);
+    if (!Number.isFinite(extreme) || extreme >= gapTop) return 0;
+    if (extreme <= gapBottom) return 1;
+    return Number(((gapTop - extreme) / size).toFixed(4));
+  }
+  const extreme = subsequent.reduce((max, k) => Math.max(max, k.high), -Infinity);
+  if (!Number.isFinite(extreme) || extreme <= gapBottom) return 0;
+  if (extreme >= gapTop) return 1;
+  return Number(((extreme - gapBottom) / size).toFixed(4));
+}
+
+export function collectUnfilledFvgZones(
+  confirmed: Kline[],
+  lookbackBars = 24
+): SmcFvgZone[] {
+  const start = Math.max(2, confirmed.length - lookbackBars);
+  const zones: SmcFvgZone[] = [];
+  for (let i = confirmed.length - 1; i >= start; i--) {
+    const c0 = confirmed[i - 2];
+    const c2 = confirmed[i];
+    const subsequent = confirmed.slice(i + 1);
+
+    if (c2.low > c0.high) {
+      const fillRatio = computeFvgFillRatio('BULL', c2.low, c0.high, subsequent);
+      zones.push({
+        direction: 'BULL',
+        top: c2.low,
+        bottom: c0.high,
+        candleTime: confirmed[i - 1].openTime,
+        fillRatio,
+        mitigated: fillRatio >= 1,
+      });
+    }
+    if (c2.high < c0.low) {
+      const fillRatio = computeFvgFillRatio('BEAR', c0.low, c2.high, subsequent);
+      zones.push({
+        direction: 'BEAR',
+        top: c0.low,
+        bottom: c2.high,
+        candleTime: confirmed[i - 1].openTime,
+        fillRatio,
+        mitigated: fillRatio >= 1,
+      });
+    }
+  }
+  return zones;
+}
+
+function selectPrimaryFvg(
+  zones: SmcFvgZone[],
+  preferredDirection: 'BULL' | 'BEAR' | 'NONE'
+): SmcFvgZone | null {
+  const live = zones.filter((z) => !z.mitigated);
+  if (live.length === 0) return null;
+  const preferred =
+    preferredDirection === 'BULL' || preferredDirection === 'BEAR'
+      ? live.filter((z) => z.direction === preferredDirection)
+      : live;
+  const pool = preferred.length > 0 ? preferred : live;
+  // Most recent first (collectUnfilledFvgZones already walks newest-to-oldest)
+  return pool[0];
+}
+
+/**
+ * Strict order block: last meaningful opposing candle immediately before displacement,
+ * displacement must leave the block, and a later confirmed close must not have invalidated it.
+ */
+export function detectStrictOrderBlock(params: {
+  confirmed: Kline[];
+  displacementIndex: number;
+  direction: 'BULL' | 'BEAR';
+  atr14: number;
+}): { evidence: SmcOrderBlockEvidence; found: boolean } {
+  const { confirmed, displacementIndex: i, direction, atr14 } = params;
+  const empty: SmcOrderBlockEvidence = {
+    detected: false,
+    direction: 'NONE',
+    high: null,
+    low: null,
+    candleTime: null,
+    description: '未確認有效機構訂單塊 (Order Block)',
+    mitigated: false,
+    bodyToAtrRatio: null,
+  };
+  const disp = confirmed[i];
+  // Search up to 4 bars before the displacement for the nearest meaningful opposing candle.
+  // Consecutive displacement bars are common; the first opposing candle may sit 2–4 bars back.
+  for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
+    const prev = confirmed[j];
+    const isOpposing =
+      (direction === 'BULL' && prev.close < prev.open) ||
+      (direction === 'BEAR' && prev.close > prev.open);
+    if (!isOpposing) continue;
+
+    const body = Math.abs(prev.close - prev.open);
+    const range = Math.max(prev.high - prev.low, 1e-9);
+    const bodyToAtr = atr14 > 0 ? body / atr14 : 0;
+    const bodyToRange = body / range;
+    // Reject dojis / tiny indecision bars that are not a real supply/demand candle.
+    if (bodyToAtr < 0.25 && bodyToRange < 0.4) continue;
+
+    const leftTheBlock =
+      direction === 'BULL' ? disp.close > prev.high : disp.close < prev.low;
+    if (!leftTheBlock) continue;
+
+    const subsequent = confirmed.slice(i + 1);
+    const mitigated =
+      direction === 'BULL'
+        ? subsequent.some((k) => k.close < prev.low)
+        : subsequent.some((k) => k.close > prev.high);
+    if (mitigated) {
+      return {
+        found: false,
+        evidence: {
+          detected: false,
+          direction: 'NONE',
+          high: prev.high,
+          low: prev.low,
+          candleTime: prev.openTime,
+          description: `位移前 Order Block 已被後續已收盤 K 線收盤穿越而失效`,
+          mitigated: true,
+          bodyToAtrRatio: Number(bodyToAtr.toFixed(2)),
+        },
+      };
+    }
+
+    return {
+      found: true,
+      evidence: {
+        detected: true,
+        direction,
+        high: prev.high,
+        low: prev.low,
+        candleTime: prev.openTime,
+        description: `於位移前確認具實體的${direction === 'BULL' ? '多頭需求' : '空頭供給'} Order Block 區間 [${prev.low} – ${prev.high}]（未被後續收盤穿越）`,
+        mitigated: false,
+        bodyToAtrRatio: Number(bodyToAtr.toFixed(2)),
+      },
+    };
+  }
+  return { found: false, evidence: empty };
+}
+
+function deriveHistoricalVolumeFromKlines(
+  symbol: string,
+  klines: Kline[] | undefined,
+  baseProvenance: import('../../src/types/market.ts').DataProvenance
+): import('../../src/types/market.ts').HistoricalVolumeMetrics | null {
+  if (!klines || klines.length === 0) return null;
+  const confirmed = klines.filter((k) => k.isClosed && Number.isFinite(k.quoteVolume));
+  if (confirmed.length < MIN_HISTORY_SAMPLES + 1) return null;
+  const vols = confirmed.map((k) => k.quoteVolume);
+  const extracted = extractPriorConfirmedBaselineWindow(
+    vols,
+    vols.length - 1,
+    MIN_HISTORY_SAMPLES
+  );
+  return evaluateHistoricalVolumeAnomaly({
+    symbol,
+    exchange: 'binance_usdm',
+    currentVolume: extracted.currentVolume,
+    historicalVolumes: extracted.historicalVolumes,
+    volumeTimeframe: '15m',
+    baseProvenance,
+  });
+}
+
+/** Equal-high / equal-low cluster tolerance: 0.15 ATR or 5 bps of price, whichever is larger. */
+export const SWING_EQUALITY_ATR_RATIO = 0.15;
+export const SWING_EQUALITY_PRICE_RATIO = 0.0005;
+
+export function swingEqualityTolerance(
+  price: number,
+  atr14: number | null | undefined
+): number {
+  const fromPrice = Math.abs(price) * SWING_EQUALITY_PRICE_RATIO;
+  const fromAtr = Math.max(0, atr14 ?? 0) * SWING_EQUALITY_ATR_RATIO;
+  return Math.max(fromPrice, fromAtr, Math.abs(price) * 1e-8);
+}
+
+export interface SwingLiquidityPool {
+  side: 'HIGH' | 'LOW';
+  /** Extreme of the equal-high / equal-low cluster (buy-side = max, sell-side = min). */
+  price: number;
+  /** Confirmed-bar index of the first swing that established the pool. */
+  formedAtIndex: number;
+  memberCount: number;
+}
+
+/**
+ * Cluster confirmed swing highs/lows that sit within the equality tolerance
+ * into liquidity pools (including a single isolated swing as a 1-member pool).
+ */
+export function collectSwingLiquidityPools(
+  swings: Array<{ index: number; price: number }>,
+  side: 'HIGH' | 'LOW',
+  tolerance: number
+): SwingLiquidityPool[] {
+  if (swings.length === 0) return [];
+  const sorted = [...swings].sort((a, b) => a.index - b.index);
+  const used = new Set<number>();
+  const pools: SwingLiquidityPool[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (used.has(i)) continue;
+    const cluster = [sorted[i]];
+    used.add(i);
+    for (let j = i + 1; j < sorted.length; j++) {
+      if (used.has(j)) continue;
+      if (Math.abs(sorted[j].price - sorted[i].price) <= tolerance) {
+        cluster.push(sorted[j]);
+        used.add(j);
+      }
+    }
+    const prices = cluster.map((s) => s.price);
+    const price = side === 'HIGH' ? Math.max(...prices) : Math.min(...prices);
+    pools.push({
+      side,
+      price,
+      formedAtIndex: Math.min(...cluster.map((s) => s.index)),
+      memberCount: cluster.length,
+    });
+  }
+  return pools;
+}
+
+/**
+ * Most recent confirmed close that broke a prior confirmed swing high (BULL)
+ * or swing low (BEAR). Returns null when no such break exists in the window.
+ */
+export function detectLastStructureBreak(
+  confirmed: Kline[]
+): 'BULL' | 'BEAR' | null {
+  if (confirmed.length < 7) return null;
+  const { swingHighs, swingLows } = findConfirmedSwingPoints(confirmed);
+  if (swingHighs.length === 0 && swingLows.length === 0) return null;
+  const lookbackStart = Math.max(SWING_CONFIRMATION_BARS + 1, confirmed.length - 36);
+  let last: { dir: 'BULL' | 'BEAR'; index: number } | null = null;
+  for (let i = lookbackStart; i < confirmed.length; i++) {
+    const c = confirmed[i];
+    const priorHigh = [...swingHighs].reverse().find((s) => s.index < i);
+    const priorLow = [...swingLows].reverse().find((s) => s.index < i);
+    if (priorHigh && c.close > priorHigh.price) {
+      last = { dir: 'BULL', index: i };
+    }
+    if (priorLow && c.close < priorLow.price) {
+      last = { dir: 'BEAR', index: i };
+    }
+  }
+  return last?.dir ?? null;
+}
+
+/**
+ * Timeframe bias from confirmed swing structure only (no open/forming bars).
+ * HH+HL = bullish, LH+LL = bearish; a more recent BOS/CHoCH close-through
+ * overrides older swing structure. Returns NEUTRAL when structure is mixed
+ * or insufficient, and MISSING when there is not enough closed history.
+ */
+export function detectTimeframeBias(
+  klines: Kline[] | undefined
+): 'BULL' | 'BEAR' | 'NEUTRAL' | 'MISSING' {
   if (!klines || klines.length === 0) return 'MISSING';
   const confirmed = klines.filter((k) => k.isClosed);
   if (confirmed.length < 20) return 'MISSING';
 
-  const recent = confirmed.slice(-20);
-  const firstHalfAvg =
-    recent.slice(0, 10).reduce((s, k) => s + k.close, 0) / 10;
-  const secondHalfAvg =
-    recent.slice(10).reduce((s, k) => s + k.close, 0) / 10;
-  const lastClose = recent[recent.length - 1].close;
-  const high10 = Math.max(...recent.slice(0, 15).map((k) => k.high));
-  const low10 = Math.min(...recent.slice(0, 15).map((k) => k.low));
+  const { swingHighs, swingLows } = findConfirmedSwingPoints(confirmed);
+  const lastHighs = swingHighs.slice(-2);
+  const lastLows = swingLows.slice(-2);
+  const hh =
+    lastHighs.length === 2 && lastHighs[1].price > lastHighs[0].price;
+  const hl = lastLows.length === 2 && lastLows[1].price > lastLows[0].price;
+  const lh =
+    lastHighs.length === 2 && lastHighs[1].price < lastHighs[0].price;
+  const ll = lastLows.length === 2 && lastLows[1].price < lastLows[0].price;
+  const bullishStructure = hh && hl;
+  const bearishStructure = lh && ll;
+  const lastBreak = detectLastStructureBreak(confirmed);
 
-  if (lastClose > high10 || (secondHalfAvg > firstHalfAvg * 1.004 && lastClose > secondHalfAvg)) {
-    return 'BULL';
-  }
-  if (lastClose < low10 || (secondHalfAvg < firstHalfAvg * 0.996 && lastClose < secondHalfAvg)) {
-    return 'BEAR';
+  // A later BOS / CHoCH close is the most timely structure event (CHoCH flips bias).
+  if (lastBreak) return lastBreak;
+  if (bullishStructure) return 'BULL';
+  if (bearishStructure) return 'BEAR';
+
+  // Monotonic move with no pullback often has no 5-bar fractals. Treat a last
+  // confirmed close beyond the established (excluding the last two bars) range
+  // as a nascent structure bias; a range stays NEUTRAL.
+  const established = confirmed.slice(0, Math.max(0, confirmed.length - 2));
+  if (established.length >= 10) {
+    const rangeHigh = Math.max(...established.map((k) => k.high));
+    const rangeLow = Math.min(...established.map((k) => k.low));
+    const lastClose = confirmed[confirmed.length - 1].close;
+    if (lastClose > rangeHigh) return 'BULL';
+    if (lastClose < rangeLow) return 'BEAR';
   }
   return 'NEUTRAL';
+}
+
+/**
+ * Liquidity Sweep on confirmed candles only: wick through a confirmed swing
+ * high/low pool (or an equal-high / equal-low cluster) and close back inside.
+ */
+export function detectConfirmedLiquiditySweep(
+  confirmed: Kline[],
+  atr14: number | null | undefined,
+  lookbackBars = 16
+): SmcLiquiditySweepEvidence {
+  const empty: SmcLiquiditySweepEvidence = {
+    detected: false,
+    side: 'NONE',
+    sweptLevel: null,
+    candleTime: null,
+    description: '近期已確認 K 線未偵測到高低點流動性掃單 (Liquidity Sweep)',
+  };
+  confirmed = confirmed.filter((k) => k.isClosed);
+  if (confirmed.length < 7) return empty;
+  const { swingHighs, swingLows } = findConfirmedSwingPoints(confirmed);
+  if (swingHighs.length === 0 && swingLows.length === 0) return empty;
+
+  const refPrice = confirmed[confirmed.length - 1].close;
+  const tolerance = swingEqualityTolerance(refPrice, atr14 ?? null);
+  const buySidePools = collectSwingLiquidityPools(swingHighs, 'HIGH', tolerance);
+  const sellSidePools = collectSwingLiquidityPools(swingLows, 'LOW', tolerance);
+
+  const start = Math.max(SWING_CONFIRMATION_BARS + 1, confirmed.length - lookbackBars);
+  // Walk newest -> oldest so the most recent valid sweep wins.
+  for (let i = confirmed.length - 1; i >= start; i--) {
+    const c = confirmed[i];
+    const sellPool = sellSidePools
+      .filter((p) => p.formedAtIndex < i)
+      .sort((a, b) => b.formedAtIndex - a.formedAtIndex)[0];
+    // Prefer the pool the wick actually pierced; if several, the nearest below.
+    const piercedSell = sellSidePools
+      .filter(
+        (p) =>
+          p.formedAtIndex < i &&
+          c.low < p.price &&
+          Math.min(c.open, c.close) >= p.price
+      )
+      .sort((a, b) => b.price - a.price)[0];
+    if (piercedSell) {
+      return {
+        detected: true,
+        side: 'SELL_SIDE_SWEPT',
+        sweptLevel: piercedSell.price,
+        candleTime: c.openTime,
+        description: `下影線刺穿已確認擺動低點／同等低點流動性池 (${piercedSell.price}) 後實體收回其上方 (Sell-Side Liquidity Sweep)`,
+      };
+    }
+    const piercedBuy = buySidePools
+      .filter(
+        (p) =>
+          p.formedAtIndex < i &&
+          c.high > p.price &&
+          Math.max(c.open, c.close) <= p.price
+      )
+      .sort((a, b) => a.price - b.price)[0];
+    if (piercedBuy) {
+      return {
+        detected: true,
+        side: 'BUY_SIDE_SWEPT',
+        sweptLevel: piercedBuy.price,
+        candleTime: c.openTime,
+        description: `上影線刺穿已確認擺動高點／同等高點流動性池 (${piercedBuy.price}) 後實體收回其下方 (Buy-Side Liquidity Sweep)`,
+      };
+    }
+  }
+  return empty;
 }
 
 function detectEarlyInflection(
@@ -311,21 +692,40 @@ export function computeEntryZoneAnalysis(params: {
   let zoneLow: number | null = null;
   let zoneHigh: number | null = null;
 
+  const liveFvgZones = (fvg.zones ?? []).filter((z) => !z.mitigated);
+  const pickNearestFvg = (dir: 'BULL' | 'BEAR') => {
+    const pool = liveFvgZones.filter((z) => z.direction === dir);
+    if (pool.length === 0) {
+      if (
+        fvg.detected &&
+        !fvg.mitigated &&
+        fvg.direction === dir &&
+        fvg.bottom !== null &&
+        fvg.top !== null
+      ) {
+        return { bottom: fvg.bottom, top: fvg.top };
+      }
+      return null;
+    }
+    return pool
+      .map((z) => ({
+        bottom: z.bottom,
+        top: z.top,
+        mid: (z.bottom + z.top) / 2,
+      }))
+      .sort((a, b) => Math.abs(a.mid - currentPrice) - Math.abs(b.mid - currentPrice))[0];
+  };
+
   if (direction === 'LONG') {
-    if (
-      fvg.detected &&
-      !fvg.mitigated &&
-      fvg.direction === 'BULL' &&
-      fvg.bottom !== null &&
-      fvg.top !== null &&
-      fvg.bottom <= currentPrice * 1.02
-    ) {
+    const bullFvg = pickNearestFvg('BULL');
+    if (bullFvg && bullFvg.bottom <= currentPrice * 1.02) {
       anchorType = 'FVG';
       anchorLabel = '未回補多頭 FVG 折價區';
-      zoneLow = fvg.bottom;
-      zoneHigh = fvg.top;
+      zoneLow = bullFvg.bottom;
+      zoneHigh = bullFvg.top;
     } else if (
       orderBlock.detected &&
+      orderBlock.mitigated !== true &&
       orderBlock.direction === 'BULL' &&
       orderBlock.low !== null &&
       orderBlock.high !== null &&
@@ -347,20 +747,15 @@ export function computeEntryZoneAnalysis(params: {
       zoneHigh = intradayVwap + effectiveAtr * 0.25;
     }
   } else {
-    if (
-      fvg.detected &&
-      !fvg.mitigated &&
-      fvg.direction === 'BEAR' &&
-      fvg.bottom !== null &&
-      fvg.top !== null &&
-      fvg.top >= currentPrice * 0.98
-    ) {
+    const bearFvg = pickNearestFvg('BEAR');
+    if (bearFvg && bearFvg.top >= currentPrice * 0.98) {
       anchorType = 'FVG';
       anchorLabel = '未回補空頭 FVG 溢價區';
-      zoneLow = fvg.bottom;
-      zoneHigh = fvg.top;
+      zoneLow = bearFvg.bottom;
+      zoneHigh = bearFvg.top;
     } else if (
       orderBlock.detected &&
+      orderBlock.mitigated !== true &&
       orderBlock.direction === 'BEAR' &&
       orderBlock.low !== null &&
       orderBlock.high !== null &&
@@ -558,7 +953,6 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     primaryTimeframe,
     klinesByTimeframe,
     openInterest,
-    historicalVolume,
     isLowLiquidity = false,
     extremeFunding = false,
     lowLiquidityHighVolatility = false,
@@ -575,13 +969,33 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
   const confirmedKlines = rawPrimaryKlines.filter((k) => k.isClosed);
   const unclosedKlineIgnoredCount = rawPrimaryKlines.length - confirmedKlines.length;
 
+  // Cold-start: if the caller passed an insufficient 15m baseline but we already have
+  // enough confirmed 15m (or primary) klines, derive the baseline from those closed bars.
+  let historicalVolume = input.historicalVolume;
+  const volumeSourceKlines = klinesByTimeframe['15m'] ?? rawPrimaryKlines;
+  if (
+    !historicalVolume ||
+    historicalVolume.status === 'INSUFFICIENT_HISTORY' ||
+    (historicalVolume.sampleCount ?? 0) < MIN_HISTORY_SAMPLES
+  ) {
+    const derived = deriveHistoricalVolumeFromKlines(
+      symbol,
+      volumeSourceKlines,
+      provenance
+    );
+    if (derived && derived.status === 'READY') {
+      historicalVolume = derived;
+    }
+  }
+
   const waitReasons: string[] = [];
+  const blockingMissingData = coreMissingData(provenance.missingData);
 
   if (provenance.stale) {
     waitReasons.push('資料已過期 (Stale Data)：行情或 K 線時間戳超出有效範圍');
   }
-  if (provenance.missingData.length > 0) {
-    waitReasons.push(`基礎欄位缺失：${provenance.missingData.join(', ')}`);
+  if (blockingMissingData.length > 0) {
+    waitReasons.push(`基礎欄位缺失：${blockingMissingData.join(', ')}`);
   }
   if (openInterest === null || !Number.isFinite(openInterest)) {
     waitReasons.push('Open Interest (OI 未平倉量) 資料缺失，觸發 WAIT 安全閘門');
@@ -715,24 +1129,13 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
           description: matchedDesc,
         };
 
-        // 2. Order Block: last opposing candle within 3-4 bars prior to displacement
-        for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
-          const prev = confirmedKlines[j];
-          const isOpposing =
-            (matchedDir === 'BULL' && prev.close < prev.open) ||
-            (matchedDir === 'BEAR' && prev.close > prev.open);
-          if (isOpposing) {
-            orderBlock = {
-              detected: true,
-              direction: matchedDir,
-              high: prev.high,
-              low: prev.low,
-              candleTime: prev.openTime,
-              description: `於位移前確認 ${matchedDir === 'BULL' ? '多頭需求' : '空頭供給'} Order Block 區間 [${prev.low} – ${prev.high}]`,
-            };
-            break;
-          }
-        }
+        const ob = detectStrictOrderBlock({
+          confirmed: confirmedKlines,
+          displacementIndex: i,
+          direction: matchedDir,
+          atr14,
+        });
+        orderBlock = ob.evidence;
         break;
       }
     }
@@ -746,9 +1149,13 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     for (let i = confirmedKlines.length - 1; i >= lookbackStart; i--) {
       const c = confirmedKlines[i];
       if (refSwingHigh && i > refSwingHigh.index && c.close > refSwingHigh.price) {
-        const isMss =
-          refSwingLow !== null &&
-          confirmedKlines[Math.max(0, refSwingHigh.index - 3)].close > refSwingLow.price;
+        // CHoCH / MSS: the broken high is itself a lower high, or the last two swing lows are descending.
+        const prevSwingHigh = priorHighs.length >= 2 ? priorHighs[priorHighs.length - 2] : null;
+        const lastTwoLows = priorLows.slice(-2);
+        const wasDowntrend =
+          (prevSwingHigh !== null && refSwingHigh.price < prevSwingHigh.price) ||
+          (lastTwoLows.length === 2 && lastTwoLows[1].price < lastTwoLows[0].price);
+        const isMss = wasDowntrend;
         bosOrMss = {
           detected: true,
           type: isMss ? 'MSS_BULL' : 'BOS_BULL',
@@ -759,9 +1166,12 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
         break;
       }
       if (refSwingLow && i > refSwingLow.index && c.close < refSwingLow.price) {
-        const isMss =
-          refSwingHigh !== null &&
-          confirmedKlines[Math.max(0, refSwingLow.index - 3)].close < refSwingHigh.price;
+        const prevSwingLow = priorLows.length >= 2 ? priorLows[priorLows.length - 2] : null;
+        const lastTwoHighs = priorHighs.slice(-2);
+        const wasUptrend =
+          (prevSwingLow !== null && refSwingLow.price > prevSwingLow.price) ||
+          (lastTwoHighs.length === 2 && lastTwoHighs[1].price > lastTwoHighs[0].price);
+        const isMss = wasUptrend;
         bosOrMss = {
           detected: true,
           type: isMss ? 'MSS_BEAR' : 'BOS_BEAR',
@@ -773,77 +1183,43 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       }
     }
 
-    // 4. Liquidity Sweep detection (wick pierces prior swing or 10-bar extreme, body closes inside)
-    for (let i = confirmedKlines.length - 1; i >= lookbackStart; i--) {
-      const c = confirmedKlines[i];
-      const priorSlice = confirmedKlines.slice(Math.max(0, i - 12), i);
-      if (priorSlice.length < 5) continue;
+    // 4. Liquidity Sweep: wick through a confirmed swing / equal-high-low pool, close back inside.
+    liquiditySweep = detectConfirmedLiquiditySweep(confirmedKlines, atr14);
 
-      const priorLow = Math.min(...priorSlice.map((k) => k.low));
-      const priorHigh = Math.max(...priorSlice.map((k) => k.high));
-
-      if (c.low < priorLow && Math.min(c.open, c.close) >= priorLow) {
-        liquiditySweep = {
-          detected: true,
-          side: 'SELL_SIDE_SWEPT',
-          sweptLevel: priorLow,
-          candleTime: c.openTime,
-          description: `下影線刺穿前波低點流動性池 (${priorLow}) 後實體收回其上方 (Sell-Side Liquidity Sweep)`,
-        };
-        break;
-      }
-      if (c.high > priorHigh && Math.max(c.open, c.close) <= priorHigh) {
-        liquiditySweep = {
-          detected: true,
-          side: 'BUY_SIDE_SWEPT',
-          sweptLevel: priorHigh,
-          candleTime: c.openTime,
-          description: `上影線刺穿前波高點流動性池 (${priorHigh}) 後實體收回其下方 (Buy-Side Liquidity Sweep)`,
-        };
-        break;
-      }
-    }
-
-    // 5. Fair Value Gap (FVG) detection on confirmed 3-candle sequences
-    for (let i = confirmedKlines.length - 1; i >= Math.max(2, lookbackStart); i--) {
-      const c0 = confirmedKlines[i - 2];
-      const c2 = confirmedKlines[i];
-
-      // Bullish FVG: c0.high < c2.low
-      if (c2.low > c0.high && c2.close > c0.close) {
-        const gapBottom = c0.high;
-        const gapTop = c2.low;
-        const subsequent = confirmedKlines.slice(i + 1);
-        const mitigated = subsequent.some((k) => k.low <= gapBottom);
-        fvg = {
-          detected: true,
-          direction: 'BULL',
-          top: gapTop,
-          bottom: gapBottom,
-          mitigated,
-          candleTime: confirmedKlines[i - 1].openTime,
-          description: `多頭 FVG 失衡區 [${gapBottom} – ${gapTop}] (${mitigated ? '已回補 Mitigated' : '尚未完全回補 Unmitigated'})`,
-        };
-        break;
-      }
-
-      // Bearish FVG: c0.low > c2.high
-      if (c2.high < c0.low && c2.close < c0.close) {
-        const gapTop = c0.low;
-        const gapBottom = c2.high;
-        const subsequent = confirmedKlines.slice(i + 1);
-        const mitigated = subsequent.some((k) => k.high >= gapTop);
-        fvg = {
-          detected: true,
-          direction: 'BEAR',
-          top: gapTop,
-          bottom: gapBottom,
-          mitigated,
-          candleTime: confirmedKlines[i - 1].openTime,
-          description: `空頭 FVG 失衡區 [${gapBottom} – ${gapTop}] (${mitigated ? '已回補 Mitigated' : '尚未完全回補 Unmitigated'})`,
-        };
-        break;
-      }
+    // 5. Fair Value Gap (FVG): keep every recent unfilled / partially filled 3-candle gap.
+    const fvgZones = collectUnfilledFvgZones(confirmedKlines, 24);
+    const liveFvgZones = fvgZones.filter((z) => !z.mitigated);
+    const preferredFvgDir: 'BULL' | 'BEAR' | 'NONE' =
+      displacement.detected && (displacement.direction === 'BULL' || displacement.direction === 'BEAR')
+        ? displacement.direction
+        : 'NONE';
+    const primaryFvg = selectPrimaryFvg(liveFvgZones, preferredFvgDir);
+    if (primaryFvg) {
+      const fillPct = Math.round(primaryFvg.fillRatio * 100);
+      fvg = {
+        detected: true,
+        direction: primaryFvg.direction,
+        top: primaryFvg.top,
+        bottom: primaryFvg.bottom,
+        mitigated: false,
+        candleTime: primaryFvg.candleTime,
+        fillRatio: primaryFvg.fillRatio,
+        zones: fvgZones,
+        description: `${primaryFvg.direction === 'BULL' ? '多頭' : '空頭'} FVG 失衡區 [${primaryFvg.bottom} – ${primaryFvg.top}]（回補 ${fillPct}%，尚有 ${liveFvgZones.length} 個未完全回補缺口）`,
+      };
+    } else if (fvgZones.length > 0) {
+      const latest = fvgZones[0];
+      fvg = {
+        detected: true,
+        direction: latest.direction,
+        top: latest.top,
+        bottom: latest.bottom,
+        mitigated: true,
+        candleTime: latest.candleTime,
+        fillRatio: latest.fillRatio,
+        zones: fvgZones,
+        description: `近期 FVG 均已完全回補（共 ${fvgZones.length} 個）`,
+      };
     }
   }
 
@@ -1133,7 +1509,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     openInterest !== null &&
     Number.isFinite(openInterest) &&
     !provenance.stale &&
-    provenance.missingData.length === 0 &&
+    blockingMissingData.length === 0 &&
     confirmedKlines.length >= MIN_HISTORY_SAMPLES &&
     (!historicalVolume ||
       (historicalVolume.status === 'READY' &&

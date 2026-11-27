@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Runtime SQLite and WAL sidecar files must not be committed (they can be large or corrupt).
+/data/*
+!/data/.gitkeep
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

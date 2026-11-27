@@ -2894,13 +2894,17 @@ export function generateDeterministicSmcKlines(params: {
         high = close + step * 0.8;
         low = open - step * 0.3;
       } else if (relFromEnd === 4) {
-        // Guaranteed Sell-Side Liquidity Sweep: wick pierces prior 12-bar low while body closes above it, and acts as opposing bearish Order Block candle
+        // Sell-side liquidity sweep + a real last-down-close Order Block.
+        // Wick pierces the prior 12-bar low; body closes back above it and is
+        // large enough (~0.7*step, typically >= 0.25 ATR) to pass the strict OB filter
+        // so formal LONG CANDIDATE appears as soon as the displacement bar confirms
+        // (leaving a next bar for walk-forward entry).
         const prior12Low =
           klines.length > 0
             ? Math.min(...klines.slice(-12).map((k) => k.low))
             : price - step * 2.4;
-        open = Math.max(price, prior12Low + step * 0.6);
-        close = Math.max(open - step * 0.25, prior12Low + step * 0.25);
+        open = Math.max(price, prior12Low + step * 1.4);
+        close = Math.max(open - step * 0.7, prior12Low + step * 0.3);
         low = prior12Low - step * 0.65;
         high = open + step * 0.25;
       } else if (relFromEnd === 3) {
@@ -2931,13 +2935,16 @@ export function generateDeterministicSmcKlines(params: {
         low = close - step * 0.8;
         high = open + step * 0.3;
       } else if (relFromEnd === 4) {
-        // Guaranteed Buy-Side Liquidity Sweep: wick pierces prior 12-bar high while body closes below it, and acts as opposing bullish Order Block candle
+        // Buy-side liquidity sweep + a real last-up-close Order Block.
+        // Wick pierces the prior 12-bar high; body closes back below it and is
+        // large enough (~0.7*step) to pass the strict OB filter, so formal
+        // SHORT CANDIDATE appears as soon as the displacement bar confirms.
         const prior12High =
           klines.length > 0
             ? Math.max(...klines.slice(-12).map((k) => k.high))
             : price + step * 2.4;
-        open = Math.min(price, prior12High - step * 0.6);
-        close = Math.min(open + step * 0.25, prior12High - step * 0.25);
+        open = Math.min(price, prior12High - step * 1.4);
+        close = Math.min(open + step * 0.7, prior12High - step * 0.3);
         high = prior12High + step * 0.65;
         low = open - step * 0.25;
       } else if (relFromEnd === 3) {

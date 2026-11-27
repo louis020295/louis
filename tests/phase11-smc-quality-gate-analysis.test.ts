@@ -17,8 +17,7 @@ import { PaperShadowMonitor } from '../server/services/PaperShadowMonitor.ts';
 import { SignalOutcomeTracker } from '../server/services/SignalOutcomeTracker.ts';
 import { SmcBatchScanService } from '../server/services/SmcBatchScanService.ts';
 import { ExchangeId, Kline, SmcScanResultRecord } from '../src/types/market.ts';
-
-const TEST_BASE_URL = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
+import { startLocalTestServer } from './helpers/localTestServer.ts';
 
 function createTempDb() {
   const tmpDir = fs.mkdtempSync(
@@ -26,7 +25,7 @@ function createTempDb() {
   );
   const dbPath = path.join(tmpDir, 'test-phase11.sqlite');
   const db = new RadarDatabase(dbPath);
-  return { tmpDir, db };
+  return { tmpDir, dbPath, db };
 }
 
 function createTestAdapters(): Record<ExchangeId, ExchangeAdapter> {
@@ -254,6 +253,9 @@ test('Phase 11 (3, 4, 5 & 6): 嚴格區分 WAIT/WATCH/HIGH RISK/PENDING 以及 D
 });
 
 test('Phase 11 (7, 8, 9, 10, 11 & 12): 當 paperClosed = 0 時回傳 metricStatus = NO_TRADES 與 null 指標、7d/30d 數學恆等式成立、多 API snapshotAt/statsVersion/cycleId 一致、Demo 遭拒、下單端點 404、外部通知請求數為 0', async () => {
+  const httpServer = await startLocalTestServer();
+  const TEST_BASE_URL = httpServer.baseUrl;
+  try {
   const scanRes = await fetch(
     `${TEST_BASE_URL}/api/scan?exchange=binance_usdm&mode=live`
   );
@@ -414,10 +416,13 @@ test('Phase 11 (7, 8, 9, 10, 11 & 12): 當 paperClosed = 0 時回傳 metricStatu
   assert.equal(report7d.safety.mode, 'PAPER ONLY');
   assert.equal(report7d.safety.liveOrders, 'LIVE ORDERS DISABLED');
   assert.equal(report7d.safety.executionPolicy, 'NEVER AUTO-PLACE ORDERS');
+  } finally {
+    await httpServer.close();
+  }
 });
 
 test('Phase 11 時間窗口與報表語義修正驗收 (1~5): 1 年前訊號排除於目前 7d/30d、ENTRY_WINDOW_MISSED 狀態語義、未平倉績效欄位維持 null、sampleCount=1 標記 INSUFFICIENT、reportAnchorAt 與真實時間不混用', async () => {
-  const { db } = createTempDb();
+  const { db, dbPath } = createTempDb();
   const monitorDb = new PaperMonitorDatabase(db);
   const tracker = new SignalOutcomeTracker({ paperMonitorDb: monitorDb });
   const adapters = createTestAdapters();
@@ -626,7 +631,11 @@ test('Phase 11 時間窗口與報表語義修正驗收 (1~5): 1 年前訊號排�
   assert.equal(latencyAnchored.signalLatencyP50, 886640);
   assert.equal(latencyAnchored.signalLatencyP95, 886640);
 
-  // Also verify live HTTP endpoints for current window vs anchored historical window
+  // Also verify HTTP endpoints against the same seeded SQLite (self-hosted, no :3000 dependency)
+  db.close();
+  const httpServer = await startLocalTestServer({ customDbPath: dbPath });
+  const TEST_BASE_URL = httpServer.baseUrl;
+  try {
   const [live7dHttp, live30dHttp, anchored7dHttp] = await Promise.all([
     fetch(`${TEST_BASE_URL}/api/smc-quality/report?window=7d&exchange=binance_usdm`).then(
       (r) => r.json()
@@ -666,5 +675,8 @@ test('Phase 11 時間窗口與報表語義修正驗收 (1~5): 1 年前訊號排�
   assert.equal(anchored7dHttp.sampleCount, 1);
   assert.equal(anchored7dHttp.sampleSufficiency, 'INSUFFICIENT');
   assert.equal(anchored7dHttp.sampleSufficiencyNotice, '樣本不足，僅供觀察');
+  } finally {
+    await httpServer.close();
+  }
 });
 

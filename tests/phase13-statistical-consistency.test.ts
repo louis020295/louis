@@ -17,8 +17,8 @@ import { PaperShadowMonitor } from '../server/services/PaperShadowMonitor.ts';
 import { SignalOutcomeTracker } from '../server/services/SignalOutcomeTracker.ts';
 import { SmcBatchScanService } from '../server/services/SmcBatchScanService.ts';
 import { ExchangeId, Kline, SmcScanResultRecord } from '../src/types/market.ts';
+import { startLocalTestServer } from './helpers/localTestServer.ts';
 
-const TEST_BASE_URL = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
 
 function createTempDb() {
   const tmpDir = fs.mkdtempSync(
@@ -544,6 +544,9 @@ test('Phase 13 (10): 四個統計恆等式任一不成立時，強制標記 stat
 });
 
 test('Phase 13 (11): Live API /api/paper-quality/* 四大統計恆等式驗證、下單 API 一律回傳 404、外部 Telegram/TradingView 請求數為 0', async () => {
+  const httpServer = await startLocalTestServer();
+  const TEST_BASE_URL = httpServer.baseUrl;
+  try {
   const [statusRes, rep30Res, rep60Res, rep90Res, regimesRes] =
     await Promise.all([
       fetch(`${TEST_BASE_URL}/api/paper-quality/status`),
@@ -638,5 +641,8 @@ test('Phase 13 (11): Live API /api/paper-quality/* 四大統計恆等式驗證�
       body: JSON.stringify({ symbol: 'BTCUSDT', side: 'BUY', quantity: 1 }),
     });
     assert.equal(res.status, 404);
+  }
+  } finally {
+    await httpServer.close();
   }
 });

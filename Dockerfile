@@ -2,7 +2,9 @@ FROM node:22-slim
 
 WORKDIR /app
 
-COPY package.json bun.lock* package-lock.json* ./
+# package-lock.json is required for reproducible npm ci (node:sqlite lives in Node 22+).
+# bun.lock remains for local bun install; do not switch this image to Bun (no node:sqlite).
+COPY package.json package-lock.json bun.lock* .npmrc ./
 RUN npm ci
 
 COPY . .

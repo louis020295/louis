@@ -11,6 +11,7 @@ import { RadarDatabase } from '../server/db/RadarDatabase.ts';
 import { SMC_RULE_VERSION } from '../server/engine/SmcRuleEngine.ts';
 import { SmcBatchScanService } from '../server/services/SmcBatchScanService.ts';
 import { ExchangeId, Timeframe } from '../src/types/market.ts';
+import { startLocalTestServer } from './helpers/localTestServer.ts';
 
 function createMockLiveAdapter(
   exchange: ExchangeId = 'binance_usdm'
@@ -84,13 +85,19 @@ function createMockLiveAdapter(
 
 describe('Phase 16: SMC PENDING 進度追蹤、背景 Worker 健康度與卡住診斷 (14 Required Scenarios)', () => {
   let tmpDir: string;
-  const serverUrl = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
+  let serverUrl = process.env.TEST_BASE_URL || '';
+  let httpServer: Awaited<ReturnType<typeof startLocalTestServer>> | null = null;
 
   before(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'radar-phase16-test-'));
+    if (!serverUrl) {
+      httpServer = await startLocalTestServer();
+      serverUrl = httpServer.baseUrl;
+    }
   });
 
   after(async () => {
+    if (httpServer) await httpServer.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
