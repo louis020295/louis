@@ -2,6 +2,7 @@ import { PaperMonitorDatabase } from '../db/PaperMonitorDatabase.ts';
 import { MARKET_SCAN_RULE_VERSION } from '../engine/MarketScanner.ts';
 import { SMC_RULE_VERSION } from '../engine/SmcRuleEngine.ts';
 import {
+  CandidateEvidenceType,
   DataProvenance,
   ExchangeId,
   FinalTradeSignal,
@@ -20,8 +21,10 @@ import {
   SmcActionState,
   SmcEvaluationStatus,
   Timeframe,
+  TradeHorizonCategory,
   TRADING_SAFETY_FLAGS,
 } from '../../src/types/market.ts';
+import { resolveCandidateEvidenceType } from '../utils/provenanceQuarantine.ts';
 
 export interface EvaluateSignalCandidateInput {
   monitorRunId: string;
@@ -49,6 +52,7 @@ export interface EvaluateSignalCandidateInput {
   entryWindowStatus?: 'DETECTED_BEFORE_NEXT_BAR_OPEN' | 'ENTRY_WINDOW_MISSED' | string;
   entryWindowMissed?: boolean;
   isFastLane?: boolean;
+  evidenceType?: CandidateEvidenceType;
   useCanonicalEntryWindowStatus?: boolean;
   klines: Kline[];
   signalBarIndex?: number;
@@ -63,8 +67,12 @@ export interface EvaluateSignalCandidateInput {
   isBacktest?: boolean;
   allowBacktestTracking?: boolean;
   allowDeferredFutureBarEntry?: boolean;
+  currentTimeMs?: number;
   recordBlockedInDb?: boolean;
   enqueueSandboxNotifications?: boolean;
+  overextendedBlocked?: boolean;
+  btcRegimeBlockedReason?: string | null;
+  tradeHorizonClass?: TradeHorizonCategory;
 }
 
 export interface SettleSignalKlinesInput {
@@ -72,11 +80,13 @@ export interface SettleSignalKlinesInput {
   klines: Kline[];
   atr14?: number | null;
   maxHoldBars?: number;
+  tradeHorizonClass?: TradeHorizonCategory;
   invalidatedBeforeEntry?: boolean;
   invalidationReason?: string;
   isBacktest?: boolean;
   allowDeferredFutureBarEntry?: boolean;
   currentTimeMs?: number;
+  fundingRatePer8h?: number | null;
 }
 
 export class SignalOutcomeTracker {
@@ -227,14 +237,32 @@ export class SignalOutcomeTracker {
     const isStale = provenance.stale === true;
     const isFallback = provenance.fallback === true;
     const isDemo = provenance.isDemo === true || exchange === 'demo_synthetic';
+    const resolvedEvidenceType = resolveCandidateEvidenceType({
+      exchange,
+      isDemo,
+      isTestFixture: provenance.isTestFixture,
+      source: provenance.source,
+      evidenceType: input.evidenceType,
+    });
+    const isControlledFixture =
+      resolvedEvidenceType === 'CONTROLLED_LIVE_FIXTURE';
     const hasWaitReasons = Array.isArray(waitReasons) && waitReasons.length > 0;
     const hasMissingData = missingData.length > 0;
     const allowBacktestTracking = input.allowBacktestTracking === true;
+    const isOverextendedBlocked = !isBacktest && input.overextendedBlocked === true;
+    const btcRegimeBlockedReason =
+      !isBacktest && input.btcRegimeBlockedReason
+        ? String(input.btcRegimeBlockedReason)
+        : null;
+    const isBlockedByWinRateGuard =
+      isOverextendedBlocked || Boolean(btcRegimeBlockedReason);
 
-    // Section 三: Strict Eligibility Check
+    // Section 三: Strict Eligibility Check (CONTROLLED_LIVE_FIXTURE and DEMO_LATENCY_FIXTURE NEVER enter Live Paper)
     const isEligibleCandidate =
       (!isBacktest || allowBacktestTracking) &&
       !isDemo &&
+      !isControlledFixture &&
+      resolvedEvidenceType === 'LIVE_PRODUCTION' &&
       smcEvaluationStatus === 'EVALUATED' &&
       (smcActionState === 'LONG CANDIDATE' ||
         smcActionState === 'SHORT CANDIDATE') &&
@@ -245,6 +273,7 @@ export class SignalOutcomeTracker {
       !isFallback &&
       !hasWaitReasons &&
       !hasMissingData &&
+      !isBlockedByWinRateGuard &&
       signalBar !== null;
 
     const signalId = this.buildDeterministicSignalId({
@@ -351,25 +380,71 @@ export class SignalOutcomeTracker {
       stale: isStale,
       fallback: isFallback,
       isDemo,
+      evidenceType: resolvedEvidenceType,
     };
+
+    if (
+      isControlledFixture &&
+      smcEvaluationStatus === 'EVALUATED' &&
+      (direction === 'LONG' || direction === 'SHORT') &&
+      !isStale &&
+      !isFallback
+    ) {
+      this.paperMonitorDb.radarDb.saveControlledFixtureCandidate({
+        cycleId: scanCycleId,
+        signalId,
+        symbol,
+        exchange,
+        timeframe,
+        direction,
+        signalBarOpenTime,
+        signalBarCloseTime,
+        nextBarOpenTime,
+        candidateDetectedAt,
+        signalDetectedAt,
+        queueEnteredAt,
+        evaluationStartedAt,
+        evaluationCompletedAt,
+        queueWaitMs,
+        evaluationLatencyMs,
+        candidateDetectionLatencyMs,
+        nextBarRemainingMs,
+        entryWindowStatus: canonicalEntryWindowStatus,
+        entryWindowMissed: canonicalEntryWindowMissed,
+        isFastLane,
+        evidenceType: 'CONTROLLED_LIVE_FIXTURE',
+        source: provenance.source || 'CONTROLLED_LIVE_FIXTURE',
+        fetchedAt: provenance.fetchedAt || snapshotAt,
+        stale: isStale,
+        fallback: isFallback,
+        isDemo: false,
+        isTestFixture: true,
+      });
+    }
 
     if (!isEligibleCandidate) {
       const blockReason = isBacktest
         ? '回測訊號 (isBacktest=true) 嚴禁進入即時影子監控與通知佇列'
         : isDemo
           ? 'Demo 模擬資料 (isDemo=true) 嚴禁混入 Live 影子運行'
-          : isStale
-            ? '資料已過期 (stale=true)，禁止建立可交易訊號'
-            : isFallback
-              ? '使用降級資料 (fallback=true)，禁止建立可交易訊號'
-              : hasMissingData
-                ? `缺少必要市場資料 (${missingData.join(', ')})，禁止建立可交易訊號`
-                : hasWaitReasons
-                  ? `存在安全閘門等待原因 (${waitReasons.join('；')})`
-                  : `狀態未達交易候選門檻 (smcEvaluationStatus=${smcEvaluationStatus}, smcActionState=${smcActionState}, finalTradeSignal=${finalTradeSignal})`;
+          : isControlledFixture
+            ? '受控測試資料 (CONTROLLED_LIVE_FIXTURE) 嚴禁計入真實 Live 正式候選或 Live Paper 績效'
+            : isStale
+              ? '資料已過期 (stale=true)，禁止建立可交易訊號'
+              : isFallback
+                ? '使用降級資料 (fallback=true)，禁止建立可交易訊號'
+                : hasMissingData
+                  ? `缺少必要市場資料 (${missingData.join(', ')})，禁止建立可交易訊號`
+                  : btcRegimeBlockedReason
+                    ? `BTC_REGIME_BLOCKED: ${btcRegimeBlockedReason}`
+                    : isOverextendedBlocked
+                      ? 'OVEREXTENDED_ANTI_CHASE_BLOCKED: 價格過度延伸 (OVEREXTENDED)，已攔截自動市價追高進場，請等待回踩 FVG/OB 限價掛單'
+                      : hasWaitReasons
+                        ? `存在安全閘門等待原因 (${waitReasons.join('；')})`
+                        : `狀態未達交易候選門檻 (smcEvaluationStatus=${smcEvaluationStatus}, smcActionState=${smcActionState}, finalTradeSignal=${finalTradeSignal})`;
 
       let blockedSignal: PaperTrackedSignalRecord | null = null;
-      if (recordBlockedInDb && !isDemo && !isBacktest) {
+      if (recordBlockedInDb && !isDemo && !isControlledFixture && !isBacktest) {
         const candidateBlockedRecord: PaperTrackedSignalRecord = {
           signalId,
           monitorRunId,
@@ -487,6 +562,7 @@ export class SignalOutcomeTracker {
         signalId: existing.signalId,
         klines: confirmedKlines,
         atr14,
+        tradeHorizonClass: input.tradeHorizonClass,
       });
       return {
         signal: updated ?? existing,
@@ -732,6 +808,7 @@ export class SignalOutcomeTracker {
       evidences,
       decisionTrace: resolvedDecisionTrace,
       isDemo: false,
+      evidenceType: 'LIVE_PRODUCTION',
       createdAt: nowIso,
       updatedAt: nowIso,
     };
@@ -739,14 +816,58 @@ export class SignalOutcomeTracker {
     const { inserted, record: persistedSignal } =
       this.paperMonitorDb.insertTrackedSignalIfAbsent(initialRecord);
 
+    const activeCycleId = this.paperMonitorDb.radarDb.getSmcScanCycleId(exchange);
+    const isCurrentCycleOrExplicitLive =
+      scanCycleId === activeCycleId || input.evidenceType === 'LIVE_PRODUCTION';
+    if (
+      inserted &&
+      !isBacktest &&
+      isCurrentCycleOrExplicitLive &&
+      (direction === 'LONG' || direction === 'SHORT')
+    ) {
+      this.paperMonitorDb.radarDb.saveLiveCaptureCandidate({
+        cycleId: scanCycleId,
+        signalId,
+        symbol,
+        exchange,
+        timeframe,
+        direction,
+        signalBarOpenTime,
+        signalBarCloseTime,
+        nextBarOpenTime,
+        candidateDetectedAt,
+        signalDetectedAt,
+        queueEnteredAt,
+        evaluationStartedAt,
+        evaluationCompletedAt,
+        queueWaitMs,
+        evaluationLatencyMs,
+        candidateDetectionLatencyMs,
+        nextBarRemainingMs,
+        entryWindowStatus: canonicalEntryWindowStatus,
+        entryWindowMissed: isOriginalEntryWindowMissed,
+        isFastLane,
+        evidenceType: 'LIVE_PRODUCTION',
+        source: provenance.source,
+        fetchedAt: provenance.fetchedAt || snapshotAt,
+        stale: false,
+        fallback: false,
+        isDemo: false,
+        isTestFixture: false,
+      });
+    }
+
     // Attempt to open/settle according to Backtest vs Live Paper rules
     const settledSignal =
       this.settleSignalWithKlines({
         signalId: persistedSignal.signalId,
         klines,
         atr14,
+        tradeHorizonClass: input.tradeHorizonClass,
         isBacktest,
         allowDeferredFutureBarEntry: input.allowDeferredFutureBarEntry,
+        currentTimeMs: input.currentTimeMs,
+        fundingRatePer8h: fundingRate,
       }) ?? persistedSignal;
 
     const outboxRecords: NotificationOutboxRecord[] = [];
@@ -961,8 +1082,14 @@ export class SignalOutcomeTracker {
                 ) / Math.min(14, priorConfirmed.length)
             : entryReferencePrice * 0.006;
 
-      const riskDistance = effectiveAtr * 1.5;
-      const rewardDistance = effectiveAtr * 2.5; // 1.67R target
+      const riskDistance = Math.max(
+        effectiveAtr * 1.8,
+        entryReferencePrice * 0.006
+      );
+      const rewardDistance = Math.max(
+        effectiveAtr * 2.7,
+        riskDistance * 1.6
+      );
 
       const stopLoss =
         currentRecord.direction === 'LONG'
@@ -1027,7 +1154,13 @@ export class SignalOutcomeTracker {
     }
 
     // Step 2: Evaluate confirmed bars from entryBar onward for SL / TP / Expiry
-    const maxHoldBars = input.maxHoldBars ?? 16;
+    const defaultHold =
+      input.tradeHorizonClass === 'SWING_EXTENDED'
+        ? 48
+        : input.tradeHorizonClass === 'SCALP_FAST'
+          ? 20
+          : 32;
+    const maxHoldBars = input.maxHoldBars ?? defaultHold;
     const entryPrice = currentRecord.entryReferencePrice!;
     const stopLoss = currentRecord.stopLoss!;
     const takeProfit = currentRecord.takeProfit!;
@@ -1065,7 +1198,12 @@ export class SignalOutcomeTracker {
             this.paperMonitorDb.radarDb.closePaperLedgerEntry(
               currentRecord.paperLedgerId,
               stopLoss,
-              '[PAPER ONLY] 同根 K 線同時觸及 SL/TP，保守判定為止損 CLOSED_LOSS'
+              '[PAPER ONLY] 同根 K 線同時觸及 SL/TP，保守判定為止損 CLOSED_LOSS',
+              {
+                closedAtIso: exitTimeIso,
+                exitIsLimitFill: false,
+                fundingRatePer8h: input.fundingRatePer8h,
+              }
             );
           }
           return this.paperMonitorDb.updateTrackedSignalOutcome({
@@ -1085,7 +1223,12 @@ export class SignalOutcomeTracker {
             this.paperMonitorDb.radarDb.closePaperLedgerEntry(
               currentRecord.paperLedgerId,
               stopLoss,
-              '[PAPER ONLY] 觸及結構失效止損位 CLOSED_LOSS'
+              '[PAPER ONLY] 觸及結構失效止損位 CLOSED_LOSS',
+              {
+                closedAtIso: exitTimeIso,
+                exitIsLimitFill: false,
+                fundingRatePer8h: input.fundingRatePer8h,
+              }
             );
           }
           return this.paperMonitorDb.updateTrackedSignalOutcome({
@@ -1105,7 +1248,12 @@ export class SignalOutcomeTracker {
             this.paperMonitorDb.radarDb.closePaperLedgerEntry(
               currentRecord.paperLedgerId,
               takeProfit,
-              '[PAPER ONLY] 觸及結構目標止盈位 CLOSED_WIN'
+              '[PAPER ONLY] 觸及結構目標止盈位 CLOSED_WIN',
+              {
+                closedAtIso: exitTimeIso,
+                exitIsLimitFill: true,
+                fundingRatePer8h: input.fundingRatePer8h,
+              }
             );
           }
           return this.paperMonitorDb.updateTrackedSignalOutcome({
@@ -1128,7 +1276,12 @@ export class SignalOutcomeTracker {
             this.paperMonitorDb.radarDb.closePaperLedgerEntry(
               currentRecord.paperLedgerId,
               stopLoss,
-              '[PAPER ONLY] 同根 K 線同時觸及 SL/TP，保守判定為止損 CLOSED_LOSS'
+              '[PAPER ONLY] 同根 K 線同時觸及 SL/TP，保守判定為止損 CLOSED_LOSS',
+              {
+                closedAtIso: exitTimeIso,
+                exitIsLimitFill: false,
+                fundingRatePer8h: input.fundingRatePer8h,
+              }
             );
           }
           return this.paperMonitorDb.updateTrackedSignalOutcome({
@@ -1148,7 +1301,12 @@ export class SignalOutcomeTracker {
             this.paperMonitorDb.radarDb.closePaperLedgerEntry(
               currentRecord.paperLedgerId,
               stopLoss,
-              '[PAPER ONLY] 觸及結構失效止損位 CLOSED_LOSS'
+              '[PAPER ONLY] 觸及結構失效止損位 CLOSED_LOSS',
+              {
+                closedAtIso: exitTimeIso,
+                exitIsLimitFill: false,
+                fundingRatePer8h: input.fundingRatePer8h,
+              }
             );
           }
           return this.paperMonitorDb.updateTrackedSignalOutcome({
@@ -1168,7 +1326,12 @@ export class SignalOutcomeTracker {
             this.paperMonitorDb.radarDb.closePaperLedgerEntry(
               currentRecord.paperLedgerId,
               takeProfit,
-              '[PAPER ONLY] 觸及結構目標止盈位 CLOSED_WIN'
+              '[PAPER ONLY] 觸及結構目標止盈位 CLOSED_WIN',
+              {
+                closedAtIso: exitTimeIso,
+                exitIsLimitFill: true,
+                fundingRatePer8h: input.fundingRatePer8h,
+              }
             );
           }
           return this.paperMonitorDb.updateTrackedSignalOutcome({
@@ -1193,7 +1356,12 @@ export class SignalOutcomeTracker {
           this.paperMonitorDb.radarDb.closePaperLedgerEntry(
             currentRecord.paperLedgerId,
             bar.close,
-            '[PAPER ONLY] 持倉到期平倉 PAPER_EXPIRED'
+            '[PAPER ONLY] 持倉到期平倉 PAPER_EXPIRED',
+            {
+              closedAtIso: exitTimeIso,
+              exitIsLimitFill: false,
+              fundingRatePer8h: input.fundingRatePer8h,
+            }
           );
         }
         return this.paperMonitorDb.updateTrackedSignalOutcome({

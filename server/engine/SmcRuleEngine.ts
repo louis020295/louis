@@ -1,5 +1,7 @@
 import {
   DataProvenance,
+  EntryPullbackStatus,
+  EntryZoneAnalysis,
   EvidenceItem,
   FunnelAggregationScope,
   GateStatisticScope,
@@ -22,14 +24,29 @@ import {
   SmcMtfAlignment,
   SmcNearMissSymbolRecord,
   SmcOrderBlockEvidence,
+  SmcRuleProfile,
   SmcStatsConsistency,
   SymbolSmcGateEvaluation,
   Timeframe,
 } from '../../src/types/market.ts';
 import { MIN_HISTORY_SAMPLES } from './VolumeAnomalyEngine.ts';
 import { enforceProvenanceIntegrity } from '../utils/provenanceQuarantine.ts';
+import { classifyTradeHorizon } from './TradeHorizonClassifier.ts';
 
 export const SMC_RULE_VERSION = 'v1.0.0-smc-ict-deterministic';
+
+export function normalizeSmcRuleProfile(profile?: unknown): SmcRuleProfile {
+  if (profile === 'RELAXED_MTF_DISP' || profile === 'TREND_NO_SWEEP') {
+    return profile;
+  }
+  return 'STRICT_PRODUCTION';
+}
+
+export function getSmcRuleVersionForProfile(profile: SmcRuleProfile): string {
+  return profile === 'STRICT_PRODUCTION'
+    ? SMC_RULE_VERSION
+    : `${SMC_RULE_VERSION}:${profile}`;
+}
 
 export interface EvaluateSmcInput {
   symbol: string;
@@ -41,6 +58,7 @@ export interface EvaluateSmcInput {
   extremeFunding?: boolean;
   lowLiquidityHighVolatility?: boolean;
   requireFullMultiTimeframe?: boolean;
+  ruleProfile?: SmcRuleProfile;
   provenance: DataProvenance;
 }
 
@@ -67,7 +85,7 @@ interface SwingPoints {
   swingLows: Array<{ index: number; price: number; time: number }>;
 }
 
-function findConfirmedSwingPoints(confirmed: Kline[]): SwingPoints {
+export function findConfirmedSwingPoints(confirmed: Kline[]): SwingPoints {
   const swingHighs: Array<{ index: number; price: number; time: number }> = [];
   const swingLows: Array<{ index: number; price: number; time: number }> = [];
 
@@ -94,7 +112,7 @@ function findConfirmedSwingPoints(confirmed: Kline[]): SwingPoints {
   return { swingHighs, swingLows };
 }
 
-function detectTimeframeBias(klines: Kline[] | undefined): 'BULL' | 'BEAR' | 'NEUTRAL' | 'MISSING' {
+export function detectTimeframeBias(klines: Kline[] | undefined): 'BULL' | 'BEAR' | 'NEUTRAL' | 'MISSING' {
   if (!klines || klines.length === 0) return 'MISSING';
   const confirmed = klines.filter((k) => k.isClosed);
   if (confirmed.length < 20) return 'MISSING';
@@ -117,6 +135,423 @@ function detectTimeframeBias(klines: Kline[] | undefined): 'BULL' | 'BEAR' | 'NE
   return 'NEUTRAL';
 }
 
+function detectEarlyInflection(
+  klines5m: Kline[] | undefined,
+  klines15m: Kline[] | undefined
+): NonNullable<SmcAnalysisResult['earlyInflection']> {
+  const candidates: Array<{ tf: '5m' | '15m'; klines: Kline[] }> = [
+    { tf: '5m', klines: (klines5m ?? []).filter((k) => k.isClosed) },
+    { tf: '15m', klines: (klines15m ?? []).filter((k) => k.isClosed) },
+  ];
+
+  for (const { tf, klines } of candidates) {
+    if (klines.length < 22) continue;
+    const atr = calculateConfirmedAtr14(klines);
+    if (atr === null || atr <= 0) continue;
+
+    const { swingHighs, swingLows } = findConfirmedSwingPoints(klines);
+    const lookbackStart = Math.max(6, klines.length - 8);
+    const recent = klines.slice(lookbackStart);
+
+    // Check recent sweep on 5m / 15m
+    let bullSweepLow: number | null = null;
+    let bearSweepHigh: number | null = null;
+    for (let i = klines.length - 1; i >= lookbackStart; i--) {
+      const c = klines[i];
+      const priorSlice = klines.slice(Math.max(0, i - 10), i);
+      if (priorSlice.length < 5) continue;
+      const pLow = Math.min(...priorSlice.map((k) => k.low));
+      const pHigh = Math.max(...priorSlice.map((k) => k.high));
+      if (bullSweepLow === null && c.low < pLow && Math.min(c.open, c.close) >= pLow) {
+        bullSweepLow = c.low;
+      }
+      if (bearSweepHigh === null && c.high > pHigh && Math.max(c.open, c.close) <= pHigh) {
+        bearSweepHigh = c.high;
+      }
+    }
+
+    // Check early displacement / ignition bar
+    let bullDisp = false;
+    let bearDisp = false;
+    for (const c of recent) {
+      const body = Math.abs(c.close - c.open);
+      const range = Math.max(c.high - c.low, 1e-9);
+      if (body / atr >= 1.15 && body / range >= 0.55) {
+        if (c.close > c.open) bullDisp = true;
+        else bearDisp = true;
+      }
+    }
+
+    // Check micro-swing break
+    const priorHigh = swingHighs.filter((s) => s.index < klines.length - 2).slice(-1)[0];
+    const priorLow = swingLows.filter((s) => s.index < klines.length - 2).slice(-1)[0];
+    const lastClose = klines[klines.length - 1].close;
+    const bullBreak = priorHigh ? lastClose > priorHigh.price : false;
+    const bearBreak = priorLow ? lastClose < priorLow.price : false;
+
+    const bullScore =
+      (bullSweepLow !== null ? 2 : 0) + (bullBreak ? 2 : 0) + (bullDisp ? 1 : 0);
+    const bearScore =
+      (bearSweepHigh !== null ? 2 : 0) + (bearBreak ? 2 : 0) + (bearDisp ? 1 : 0);
+
+    if (bullScore >= 3 && bullScore > bearScore) {
+      const invPrice =
+        bullSweepLow ?? priorLow?.price ?? Math.min(...recent.map((k) => k.low));
+      const invLabel =
+        bullSweepLow !== null
+          ? `${tf} Sweep 低點`
+          : `${tf} 起漲擺動低點`;
+      const tags: string[] = [];
+      if (bullSweepLow !== null) tags.push('掃底吸籌');
+      if (bullBreak) tags.push('MSS突破');
+      if (bullDisp) tags.push('放量位移');
+      return {
+        direction: 'LONG',
+        timeframe: tf,
+        sweepDetected: bullSweepLow !== null,
+        mssOrBreakDetected: bullBreak,
+        displacementDetected: bullDisp,
+        invalidationPrice: Number(invPrice.toPrecision(6)),
+        invalidationLabel: invLabel,
+        descriptionZh: `${tf} 早鳥多頭轉折（${tags.join(' + ')}）`,
+      };
+    }
+
+    if (bearScore >= 3 && bearScore > bullScore) {
+      const invPrice =
+        bearSweepHigh ?? priorHigh?.price ?? Math.max(...recent.map((k) => k.high));
+      const invLabel =
+        bearSweepHigh !== null
+          ? `${tf} Sweep 高點`
+          : `${tf} 起跌擺動高點`;
+      const tags: string[] = [];
+      if (bearSweepHigh !== null) tags.push('掃頂派發');
+      if (bearBreak) tags.push('MSS跌破');
+      if (bearDisp) tags.push('放量位移');
+      return {
+        direction: 'SHORT',
+        timeframe: tf,
+        sweepDetected: bearSweepHigh !== null,
+        mssOrBreakDetected: bearBreak,
+        displacementDetected: bearDisp,
+        invalidationPrice: Number(invPrice.toPrecision(6)),
+        invalidationLabel: invLabel,
+        descriptionZh: `${tf} 早鳥空頭轉折（${tags.join(' + ')}）`,
+      };
+    }
+  }
+
+  return {
+    direction: 'NEUTRAL',
+    timeframe: null,
+    sweepDetected: false,
+    mssOrBreakDetected: false,
+    displacementDetected: false,
+    invalidationPrice: null,
+    invalidationLabel: null,
+    descriptionZh: null,
+  };
+}
+
+export function computeEntryZoneAnalysis(params: {
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  currentPrice: number;
+  atr14: number | null;
+  fvg: SmcFvgEvidence;
+  orderBlock: SmcOrderBlockEvidence;
+  liquiditySweep: SmcLiquiditySweepEvidence;
+  intradayVwap?: number | null;
+  pdh?: number | null;
+  pdl?: number | null;
+}): EntryZoneAnalysis {
+  const {
+    direction,
+    currentPrice,
+    atr14,
+    fvg,
+    orderBlock,
+    liquiditySweep,
+    intradayVwap = null,
+    pdh = null,
+    pdl = null,
+  } = params;
+
+  if (
+    direction === 'NEUTRAL' ||
+    !Number.isFinite(currentPrice) ||
+    currentPrice <= 0
+  ) {
+    return {
+      status: 'NO_CLEAR_ZONE',
+      direction,
+      anchorType: 'NONE',
+      anchorLabel: '無明確方向或價格',
+      zoneLow: null,
+      zoneHigh: null,
+      idealPullbackEntry: null,
+      stopLossPrice: null,
+      targetPrice: null,
+      currentPrice,
+      distanceToZonePct: null,
+      distanceToZoneAtr: null,
+      chaseRR: null,
+      pullbackRR: null,
+      headlineZh: '多空方向尚未表態，暫無回踩區間參考',
+      actionAdviceZh: '等待結構形成明確方向後再評估回踩折價區。',
+    };
+  }
+
+  const effectiveAtr =
+    atr14 !== null && Number.isFinite(atr14) && atr14 > 0
+      ? atr14
+      : currentPrice * 0.012;
+
+  let anchorType: EntryZoneAnalysis['anchorType'] = 'NONE';
+  let anchorLabel = '無明確回踩錨點';
+  let zoneLow: number | null = null;
+  let zoneHigh: number | null = null;
+
+  if (direction === 'LONG') {
+    if (
+      fvg.detected &&
+      !fvg.mitigated &&
+      fvg.direction === 'BULL' &&
+      fvg.bottom !== null &&
+      fvg.top !== null &&
+      fvg.bottom <= currentPrice * 1.02
+    ) {
+      anchorType = 'FVG';
+      anchorLabel = '未回補多頭 FVG 折價區';
+      zoneLow = fvg.bottom;
+      zoneHigh = fvg.top;
+    } else if (
+      orderBlock.detected &&
+      orderBlock.direction === 'BULL' &&
+      orderBlock.low !== null &&
+      orderBlock.high !== null &&
+      orderBlock.low <= currentPrice * 1.02
+    ) {
+      anchorType = 'ORDER_BLOCK';
+      anchorLabel = '多頭 Order Block 需求區';
+      zoneLow = orderBlock.low;
+      zoneHigh = orderBlock.high;
+    } else if (
+      intradayVwap !== null &&
+      Number.isFinite(intradayVwap) &&
+      intradayVwap > 0 &&
+      intradayVwap <= currentPrice * 1.02
+    ) {
+      anchorType = 'VWAP';
+      anchorLabel = '盤中 VWAP 均價支撐帶';
+      zoneLow = intradayVwap - effectiveAtr * 0.25;
+      zoneHigh = intradayVwap + effectiveAtr * 0.25;
+    }
+  } else {
+    if (
+      fvg.detected &&
+      !fvg.mitigated &&
+      fvg.direction === 'BEAR' &&
+      fvg.bottom !== null &&
+      fvg.top !== null &&
+      fvg.top >= currentPrice * 0.98
+    ) {
+      anchorType = 'FVG';
+      anchorLabel = '未回補空頭 FVG 溢價區';
+      zoneLow = fvg.bottom;
+      zoneHigh = fvg.top;
+    } else if (
+      orderBlock.detected &&
+      orderBlock.direction === 'BEAR' &&
+      orderBlock.low !== null &&
+      orderBlock.high !== null &&
+      orderBlock.high >= currentPrice * 0.98
+    ) {
+      anchorType = 'ORDER_BLOCK';
+      anchorLabel = '空頭 Order Block 供給區';
+      zoneLow = orderBlock.low;
+      zoneHigh = orderBlock.high;
+    } else if (
+      intradayVwap !== null &&
+      Number.isFinite(intradayVwap) &&
+      intradayVwap > 0 &&
+      intradayVwap >= currentPrice * 0.98
+    ) {
+      anchorType = 'VWAP';
+      anchorLabel = '盤中 VWAP 均價壓力帶';
+      zoneLow = intradayVwap - effectiveAtr * 0.25;
+      zoneHigh = intradayVwap + effectiveAtr * 0.25;
+    }
+  }
+
+  if (zoneLow === null || zoneHigh === null) {
+    return {
+      status: 'NO_CLEAR_ZONE',
+      direction,
+      anchorType: 'NONE',
+      anchorLabel: '尚無未回補 FVG / OB 回踩錨點',
+      zoneLow: null,
+      zoneHigh: null,
+      idealPullbackEntry: null,
+      stopLossPrice: null,
+      targetPrice: null,
+      currentPrice,
+      distanceToZonePct: null,
+      distanceToZoneAtr: null,
+      chaseRR: null,
+      pullbackRR: null,
+      headlineZh: '近期未偵測到未回補 FVG 或有效機構訂單塊',
+      actionAdviceZh: '可切換至較低週期觀察是否留下新的失衡缺口或回踩 VWAP。',
+    };
+  }
+
+  const idealPullbackEntry = Number(((zoneLow + zoneHigh) / 2).toPrecision(6));
+
+  let stopLossPrice: number;
+  if (direction === 'LONG') {
+    const obLow =
+      orderBlock.detected && orderBlock.direction === 'BULL' && orderBlock.low
+        ? Math.min(orderBlock.low * 0.9965, orderBlock.low - effectiveAtr * 0.25)
+        : null;
+    const sweepLow =
+      liquiditySweep.detected &&
+      liquiditySweep.side === 'SELL_SIDE_SWEPT' &&
+      liquiditySweep.sweptLevel
+        ? Math.min(
+            liquiditySweep.sweptLevel * 0.9965,
+            liquiditySweep.sweptLevel - effectiveAtr * 0.25
+          )
+        : null;
+    const rawStop =
+      obLow ?? sweepLow ?? zoneLow - effectiveAtr * 0.85;
+    const minStopDist = Math.max(
+      effectiveAtr * 0.85,
+      idealPullbackEntry * 0.006
+    );
+    stopLossPrice = Math.min(rawStop, idealPullbackEntry - minStopDist);
+  } else {
+    const obHigh =
+      orderBlock.detected && orderBlock.direction === 'BEAR' && orderBlock.high
+        ? Math.max(orderBlock.high * 1.0035, orderBlock.high + effectiveAtr * 0.25)
+        : null;
+    const sweepHigh =
+      liquiditySweep.detected &&
+      liquiditySweep.side === 'BUY_SIDE_SWEPT' &&
+      liquiditySweep.sweptLevel
+        ? Math.max(
+            liquiditySweep.sweptLevel * 1.0035,
+            liquiditySweep.sweptLevel + effectiveAtr * 0.25
+          )
+        : null;
+    const rawStop =
+      obHigh ?? sweepHigh ?? zoneHigh + effectiveAtr * 0.85;
+    const minStopDist = Math.max(
+      effectiveAtr * 0.85,
+      idealPullbackEntry * 0.006
+    );
+    stopLossPrice = Math.max(rawStop, idealPullbackEntry + minStopDist);
+  }
+  stopLossPrice = Number(Math.max(1e-8, stopLossPrice).toPrecision(6));
+
+  const pullbackRisk = Math.max(
+    Math.abs(idealPullbackEntry - stopLossPrice),
+    currentPrice * 0.006
+  );
+  const chaseRisk = Math.max(
+    Math.abs(currentPrice - stopLossPrice),
+    currentPrice * 0.006
+  );
+
+  // Target: realistic structural 2.0R from pullback OR PDH/PDL if >= 1.8R from pullback
+  let targetPrice =
+    direction === 'LONG'
+      ? Math.max(
+          currentPrice + effectiveAtr * 1.5,
+          idealPullbackEntry + pullbackRisk * 2.0
+        )
+      : Math.min(
+          currentPrice - effectiveAtr * 1.5,
+          idealPullbackEntry - pullbackRisk * 2.0
+        );
+
+  if (
+    direction === 'LONG' &&
+    pdh !== null &&
+    Number.isFinite(pdh) &&
+    pdh > currentPrice + effectiveAtr * 0.4
+  ) {
+    targetPrice = Math.max(pdh, idealPullbackEntry + pullbackRisk * 1.8);
+  } else if (
+    direction === 'SHORT' &&
+    pdl !== null &&
+    Number.isFinite(pdl) &&
+    pdl < currentPrice - effectiveAtr * 0.4
+  ) {
+    targetPrice = Math.min(pdl, idealPullbackEntry - pullbackRisk * 1.8);
+  }
+  targetPrice = Number(Math.max(1e-8, targetPrice).toPrecision(6));
+
+  const distanceToEdge =
+    direction === 'LONG'
+      ? Math.max(0, currentPrice - zoneHigh)
+      : Math.max(0, zoneLow - currentPrice);
+  const distanceToZonePct = Number(
+    ((distanceToEdge / currentPrice) * 100).toFixed(2)
+  );
+  const distanceToZoneAtr = Number((distanceToEdge / effectiveAtr).toFixed(2));
+
+  const chaseReward =
+    direction === 'LONG'
+      ? Math.max(0, targetPrice - currentPrice)
+      : Math.max(0, currentPrice - targetPrice);
+  const pullbackReward =
+    direction === 'LONG'
+      ? Math.max(0, targetPrice - idealPullbackEntry)
+      : Math.max(0, idealPullbackEntry - targetPrice);
+
+  const chaseRR = Number((chaseReward / chaseRisk).toFixed(2));
+  const pullbackRR = Number((pullbackReward / pullbackRisk).toFixed(2));
+
+  let status: EntryPullbackStatus;
+  let headlineZh: string;
+  let actionAdviceZh: string;
+
+  const isInsideZone =
+    currentPrice >= zoneLow * 0.999 && currentPrice <= zoneHigh * 1.001;
+
+  if (isInsideZone || distanceToZoneAtr <= 0.35) {
+    status = 'IN_DISCOUNT_ZONE';
+    headlineZh = `正處於「${anchorLabel}」折價區（偏離 ${distanceToZoneAtr}x ATR）· 盈虧比佳`;
+    actionAdviceZh = `現價已貼近結構回踩區 [${Number(zoneLow.toPrecision(6))} – ${Number(zoneHigh.toPrecision(6))}]，無須追高，可評估結構確認後進場（淨 R:R 約 1:${pullbackRR}）。`;
+  } else if (distanceToZoneAtr <= 1.65) {
+    status = 'NEAR_PULLBACK_ZONE';
+    headlineZh = `距離「${anchorLabel}」約 ${distanceToZoneAtr}x ATR (${distanceToZonePct}%) · 接近回踩區`;
+    actionAdviceZh = `建議優先設定回踩告警於 ${idealPullbackEntry}（回踩 R:R 1:${pullbackRR} vs 現價追單 1:${chaseRR}），耐心等待價格回測。`;
+  } else {
+    status = 'OVEREXTENDED';
+    headlineZh = `已延伸過度！現價偏離「${anchorLabel}」達 ${distanceToZoneAtr}x ATR (${distanceToZonePct}%)`;
+    actionAdviceZh = `追高警戒：此刻市價追單僅剩 1:${chaseRR} 盈虧比，建議改掛回踩告警於 ${idealPullbackEntry}（回踩可提升至 1:${pullbackRR}），切勿買在趨勢末班車。`;
+  }
+
+  return {
+    status,
+    direction,
+    anchorType,
+    anchorLabel,
+    zoneLow: Number(zoneLow.toPrecision(6)),
+    zoneHigh: Number(zoneHigh.toPrecision(6)),
+    idealPullbackEntry,
+    stopLossPrice,
+    targetPrice,
+    currentPrice: Number(currentPrice.toPrecision(6)),
+    distanceToZonePct,
+    distanceToZoneAtr,
+    chaseRR,
+    pullbackRR,
+    headlineZh,
+    actionAdviceZh,
+  };
+}
+
 export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult {
   const {
     symbol,
@@ -130,6 +565,10 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     provenance: rawProvenance,
   } = input;
 
+  const ruleProfile = normalizeSmcRuleProfile(input.ruleProfile);
+  const isRelaxedMtfDisp =
+    ruleProfile === 'RELAXED_MTF_DISP' || ruleProfile === 'TREND_NO_SWEEP';
+  const requireSweep = ruleProfile !== 'TREND_NO_SWEEP';
   const provenance = enforceProvenanceIntegrity(rawProvenance);
 
   const rawPrimaryKlines = klinesByTimeframe[primaryTimeframe] || [];
@@ -228,6 +667,8 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     const lookbackStart = Math.max(5, confirmedKlines.length - 12);
 
     // 1. Displacement detection in recent confirmed bars
+    const dispAtrMin = isRelaxedMtfDisp ? 1.1 : 1.3;
+    const dispBodyRatioMin = isRelaxedMtfDisp ? 0.55 : 0.6;
     for (let i = confirmedKlines.length - 1; i >= lookbackStart; i--) {
       const c = confirmedKlines[i];
       const body = Math.abs(c.close - c.open);
@@ -235,30 +676,59 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       const bodyToAtr = body / atr14;
       const bodyToRange = body / range;
 
-      if (bodyToAtr >= 1.3 && bodyToRange >= 0.6) {
-        const dir = c.close > c.open ? 'BULL' : 'BEAR';
+      let matchedDir: 'BULL' | 'BEAR' | null = null;
+      let matchedAtrRatio = bodyToAtr;
+      let matchedDesc = '';
+
+      if (bodyToAtr >= dispAtrMin && bodyToRange >= dispBodyRatioMin) {
+        matchedDir = c.close > c.open ? 'BULL' : 'BEAR';
+        matchedAtrRatio = bodyToAtr;
+        matchedDesc = `已確認 ${matchedDir === 'BULL' ? '多頭' : '空頭'}位移 K 線 (實體為 ${bodyToAtr.toFixed(2)}x ATR，實體佔比 ${(bodyToRange * 100).toFixed(0)}%)`;
+      } else if (isRelaxedMtfDisp && i >= lookbackStart + 1) {
+        const prev = confirmedKlines[i - 1];
+        const bothBull = c.close > c.open && prev.close > prev.open;
+        const bothBear = c.close < c.open && prev.close < prev.open;
+        if (bothBull || bothBear) {
+          const twoBarMove = Math.abs(c.close - prev.open);
+          const twoBarBody =
+            Math.abs(c.close - c.open) + Math.abs(prev.close - prev.open);
+          const twoBarRange = Math.max(
+            Math.max(c.high, prev.high) - Math.min(c.low, prev.low),
+            1e-9
+          );
+          const twoBarAtr = twoBarMove / atr14;
+          const twoBarBodyRatio = twoBarBody / twoBarRange;
+          if (twoBarAtr >= 1.5 && twoBarBodyRatio >= 0.55) {
+            matchedDir = bothBull ? 'BULL' : 'BEAR';
+            matchedAtrRatio = twoBarAtr;
+            matchedDesc = `已確認 ${matchedDir === 'BULL' ? '多頭' : '空頭'}連續雙K位移推進 (累積為 ${twoBarAtr.toFixed(2)}x ATR，實體佔比 ${(twoBarBodyRatio * 100).toFixed(0)}%)`;
+          }
+        }
+      }
+
+      if (matchedDir) {
         displacement = {
           detected: true,
-          direction: dir,
-          bodyToAtrRatio: Number(bodyToAtr.toFixed(2)),
+          direction: matchedDir,
+          bodyToAtrRatio: Number(matchedAtrRatio.toFixed(2)),
           candleTime: c.openTime,
-          description: `已確認 ${dir === 'BULL' ? '多頭' : '空頭'}位移 K 線 (實體為 ${bodyToAtr.toFixed(2)}x ATR，實體佔比 ${(bodyToRange * 100).toFixed(0)}%)`,
+          description: matchedDesc,
         };
 
-        // 2. Order Block: last opposing candle within 3 bars prior to displacement
+        // 2. Order Block: last opposing candle within 3-4 bars prior to displacement
         for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
           const prev = confirmedKlines[j];
           const isOpposing =
-            (dir === 'BULL' && prev.close < prev.open) ||
-            (dir === 'BEAR' && prev.close > prev.open);
+            (matchedDir === 'BULL' && prev.close < prev.open) ||
+            (matchedDir === 'BEAR' && prev.close > prev.open);
           if (isOpposing) {
             orderBlock = {
               detected: true,
-              direction: dir,
+              direction: matchedDir,
               high: prev.high,
               low: prev.low,
               candleTime: prev.openTime,
-              description: `於位移前確認 ${dir === 'BULL' ? '多頭需求' : '空頭供給'} Order Block 區間 [${prev.low} – ${prev.high}]`,
+              description: `於位移前確認 ${matchedDir === 'BULL' ? '多頭需求' : '空頭供給'} Order Block 區間 [${prev.low} – ${prev.high}]`,
             };
             break;
           }
@@ -399,6 +869,69 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       byTimeframe,
       description: '多週期 K 線資料不足，無法確認方向一致性',
     };
+  } else if (isRelaxedMtfDisp) {
+    const coreTfs = (['15m', '1h', '4h'] as Timeframe[]).filter(
+      (tf) => byTimeframe[tf] !== 'MISSING'
+    );
+    const evalBiases =
+      coreTfs.length > 0 ? coreTfs.map((tf) => byTimeframe[tf]) : availableBiases;
+    const coreBull = evalBiases.filter((b) => b === 'BULL').length;
+    const coreBear = evalBiases.filter((b) => b === 'BEAR').length;
+    const htfBull =
+      (byTimeframe['1h'] === 'BULL' ? 1 : 0) +
+      (byTimeframe['4h'] === 'BULL' ? 1 : 0);
+    const htfBear =
+      (byTimeframe['1h'] === 'BEAR' ? 1 : 0) +
+      (byTimeframe['4h'] === 'BEAR' ? 1 : 0);
+    const primaryBias = byTimeframe[primaryTimeframe];
+    const htfConflict =
+      (byTimeframe['1h'] === 'BULL' && byTimeframe['4h'] === 'BEAR') ||
+      (byTimeframe['1h'] === 'BEAR' && byTimeframe['4h'] === 'BULL');
+
+    if (htfConflict) {
+      mtfAlignment = {
+        aligned: false,
+        dominantDirection: 'CONFLICT',
+        byTimeframe,
+        description: `高週期 1h (${byTimeframe['1h']}) 與 4h (${byTimeframe['4h']}) 方向直接衝突`,
+      };
+    } else if (
+      coreBull > coreBear &&
+      (primaryBias === 'BULL' || primaryBias === 'NEUTRAL' || htfBull === 2) &&
+      !(byTimeframe['1h'] === 'BEAR' && byTimeframe['4h'] === 'BEAR')
+    ) {
+      mtfAlignment = {
+        aligned: true,
+        dominantDirection: 'BULL',
+        byTimeframe,
+        description: `多週期核心偏多共識 (15m/1h/4h 多:${coreBull} 空:${coreBear})`,
+      };
+    } else if (
+      coreBear > coreBull &&
+      (primaryBias === 'BEAR' || primaryBias === 'NEUTRAL' || htfBear === 2) &&
+      !(byTimeframe['1h'] === 'BULL' && byTimeframe['4h'] === 'BULL')
+    ) {
+      mtfAlignment = {
+        aligned: true,
+        dominantDirection: 'BEAR',
+        byTimeframe,
+        description: `多週期核心偏空共識 (15m/1h/4h 空:${coreBear} 多:${coreBull})`,
+      };
+    } else if (coreBull > 0 && coreBear > 0) {
+      mtfAlignment = {
+        aligned: false,
+        dominantDirection: 'CONFLICT',
+        byTimeframe,
+        description: `多週期結構方向分歧 (多頭週期: ${coreBull}, 空頭週期: ${coreBear})`,
+      };
+    } else {
+      mtfAlignment = {
+        aligned: false,
+        dominantDirection: 'INSUFFICIENT',
+        byTimeframe,
+        description: '多週期處於盤整中性，尚未形成單邊共振',
+      };
+    }
   } else {
     const bullCount = availableBiases.filter((b) => b === 'BULL').length;
     const bearCount = availableBiases.filter((b) => b === 'BEAR').length;
@@ -489,7 +1022,18 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     waitReasons.push('ATR(14) 無法計算或為 0，無法建立有效波動率與風險基準，觸發 WAIT 安全閘門');
   }
 
-  if (bullSignalCount > 0 && bearSignalCount > 0) {
+  const hasInternalConflict = bullSignalCount > 0 && bearSignalCount > 0;
+  const resolvedBullByStructure =
+    hasBullBos && bullSignalCount > bearSignalCount;
+  const resolvedBearByStructure =
+    hasBearBos && bearSignalCount > bullSignalCount;
+  const blockingInternalConflict = isRelaxedMtfDisp
+    ? hasInternalConflict &&
+      !resolvedBullByStructure &&
+      !resolvedBearByStructure
+    : hasInternalConflict;
+
+  if (blockingInternalConflict) {
     waitReasons.push(
       `同週期內部多空條件互相衝突 (多頭訊號 ${bullSignalCount} 項 vs 空頭訊號 ${bearSignalCount} 項)`
     );
@@ -609,6 +1153,9 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
   // 9. Zero WAIT Gate blocking reasons
   let actionState: SmcActionState = 'WAIT';
 
+  const bullSweepGate = requireSweep ? hasBullSweep : true;
+  const bearSweepGate = requireSweep ? hasBearSweep : true;
+
   if (waitReasons.length > 0) {
     actionState = 'WAIT';
   } else if (extremeFunding || lowLiquidityHighVolatility) {
@@ -634,7 +1181,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     hasAllRequiredData &&
     hasValidAtrAndRisk &&
     hasBullBos &&
-    hasBullSweep &&
+    bullSweepGate &&
     hasBullDisplacement &&
     hasBullFvgOrOb &&
     hasBullMtf
@@ -644,7 +1191,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     hasAllRequiredData &&
     hasValidAtrAndRisk &&
     hasBearBos &&
-    hasBearSweep &&
+    bearSweepGate &&
     hasBearDisplacement &&
     hasBearFvgOrOb &&
     hasBearMtf
@@ -655,7 +1202,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     if (bullSignalCount >= bearSignalCount) {
       const missingBull: string[] = [];
       if (!hasBullBos) missingBull.push('BOS/MSS 多頭結構突破');
-      if (!hasBullSweep) missingBull.push('Sell-Side Liquidity Sweep');
+      if (requireSweep && !hasBullSweep) missingBull.push('Sell-Side Liquidity Sweep');
       if (!hasBullDisplacement) missingBull.push('多頭 Displacement 位移 K 線');
       if (!hasBullFvgOrOb) missingBull.push('多頭未回補 FVG 或 Order Block');
       if (!hasBullMtf) missingBull.push('多週期多頭一致性 (MTF Alignment)');
@@ -665,7 +1212,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     } else {
       const missingBear: string[] = [];
       if (!hasBearBos) missingBear.push('BOS/MSS 空頭結構突破');
-      if (!hasBearSweep) missingBear.push('Buy-Side Liquidity Sweep');
+      if (requireSweep && !hasBearSweep) missingBear.push('Buy-Side Liquidity Sweep');
       if (!hasBearDisplacement) missingBear.push('空頭 Displacement 位移 K 線');
       if (!hasBearFvgOrOb) missingBear.push('空頭未回補 FVG 或 Order Block');
       if (!hasBearMtf) missingBear.push('多週期空頭一致性 (MTF Alignment)');
@@ -759,11 +1306,11 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     if (!oiFundingPassed) missingGates.push('OI_FUNDING');
     if (!liquiditySafetyPassed) missingGates.push('LIQUIDITY_SAFETY');
     if (!riskSafetyPassed) missingGates.push('RISK_SAFETY');
-    if (bullSignalCount > 0 && bearSignalCount > 0) {
+    if (blockingInternalConflict) {
       missingGates.push('INTERNAL_DIRECTION_CONFLICT');
     }
     if (!dirBosPassed) missingGates.push('BOS_MSS');
-    if (!dirSweepPassed) missingGates.push('LIQUIDITY_SWEEP');
+    if (requireSweep && !dirSweepPassed) missingGates.push('LIQUIDITY_SWEEP');
     if (!dirDispPassed) missingGates.push('DISPLACEMENT');
     if (!dirFvgObPassed) missingGates.push('FVG_OR_ORDER_BLOCK');
     if (!dirMtfPassed) missingGates.push('MTF_ALIGNMENT');
@@ -802,10 +1349,48 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     intendedDirection,
   };
 
+  const earlyInflection = detectEarlyInflection(
+    klinesByTimeframe['5m'],
+    klinesByTimeframe['15m']
+  );
+
+  const entryZoneDirection: 'LONG' | 'SHORT' | 'NEUTRAL' =
+    intendedDirection !== 'NEUTRAL'
+      ? intendedDirection
+      : earlyInflection.direction;
+
+  const entryZoneAnalysis =
+    lastConfirmed && lastConfirmed.close > 0
+      ? computeEntryZoneAnalysis({
+          direction: entryZoneDirection,
+          currentPrice: lastConfirmed.close,
+          atr14,
+          fvg,
+          orderBlock,
+          liquiditySweep,
+        })
+      : null;
+
+  const tradeHorizon = classifyTradeHorizon({
+    smcActionState: actionState,
+    intendedDirection,
+    mtfAlignment,
+    atrPercent,
+    priceChangePercent24h: 0,
+    quoteVolume24h: 50_000_000,
+    fundingRate: null,
+    entryZoneAnalysis,
+    earlyIgnition: null,
+    bosOrMssDetected: bosOrMss.detected,
+    displacementDetected: displacement.detected,
+    rvol: null,
+  });
+
   return {
     symbol,
     primaryTimeframe,
-    ruleVersion: SMC_RULE_VERSION,
+    ruleVersion: getSmcRuleVersionForProfile(ruleProfile),
+    ruleProfile,
     smcEvaluationStatus,
     actionState,
     confirmedKlineCount: confirmedKlines.length,
@@ -825,6 +1410,9 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     nearMissStatus,
     missingGates,
     intendedDirection,
+    earlyInflection,
+    entryZoneAnalysis,
+    tradeHorizon,
   };
 }
 
@@ -1069,9 +1657,15 @@ export interface EvaluatedGateDiagnosticItemInput {
   smcEvaluationLatencyMs?: number | null;
   entryWindowDelayMs?: number | null;
   entryWindowMissed?: boolean | null;
+  marketRegime?: string;
+  fundingState?: string;
+  liquidityState?: string;
+  mtfAlignmentState?: string;
   dataFreshnessSeconds?: number | null;
   stale?: boolean;
   isDemo?: boolean;
+  isTestFixture?: boolean;
+  evidenceType?: 'LIVE_PRODUCTION' | 'CONTROLLED_LIVE_FIXTURE' | 'DEMO_LATENCY_FIXTURE';
   isFastLane?: boolean;
 }
 
@@ -1203,8 +1797,6 @@ function buildGateStatisticForSubset(
       evaluationUniverseSize: totalUniverseCount,
       evaluatedDenominator,
       excludedCount,
-      excludedSymbols: meta?.excludedSymbols,
-      excludedReasons: meta?.excludedReasons,
       cycleId: meta?.cycleId,
       snapshotAt: meta?.snapshotAt,
       statsVersion: meta?.statsVersion,
@@ -1548,7 +2140,10 @@ export function buildObservationShadowComparisonSummary(
       : strictPaperClosed >= 30
         ? 'LIMITED'
         : 'INSUFFICIENT';
+  const strictStrategyValidity =
+    strictPaperClosed >= 30 ? ('VALIDATED' as const) : ('INSUFFICIENT_SAMPLE' as const);
 
+  // Phase 18.5 Requirement 四: paperClosedCount < 30 -> winRate/averageR/profitFactor/maxDrawdownR/expectancyR MUST be null and strategyValidity = "INSUFFICIENT_SAMPLE"
   const strictProductionBreakdown = {
     mode: 'STRICT_PRODUCTION' as const,
     modeLabel: '嚴格正式版 (STRICT_PRODUCTION)',
@@ -1570,15 +2165,16 @@ export function buildObservationShadowComparisonSummary(
     entryWindowMissedCount: strictEntryMissed,
     paperOpenedCount: strictPaperOpened,
     paperClosedCount: strictPaperClosed,
-    winRate: strictPaperClosed > 0 ? (strictOutcome?.winRate ?? null) : null,
-    averageR: strictPaperClosed > 0 ? (strictOutcome?.averageR ?? null) : null,
+    winRate: strictPaperClosed >= 30 ? (strictOutcome?.winRate ?? null) : null,
+    averageR: strictPaperClosed >= 30 ? (strictOutcome?.averageR ?? null) : null,
     profitFactor:
-      strictPaperClosed > 0 ? (strictOutcome?.profitFactor ?? null) : null,
+      strictPaperClosed >= 30 ? (strictOutcome?.profitFactor ?? null) : null,
     maxDrawdownR:
-      strictPaperClosed > 0 ? (strictOutcome?.maxDrawdownR ?? null) : null,
+      strictPaperClosed >= 30 ? (strictOutcome?.maxDrawdownR ?? null) : null,
     expectancyR:
-      strictPaperClosed > 0 ? (strictOutcome?.expectancyR ?? null) : null,
+      strictPaperClosed >= 30 ? (strictOutcome?.expectancyR ?? null) : null,
     sampleSufficiency: strictSufficiency as 'INSUFFICIENT' | 'LIMITED' | 'SUFFICIENT',
+    strategyValidity: strictStrategyValidity,
     candidateSymbols: [...strictLongSymbols, ...strictShortSymbols],
   };
 
@@ -1609,6 +2205,7 @@ export function buildObservationShadowComparisonSummary(
     maxDrawdownR: null,
     expectancyR: null,
     sampleSufficiency: 'INSUFFICIENT' as const,
+    strategyValidity: 'INSUFFICIENT_SAMPLE' as const,
     candidateSymbols: [
       ...strictLongSymbols,
       ...strictShortSymbols,
@@ -1645,6 +2242,7 @@ export function buildObservationShadowComparisonSummary(
     maxDrawdownR: null,
     expectancyR: null,
     sampleSufficiency: 'INSUFFICIENT' as const,
+    strategyValidity: 'INSUFFICIENT_SAMPLE' as const,
     candidateSymbols: [
       ...strictLongSymbols,
       ...strictShortSymbols,
@@ -1761,6 +2359,45 @@ export function buildSmcGateDiagnosticsSummary(
                 Number.isFinite(item.nextBarOpenTime)
               ? Math.max(0, Math.round(Number(item.nextBarOpenTime) - Date.now()))
               : null;
+        const resolvedMarketRegime =
+          item.marketRegime ??
+          (item.marketRadarCategory === '雷達多頭觀察'
+            ? 'BULLISH_TREND'
+            : item.marketRadarCategory === '雷達空頭觀察'
+              ? 'BEARISH_TREND'
+              : !g.atrPassed || !g.riskSafetyPassed
+                ? 'HIGH_VOLATILITY'
+                : 'RANGING_CONSOLIDATION');
+        const resolvedFundingState =
+          item.fundingState ??
+          (!g.fundingPassed
+            ? 'FUNDING_MISSING_OR_EXTREME'
+            : !g.riskSafetyPassed
+              ? 'EXTREME_FUNDING_RISK'
+              : 'NORMAL_FUNDING');
+        const resolvedLiquidityState =
+          item.liquidityState ??
+          (!g.liquiditySafetyPassed
+            ? 'LOW_LIQUIDITY_OR_WIDE_SPREAD'
+            : g.liquiditySweepPassed
+              ? 'LIQUIDITY_SWEEP_CONFIRMED'
+              : 'ADEQUATE_LIQUIDITY_NO_SWEEP');
+        const resolvedMtfAlignmentState =
+          item.mtfAlignmentState ??
+          (g.mtfAlignmentPassed
+            ? g.intendedDirection === 'LONG'
+              ? 'ALIGNED_BULL'
+              : g.intendedDirection === 'SHORT'
+                ? 'ALIGNED_BEAR'
+                : 'MTF_ALIGNED'
+            : 'MTF_CONFLICT_OR_UNALIGNED');
+        const resolvedIsDemo = Boolean(item.isDemo);
+        const resolvedEvidenceType =
+          item.evidenceType ??
+          (resolvedIsDemo ? 'DEMO_LATENCY_FIXTURE' : 'LIVE_PRODUCTION');
+        const resolvedIsTestFixture =
+          item.isTestFixture ?? resolvedEvidenceType !== 'LIVE_PRODUCTION';
+
         nearMissSymbols.push({
           symbol: item.symbol,
           smcActionState: item.smcActionState,
@@ -1776,10 +2413,18 @@ export function buildSmcGateDiagnosticsSummary(
           nextBarRemainingMs: resolvedNextBarRemainingMs,
           queueWaitMs: item.queueWaitMs ?? null,
           smcEvaluationLatencyMs: resolvedEvaluationLatencyMs,
+          marketRegime: resolvedMarketRegime,
+          fundingState: resolvedFundingState,
+          liquidityState: resolvedLiquidityState,
+          mtfAlignmentState: resolvedMtfAlignmentState,
           dataFreshnessSeconds: item.dataFreshnessSeconds ?? null,
           stale: item.stale ?? false,
-          isDemo: item.isDemo ?? false,
+          isDemo: resolvedIsDemo,
+          isTestFixture: resolvedIsTestFixture,
+          evidenceType: resolvedEvidenceType,
           isFastLane: item.isFastLane ?? false,
+          cycleId: options?.cycleId,
+          observedAt: options?.snapshotAt,
         });
       }
     }

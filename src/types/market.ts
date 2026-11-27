@@ -83,6 +83,8 @@ export interface Kline {
   volume: number;
   closeTime: number;
   quoteVolume: number;
+  takerBuyVolume?: number | null;
+  takerBuyQuoteVolume?: number | null;
   isClosed: boolean;
 }
 
@@ -386,6 +388,11 @@ export interface ScannedCandidate {
   entryWindowStatus?: string | null;
   isFastLane?: boolean;
   intendedDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
+  earlyIgnition?: EarlyIgnitionSignal | null;
+  entryZoneSummary?: EntryZoneAnalysis | null;
+  tradeHorizon?: TradeHorizonProfile | null;
+  btcCorrelation?: BtcKlineCorrelationSummary | null;
+  sector?: MarketSectorInfo;
   evidences: EvidenceItem[];
   provenance: DataProvenance;
 }
@@ -467,6 +474,9 @@ export interface MarketScanResponse extends FullMarketGateStatistics {
   missingData: string[];
   ruleVersion: string;
   btcBenchmarkChange24h: number | null;
+  btcMarketRegime?: BtcMarketRegime | null;
+  marketBreadth?: MarketBreadthSummary | null;
+  sectorRotation?: SectorRotationItem[];
   candidates: ScannedCandidate[];
   summaryCounts: Record<ScanCategory, number>;
   marketRadarCounts: Record<MarketRadarCategory, number>;
@@ -540,6 +550,7 @@ export interface MarketScanResponse extends FullMarketGateStatistics {
   shortCandidateCount?: number;
   totalSymbols?: number;
   statsConsistency?: 'VALID' | 'INVALID';
+  snapshotConsistency?: SnapshotConsistencyMode;
   totalExpectedHttpRequests?: number;
   completedHttpRequests?: number;
   remainingHttpRequests?: number;
@@ -603,17 +614,25 @@ export interface MarketScanResponse extends FullMarketGateStatistics {
   queueWaitP95?: number | null;
   formalCandidateLatencySla?: FormalCandidateLatencySlaSummary;
   DEMO_LATENCY_FIXTURE?: DemoLatencyFixtureSummary;
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
   LIVE_FORMAL_CANDIDATE_COUNT?: number;
   LIVE_FAST_LANE_COUNT?: number;
   LIVE_BULK_COUNT?: number;
   LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT?: number;
   LIVE_ENTRY_WINDOW_MISSED_COUNT?: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
   LIVE_DETECTION_LATENCY_P50?: number | null;
   LIVE_DETECTION_LATENCY_P95?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P50?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P95?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P50?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P95?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
+  signalQualityCalibration?: SignalQualityCalibrationSummary;
   paperOpenedCount?: number;
   paperClosedCount?: number;
   blockedCount?: number;
@@ -739,10 +758,93 @@ export interface SmcMtfAlignment {
   description: string;
 }
 
+export type EarlyIgnitionStatus =
+  | 'IGNITION_LONG'
+  | 'IGNITION_SHORT'
+  | 'NONE';
+
+export type EarlyIgnitionTier =
+  | 'STRUCTURAL_IGNITION'
+  | 'VOLUME_IGNITION'
+  | 'NONE';
+
+export interface EarlyIgnitionSignal {
+  status: EarlyIgnitionStatus;
+  tier: EarlyIgnitionTier;
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  ignitionScore: number;
+  change24hPct: number;
+  rvol15m: number | null;
+  zScore15m: number | null;
+  triggerTimeframe: '5m' | '15m' | null;
+  sweepDetected: boolean;
+  mssOrBreakDetected: boolean;
+  displacementDetected: boolean;
+  invalidationPrice: number | null;
+  invalidationLabel: string | null;
+  headlineZh: string;
+  riskWarningZh: string;
+}
+
+export type EntryPullbackStatus =
+  | 'IN_DISCOUNT_ZONE'
+  | 'NEAR_PULLBACK_ZONE'
+  | 'OVEREXTENDED'
+  | 'NO_CLEAR_ZONE';
+
+export interface EntryZoneAnalysis {
+  status: EntryPullbackStatus;
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  anchorType: 'FVG' | 'ORDER_BLOCK' | 'VWAP' | 'SWING' | 'NONE';
+  anchorLabel: string;
+  zoneLow: number | null;
+  zoneHigh: number | null;
+  idealPullbackEntry: number | null;
+  stopLossPrice: number | null;
+  targetPrice: number | null;
+  currentPrice: number;
+  distanceToZonePct: number | null;
+  distanceToZoneAtr: number | null;
+  chaseRR: number | null;
+  pullbackRR: number | null;
+  headlineZh: string;
+  actionAdviceZh: string;
+}
+
+export type TradeHorizonCategory =
+  | 'SCALP_FAST'
+  | 'INTRADAY_TREND'
+  | 'SWING_EXTENDED'
+  | 'PENDING_OR_NEUTRAL';
+
+export interface TradeHorizonCriterion {
+  key: 'MTF_CONSENSUS' | 'TARGET_ROOM' | 'EXTENSION_POSITION' | 'CARRY_COST';
+  labelZh: string;
+  passedForSwing: boolean;
+  valueText: string;
+  impactZh: string;
+}
+
+export interface TradeHorizonProfile {
+  category: TradeHorizonCategory;
+  labelZh: string;
+  verdictShortZh: string;
+  holdingWindowZh: string;
+  summaryZh: string;
+  executionPlaybookZh: string;
+  criteria: TradeHorizonCriterion[];
+}
+
+export type SmcRuleProfile =
+  | 'STRICT_PRODUCTION'
+  | 'RELAXED_MTF_DISP'
+  | 'TREND_NO_SWEEP';
+
 export interface SmcAnalysisResult {
   symbol: string;
   primaryTimeframe: Timeframe;
   ruleVersion: string;
+  ruleProfile?: SmcRuleProfile;
   smcEvaluationStatus: SmcEvaluationStatus;
   actionState: SmcActionState;
   confirmedKlineCount: number;
@@ -764,6 +866,18 @@ export interface SmcAnalysisResult {
   nearMissStatus?: NearMissStatus;
   missingGates?: string[];
   intendedDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
+  earlyInflection?: {
+    direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+    timeframe: '5m' | '15m' | null;
+    sweepDetected: boolean;
+    mssOrBreakDetected: boolean;
+    displacementDetected: boolean;
+    invalidationPrice: number | null;
+    invalidationLabel: string | null;
+    descriptionZh: string | null;
+  };
+  entryZoneAnalysis?: EntryZoneAnalysis | null;
+  tradeHorizon?: TradeHorizonProfile | null;
 }
 
 export interface SymbolDetailResponse {
@@ -795,8 +909,96 @@ export interface SymbolDetailResponse {
     }
   >;
   smcAnalysis: SmcAnalysisResult;
+  entryZoneAnalysis?: EntryZoneAnalysis | null;
+  tradeHorizon?: TradeHorizonProfile | null;
+  btcCorrelation?: BtcKlineCorrelationAnalysis | null;
+  derivativesStructure?: DerivativesStructureAnalysis | null;
+  microstructure?: MarketMicrostructureAnalysis | null;
+  keyLevelsSession?: KeyLevelsAndSessionAnalysis | null;
+  btcKlinesByTimeframe?: Partial<Record<Timeframe, Kline[]>>;
+  btcMarketRegime?: BtcMarketRegime | null;
   crossExchange?: CrossExchangeDivergenceItem | null;
   provenance: DataProvenance;
+}
+
+export type BtcRegimeState =
+  | 'BULL_TREND'
+  | 'BEAR_TREND'
+  | 'CHOP_RANGE'
+  | 'VOLATILITY_SPIKE'
+  | 'UNKNOWN';
+
+export interface BtcMarketRegime {
+  state: BtcRegimeState;
+  change24hPct: number | null;
+  btcTrend15m: 'BULL' | 'BEAR' | 'NEUTRAL';
+  btcTrend1h: 'BULL' | 'BEAR' | 'NEUTRAL';
+  btcAtrPercent15m: number | null;
+  blocksLongAlts: boolean;
+  blocksShortAlts: boolean;
+  warningZh: string;
+}
+
+export type BtcCorrelationTier =
+  | 'BENCHMARK_BTC'
+  | 'HIGH_COUPLED'
+  | 'MODERATE_COUPLED'
+  | 'LOW_INDEPENDENT'
+  | 'INVERSE'
+  | 'INSUFFICIENT_DATA';
+
+export interface BtcCorrelationOverlayPoint {
+  openTime: number;
+  label: string;
+  btcClose: number;
+  symbolClose: number;
+  btcReturnPct: number;
+  symbolReturnPct: number;
+  btcBarReturnPct: number;
+  symbolBarReturnPct: number;
+  sameDirection: boolean;
+}
+
+export interface BtcTimeframeCorrelationMetric {
+  timeframe: Timeframe;
+  status: 'READY' | 'INSUFFICIENT_DATA';
+  alignedBarCount: number;
+  minRequiredBars: number;
+  pearsonCorrelation: number | null;
+  directionalOverlapRate: number | null;
+  downsideOverlapRate: number | null;
+  upsideOverlapRate: number | null;
+  beta: number | null;
+  avgAbsSpreadPct: number | null;
+  btcPeriodChangePct: number | null;
+  symbolPeriodChangePct: number | null;
+  series?: BtcCorrelationOverlayPoint[];
+}
+
+export interface BtcKlineCorrelationSummary {
+  isBenchmark: boolean;
+  status: 'READY' | 'CACHE_PENDING' | 'INSUFFICIENT_DATA';
+  tier: BtcCorrelationTier;
+  tierLabelZh: string;
+  primaryTimeframe: Timeframe;
+  pearson15m: number | null;
+  directionalOverlap15m: number | null;
+  downsideOverlap15m: number | null;
+  beta15m: number | null;
+  alignedBars15m: number;
+  pearson1h: number | null;
+  directionalOverlap1h: number | null;
+  downsideOverlap1h: number | null;
+  beta1h: number | null;
+  alignedBars1h: number;
+}
+
+export interface BtcKlineCorrelationAnalysis extends BtcKlineCorrelationSummary {
+  evaluatedAt: string;
+  riskLevel: 'HIGH' | 'MODERATE' | 'LOW' | 'BENCHMARK' | 'UNKNOWN';
+  summaryZh: string;
+  tradingHintZh: string;
+  byTimeframe: Partial<Record<Timeframe, BtcTimeframeCorrelationMetric>>;
 }
 
 export interface GeminiExplainRequest {
@@ -944,6 +1146,14 @@ export interface BacktestPointInTimeSignalEvidence {
   decisionTrace: Record<string, unknown> | SymbolDecisionTrace;
 }
 
+export interface TradingCostConfig {
+  makerFeeBps: number;
+  takerFeeBps: number;
+  slippageBps: number;
+  defaultFundingRatePer8h: number;
+  entryOrderType?: 'MARKET' | 'LIMIT';
+}
+
 export interface BacktestTradeRecord {
   signalId?: string;
   signalBarOpenTime?: number;
@@ -961,6 +1171,13 @@ export interface BacktestTradeRecord {
   structuralTargetPrice: number;
   exitPrice: number;
   rMultiple: number;
+  grossRMultiple?: number;
+  feeCostR?: number;
+  slippageCostR?: number;
+  fundingCostR?: number;
+  totalCostR?: number;
+  netRMultiple?: number;
+  fundingRateUsed?: number;
   outcome: 'WIN' | 'LOSS' | 'TIMEOUT_FLAT';
   evidencesSummary: string;
   pointInTimeEvidence?: BacktestPointInTimeSignalEvidence;
@@ -1016,6 +1233,12 @@ export interface WalkForwardWindowResult {
   averageHoldingTime: string | null;
   averageHoldingTimeMs?: number | null;
   averageHoldingBars?: number | null;
+  netWinRate?: number | null;
+  netAverageR?: number | null;
+  netProfitFactor?: number | null;
+  netMaxDrawdownR?: number | null;
+  netExpectancyR?: number | null;
+  totalCostDragR?: number | null;
   trades: BacktestTradeRecord[];
 }
 
@@ -1041,6 +1264,7 @@ export interface BacktestResult {
   exchange: ExchangeId;
   timeframe: Timeframe;
   ruleVersion: string;
+  smcRuleProfile?: SmcRuleProfile;
   scannerRuleVersion: string;
   startTime: string | null;
   endTime: string | null;
@@ -1083,6 +1307,15 @@ export interface BacktestResult {
   shortCount: number | null;
   averageWinR: number | null;
   averageLossR: number | null;
+  costConfig?: TradingCostConfig;
+  netWinRate?: number | null;
+  netAverageR?: number | null;
+  netExpectancyR?: number | null;
+  netProfitFactor?: number | null;
+  netMaxDrawdownR?: number | null;
+  totalCostDragR?: number | null;
+  avgCostDragPerTradeR?: number | null;
+  mtfHistoricalAligned?: boolean;
   trades: BacktestTradeRecord[];
   pointInTimeVolumeSnapshots?: BacktestPointInTimeVolumeSnapshot[];
   pointInTimeDecisions?: BacktestPointInTimeSignalEvidence[];
@@ -1090,6 +1323,8 @@ export interface BacktestResult {
   modeComparison?: BacktestModeComparisonMatrix;
   paperLedgerEntryIds?: number[];
   createdAt?: string;
+  triggerSource?: BacktestTriggerSource;
+  autoBatchId?: string | null;
   provenance: DataProvenance;
 }
 
@@ -1113,6 +1348,12 @@ export interface BacktestShadowModeMetrics {
   profitFactor: number | null;
   maxDrawdownR: number | null;
   expectancyR: number | null;
+  netWinRate?: number | null;
+  netAverageR?: number | null;
+  netProfitFactor?: number | null;
+  netMaxDrawdownR?: number | null;
+  netExpectancyR?: number | null;
+  totalCostDragR?: number | null;
   sampleSufficiency: SampleSufficiencyTier;
   dataStaleCount: number;
   missingDataCount: number;
@@ -1149,6 +1390,20 @@ export interface BacktestModeComparisonMatrix {
   };
 }
 
+export type PaperStrategyTrack =
+  | 'EARLY_IGNITION'
+  | 'FORMAL_SMC_MARKET'
+  | 'SMC_PULLBACK_LIMIT'
+  | 'MANUAL_OBSERVATION';
+
+export type PaperFillStatus = 'FILLED' | 'WAITING_LIMIT';
+
+export type PaperLimitExpiredReason =
+  | 'TTL_TIMEOUT'
+  | 'TARGET_MISSED'
+  | 'INVALIDATED_BEFORE_FILL'
+  | 'MANUAL_CANCEL';
+
 export interface PaperLedgerEntry {
   id: number;
   symbol: string;
@@ -1157,13 +1412,28 @@ export interface PaperLedgerEntry {
   side: 'LONG' | 'SHORT';
   category: ScanCategory;
   actionState: SmcActionState;
+  strategyTrack?: PaperStrategyTrack;
+  fillStatus?: PaperFillStatus;
+  filledAt?: string | null;
+  entryAnchorLabel?: string | null;
+  expiresAt?: string | null;
+  expiredReason?: PaperLimitExpiredReason | null;
   entryPrice: number;
   invalidationPrice: number;
+  trailingStopPrice?: number | null;
+  breakevenArmed?: boolean;
   targetPrice: number;
   currentPrice: number;
   exitPrice: number | null;
-  status: 'OPEN' | 'CLOSED_WIN' | 'CLOSED_LOSS' | 'CLOSED_MANUAL';
+  status: 'OPEN' | 'CLOSED_WIN' | 'CLOSED_LOSS' | 'CLOSED_MANUAL' | 'CLOSED_EXPIRED';
   pnlR: number;
+  grossPnlR?: number;
+  netPnlR?: number;
+  feeCostR?: number;
+  slippageCostR?: number;
+  fundingCostR?: number;
+  totalCostR?: number;
+  costConfig?: TradingCostConfig;
   pnlPercent: number;
   ruleVersion: string;
   evidences: string[];
@@ -1173,6 +1443,41 @@ export interface PaperLedgerEntry {
   isDemo?: boolean;
   demoIsolationLabel?: string | null;
   provenance: DataProvenance;
+}
+
+export interface PaperTrackMetricSummary {
+  track: PaperStrategyTrack;
+  labelZh: string;
+  totalEntries: number;
+  waitingLimitCount: number;
+  expiredLimitCount: number;
+  fillRatePercent: number | null;
+  filledCount: number;
+  openFilledCount: number;
+  closedCount: number;
+  winCount: number;
+  lossCount: number;
+  winRatePercent: number | null;
+  avgPnlR: number | null;
+  totalPnlR: number;
+  profitFactor: number | null;
+  netWinRatePercent?: number | null;
+  netAvgPnlR?: number | null;
+  netTotalPnlR?: number;
+  netProfitFactor?: number | null;
+  avgCostDragR?: number | null;
+  bestR: number | null;
+  worstR: number | null;
+}
+
+export interface PaperTrackComparisonStats {
+  scope: 'LIVE_ONLY' | 'ALL_INCLUDING_DEMO';
+  totalIncludedEntries: number;
+  totalDemoExcluded: number;
+  tracks: PaperTrackMetricSummary[];
+  leaderTrack: PaperStrategyTrack | null;
+  pullbackVsChaseDeltaR: number | null;
+  netPullbackVsChaseDeltaR?: number | null;
 }
 
 export interface BackgroundScanRunRecord {
@@ -1380,6 +1685,7 @@ export interface SmcScanResultRecord {
   nextBarRemainingMs?: number | null;
   entryWindowDelayMs?: number | null;
   intendedDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
+  evidenceType?: CandidateEvidenceType;
 }
 
 export interface SmcCandlesCacheRecord {
@@ -1574,6 +1880,7 @@ export interface SmcScanStatusResponse {
   lastCompletedCycleId?: string | null;
   lastCompletedCycleDuration?: number | null;
   statsConsistency?: 'VALID' | 'INVALID';
+  snapshotConsistency?: SnapshotConsistencyMode;
   isColdStartCycle?: boolean;
   cacheMode?: SmcCacheMode;
   cacheModeLabel?: string;
@@ -1827,17 +2134,25 @@ export interface SmcScanStatusResponse {
   queueWaitP95?: number | null;
   formalCandidateLatencySla?: FormalCandidateLatencySlaSummary;
   DEMO_LATENCY_FIXTURE?: DemoLatencyFixtureSummary;
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
   LIVE_FORMAL_CANDIDATE_COUNT?: number;
   LIVE_FAST_LANE_COUNT?: number;
   LIVE_BULK_COUNT?: number;
   LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT?: number;
   LIVE_ENTRY_WINDOW_MISSED_COUNT?: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
   LIVE_DETECTION_LATENCY_P50?: number | null;
   LIVE_DETECTION_LATENCY_P95?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P50?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P95?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P50?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P95?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
+  signalQualityCalibration?: SignalQualityCalibrationSummary;
   paperOpenedCount?: number;
   paperClosedCount?: number;
   blockedCount?: number;
@@ -2134,6 +2449,7 @@ export interface PaperTrackedSignalRecord {
   evidences: string[];
   decisionTrace?: Record<string, unknown> | SymbolDecisionTrace | null;
   isDemo: boolean;
+  evidenceType?: CandidateEvidenceType;
   createdAt: string;
   updatedAt: string;
 }
@@ -2220,6 +2536,7 @@ export interface PaperMonitorStatusResponse extends PaperMonitorEnvelope {
   lastCompletedCycleId?: string | null;
   lastCompletedCycleDuration?: number | null;
   statsConsistency?: 'VALID' | 'INVALID';
+  snapshotConsistency?: SnapshotConsistencyMode;
   maxConcurrency: number;
   concurrencyValid: boolean;
   stalledSuspected?: boolean;
@@ -2430,6 +2747,14 @@ export interface PaperMonitorStatusResponse extends PaperMonitorEnvelope {
   excludedSymbols?: string[];
   excludedReasons?: Record<string, number>;
   consistencyErrors?: string[];
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
+  signalQualityCalibration?: SignalQualityCalibrationSummary;
   externalNotificationCount: 0;
   externalTelegramRequestsCount: 0;
   externalTradingViewRequestsCount: 0;
@@ -3969,6 +4294,7 @@ export interface PaperQualityGateDriftResponse
   }>;
   cycleHistoryCount: number;
   aggregationScope?: FunnelAggregationScope;
+  snapshotConsistency?: SnapshotConsistencyMode;
   statisticScope?: GateStatisticScope;
   evaluationUniverseSize: number;
   excludedSymbols?: string[];
@@ -3998,17 +4324,25 @@ export interface PaperQualityGateDriftResponse
   queueWaitP95?: number | null;
   formalCandidateLatencySla?: FormalCandidateLatencySlaSummary;
   DEMO_LATENCY_FIXTURE?: DemoLatencyFixtureSummary;
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
   LIVE_FORMAL_CANDIDATE_COUNT?: number;
   LIVE_FAST_LANE_COUNT?: number;
   LIVE_BULK_COUNT?: number;
   LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT?: number;
   LIVE_ENTRY_WINDOW_MISSED_COUNT?: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
   LIVE_DETECTION_LATENCY_P50?: number | null;
   LIVE_DETECTION_LATENCY_P95?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P50?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P95?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P50?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P95?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
+  signalQualityCalibration?: SignalQualityCalibrationSummary;
   scopedGateStatistics?: ScopedGateStatisticsSummary;
   observationShadowComparison?: ObservationShadowComparisonSummary;
   candidateFunnel?: CycleCandidateFunnel;
@@ -4288,17 +4622,25 @@ export interface SmcScanProgressHealthResponse {
   queueWaitP95?: number | null;
   formalCandidateLatencySla?: FormalCandidateLatencySlaSummary;
   DEMO_LATENCY_FIXTURE?: DemoLatencyFixtureSummary;
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
   LIVE_FORMAL_CANDIDATE_COUNT?: number;
   LIVE_FAST_LANE_COUNT?: number;
   LIVE_BULK_COUNT?: number;
   LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT?: number;
   LIVE_ENTRY_WINDOW_MISSED_COUNT?: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
   LIVE_DETECTION_LATENCY_P50?: number | null;
   LIVE_DETECTION_LATENCY_P95?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P50?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P95?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P50?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P95?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
+  signalQualityCalibration?: SignalQualityCalibrationSummary;
   paperOpenedCount?: number;
   paperClosedCount?: number;
   blockedCount?: number;
@@ -4756,12 +5098,18 @@ export interface SymbolSmcGateEvaluation {
   intendedDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
 }
 
+export type SnapshotConsistencyMode =
+  | 'INDEPENDENT_ENDPOINT_SNAPSHOT'
+  | 'SHARED_ATOMIC_SNAPSHOT';
+
+export type StrategyValidityStatus = 'INSUFFICIENT_SAMPLE' | 'VALIDATED';
+
 export interface SmcNearMissSymbolRecord {
   symbol: string;
   smcActionState: SmcActionState;
   marketRadarCategory: MarketRadarCategory;
   nearMissStatus?: NearMissStatus;
-  intendedDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
+  intendedDirection: 'LONG' | 'SHORT' | 'NEUTRAL';
   score?: number;
   missingGateCount: 1 | 2;
   missingGates: string[];
@@ -4769,21 +5117,43 @@ export interface SmcNearMissSymbolRecord {
   waitReasons: string[];
   evaluationLatencyMs: number | null;
   nextBarRemainingMs: number | null;
-  queueWaitMs?: number | null;
+  queueWaitMs: number | null;
   smcEvaluationLatencyMs?: number | null;
+  marketRegime: string;
+  fundingState: string;
+  liquidityState: string;
+  mtfAlignmentState: string;
   dataFreshnessSeconds?: number | null;
   stale?: boolean;
   isDemo?: boolean;
+  isTestFixture?: boolean;
+  evidenceType?: CandidateEvidenceType;
   isFastLane?: boolean;
+  cycleId?: string;
+  observedAt?: string;
   candidateDetectionLatencyMs?: undefined;
   detectionLatencyMs?: undefined;
   entryWindowDelayMs?: undefined;
   entryWindowMissed?: undefined;
 }
 
+export type CandidateEvidenceType =
+  | 'LIVE_PRODUCTION'
+  | 'CONTROLLED_LIVE_FIXTURE'
+  | 'DEMO_LATENCY_FIXTURE';
+
+export type LiveCaptureValidationStatus =
+  | 'NO_LIVE_FORMAL_CANDIDATE'
+  | 'LIVE_CANDIDATE_DETECTED'
+  | 'LIVE_CANDIDATE_DETECTED_BEFORE_ENTRY'
+  | 'LIVE_ENTRY_WINDOW_MISSED'
+  | 'LIVE_VALIDATION_INSUFFICIENT_SAMPLE';
+
 export interface DemoLatencyFixtureSummary {
   evidenceType: 'DEMO_LATENCY_FIXTURE';
   isDemo: true;
+  isTestFixture?: true;
+  isLiveValidated?: false;
   neverMixedIntoLive: true;
   formalCandidateCount: number;
   fastLaneCount: number;
@@ -4802,9 +5172,126 @@ export interface DemoLatencyFixtureSummary {
   notice?: string;
 }
 
-export interface FormalCandidateSlaRecord {
+export interface ControlledLiveFixtureSummary {
+  evidenceType: 'CONTROLLED_LIVE_FIXTURE';
+  isControlledFixture: true;
+  isDemo: false;
+  isTestFixture?: true;
+  isLiveValidated?: false;
+  neverMixedIntoLive: true;
+  neverMarkedLiveValidated?: true;
+  formalCandidateCount: number;
+  fastLaneCount: number;
+  bulkCount: number;
+  detectedBeforeEntryWindowCount: number;
+  entryWindowMissedCount: number;
+  detectionLatencyP50: number | null;
+  detectionLatencyP95: number | null;
+  fastLaneDetectionLatencyP50: number | null;
+  fastLaneDetectionLatencyP95: number | null;
+  bulkDetectionLatencyP50: number | null;
+  bulkDetectionLatencyP95: number | null;
+  queueWaitP50: number | null;
+  queueWaitP95: number | null;
+  candidates?: LiveCaptureCandidateRecord[];
+  note: string;
+  notice: string;
+}
+
+export interface LiveCaptureCandidateRecord {
+  cycleId: string;
+  signalId: string;
   symbol: string;
   exchange: ExchangeId;
+  timeframe: string;
+  direction: 'LONG' | 'SHORT';
+  signalBarOpenTime: number | null;
+  signalBarCloseTime: number | null;
+  nextBarOpenTime: number | null;
+  candidateDetectedAt: string;
+  signalDetectedAt: string;
+  queueEnteredAt: string | null;
+  evaluationStartedAt: string;
+  evaluationCompletedAt: string;
+  queueWaitMs: number | null;
+  evaluationLatencyMs: number | null;
+  candidateDetectionLatencyMs: number | null;
+  nextBarRemainingMs: number | null;
+  entryWindowStatus: 'DETECTED_BEFORE_NEXT_BAR_OPEN' | 'ENTRY_WINDOW_MISSED';
+  entryWindowMissed: boolean;
+  isFastLane: boolean;
+  evidenceType: CandidateEvidenceType;
+  source: string;
+  fetchedAt: string;
+  stale: boolean;
+  fallback: boolean;
+  isDemo: boolean;
+  isTestFixture: boolean;
+}
+
+export interface Confirmed15mCloseEventRecord {
+  closeEventId: string;
+  eventId: string;
+  exchange: ExchangeId;
+  cycleId: string;
+  barOpenTime: number | null;
+  barCloseTime: number | null;
+  closeEventAt: string;
+  triggeredFastLaneCount: number;
+  completedFastLaneCount: number;
+  formalCandidateCount: number;
+  nearMissCount: number;
+  candidateDetectedBeforeEntryCount: number;
+  entryWindowMissedCount: number;
+  pendingCount: number;
+  queueWaitP50: number | null;
+  queueWaitP95: number | null;
+  workerState: SmcScanWorkerState;
+  cacheMode: SmcCacheMode;
+  snapshotAt: string;
+  statsVersion: number;
+  evidenceType: CandidateEvidenceType;
+  isDemo: boolean;
+  isTestFixture: boolean;
+}
+
+export interface SignalQualityCalibrationSummary {
+  cycleId: string;
+  snapshotAt: string;
+  statsVersion: number;
+  soleFormalSignalMode: 'STRICT_PRODUCTION';
+  noLookaheadGuaranteed: true;
+  confirmedBarsOnly: true;
+  modes: ObservationShadowModeBreakdown[];
+  strictProduction: ObservationShadowModeBreakdown;
+  shadowOneGateMissing: ObservationShadowModeBreakdown;
+  shadowTwoGatesMissing: ObservationShadowModeBreakdown;
+  settledPaperSampleCount: number;
+  minimumRequiredSettledSamples: number;
+  strategyValidity: StrategyValidityStatus;
+  lookaheadFreeBacktestCompleted: boolean;
+  walkForwardValidated: boolean;
+  marketRegimeResultsProvided: boolean;
+  allMetricsBackedByRealSamples: boolean;
+  gateAdjustmentAllowed: boolean;
+  gateAdjustmentRecommendation: string;
+  invariants: {
+    strictProductionGatesUnchanged: true;
+    shadowNeverOpensPaper: true;
+    shadowNeverWritesLedger: true;
+    shadowNeverNotifies: true;
+    shadowNeverMutatesSmcState: true;
+    shadowNeverMutatesFinalTradeSignal: true;
+  };
+}
+
+export interface FormalCandidateSlaRecord {
+  cycleId?: string;
+  signalId?: string;
+  symbol: string;
+  exchange: ExchangeId;
+  timeframe?: Timeframe;
+  direction?: 'LONG' | 'SHORT';
   smcActionState: 'LONG CANDIDATE' | 'SHORT CANDIDATE';
   finalTradeSignal: '多頭交易候選' | '空頭交易候選';
   signalBarOpenTime?: number | null;
@@ -4825,8 +5312,17 @@ export interface FormalCandidateSlaRecord {
   isFastLane: boolean;
   priorityClass: SmcPriorityClass;
   paperEligibilityStatus: PaperEligibilityStatus;
+  source?: string;
+  fetchedAt?: string;
+  stale?: boolean;
+  fallback?: boolean;
   isDemo?: boolean;
-  evidenceScope?: 'LIVE_PRODUCTION' | 'LIVE' | 'DEMO_LATENCY_FIXTURE';
+  evidenceType?: CandidateEvidenceType;
+  evidenceScope?:
+    | 'LIVE_PRODUCTION'
+    | 'LIVE'
+    | 'CONTROLLED_LIVE_FIXTURE'
+    | 'DEMO_LATENCY_FIXTURE';
 }
 
 export interface FormalCandidateLatencySlaSummary {
@@ -4874,17 +5370,24 @@ export interface FormalCandidateLatencySlaSummary {
     evaluationLatencyP95: number | null;
   };
   DEMO_LATENCY_FIXTURE?: DemoLatencyFixtureSummary;
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
   LIVE_FORMAL_CANDIDATE_COUNT?: number;
   LIVE_FAST_LANE_COUNT?: number;
   LIVE_BULK_COUNT?: number;
   LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT?: number;
   LIVE_ENTRY_WINDOW_MISSED_COUNT?: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
   LIVE_DETECTION_LATENCY_P50?: number | null;
   LIVE_DETECTION_LATENCY_P95?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P50?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P95?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P50?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P95?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
   candidates: FormalCandidateSlaRecord[];
   statusNotice?: string;
 }
@@ -5095,6 +5598,7 @@ export interface ObservationShadowModeBreakdown {
   maxDrawdownR: number | null;
   expectancyR: number | null;
   sampleSufficiency: SampleSufficiencyTier;
+  strategyValidity?: StrategyValidityStatus;
   candidateSymbols: string[];
 }
 
@@ -5262,17 +5766,25 @@ export interface CycleCandidateFunnel {
   consistencyErrors?: string[];
   formalCandidateLatencySla?: FormalCandidateLatencySlaSummary;
   DEMO_LATENCY_FIXTURE?: DemoLatencyFixtureSummary;
+  CONTROLLED_LIVE_FIXTURE?: ControlledLiveFixtureSummary;
   LIVE_FORMAL_CANDIDATE_COUNT?: number;
   LIVE_FAST_LANE_COUNT?: number;
   LIVE_BULK_COUNT?: number;
   LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT?: number;
   LIVE_ENTRY_WINDOW_MISSED_COUNT?: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE?: number | null;
   LIVE_DETECTION_LATENCY_P50?: number | null;
   LIVE_DETECTION_LATENCY_P95?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P50?: number | null;
   LIVE_FAST_LANE_DETECTION_LATENCY_P95?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P50?: number | null;
   LIVE_BULK_DETECTION_LATENCY_P95?: number | null;
+  liveValidationStatus?: LiveCaptureValidationStatus;
+  liveSampleValidationStatus?: LiveCaptureValidationStatus;
+  liveValidationStates?: LiveCaptureValidationStatus[];
+  liveValidationMessage?: string;
+  isLiveValidated?: boolean;
+  signalQualityCalibration?: SignalQualityCalibrationSummary;
   currentCycleFunnel?: ScopedFunnelBlock;
   latestSnapshotFunnel?: ScopedFunnelBlock;
   monitoringWindowFunnel?: ScopedFunnelBlock;
@@ -5341,3 +5853,965 @@ export interface PaperEligibilityAuditSummary {
   paperClosedCount?: number;
   finalTradeSignalOverwrittenCount?: number;
 }
+
+export interface LiveCloseEventWindowReport {
+  windowLabel: '24h' | '72h';
+  windowHours: 24 | 72;
+  windowStartAt: string;
+  windowEndAt: string;
+  evidenceType: 'LIVE_PRODUCTION';
+  isDemo: false;
+  isTestFixture: false;
+  totalCloseEventCount: number;
+  triggeredFastLaneCount: number;
+  completedFastLaneCount: number;
+  fastLaneCompletionRate: number | null;
+  formalCandidateCount: number;
+  nearMissCount: number;
+  candidateDetectedBeforeEntryCount: number;
+  entryWindowMissedCount: number;
+  queueWaitP50: number | null;
+  queueWaitP95: number | null;
+  events: Confirmed15mCloseEventRecord[];
+}
+
+export interface NearMissDistributionSummary {
+  totalNearMissCount: number;
+  nearMissOneGateCount: number;
+  nearMissTwoGatesCount: number;
+  byMissingGate: Record<string, number>;
+  byIntendedDirection: Record<'LONG' | 'SHORT' | 'NEUTRAL', number>;
+  byMarketRadarCategory: Record<string, number>;
+  byMarketRegime: Record<string, number>;
+  byFundingState: Record<string, number>;
+  byLiquidityState: Record<string, number>;
+  byMtfAlignmentState: Record<string, number>;
+  persistedObservationCount: number;
+  records: SmcNearMissSymbolRecord[];
+}
+
+export interface PaperQualityLiveCaptureResponse {
+  exchange: ExchangeId;
+  cycleId: string;
+  snapshotAt: string;
+  capturedAt: string;
+  statsVersion: number;
+  aggregationScope: FunnelAggregationScope;
+  snapshotConsistency: SnapshotConsistencyMode;
+  statsConsistency: 'VALID' | 'INVALID';
+  evidenceType: 'LIVE_PRODUCTION';
+  isDemo: false;
+  isTestFixture: false;
+  liveValidationStatus: LiveCaptureValidationStatus;
+  liveSampleValidationStatus: LiveCaptureValidationStatus;
+  liveValidationStates: LiveCaptureValidationStatus[];
+  liveValidationMessage: string;
+  isLiveValidated: boolean;
+  candidateDetectionLatencyP50: number | null;
+  candidateDetectionLatencyP95: number | null;
+  entryWindowMissedRate: number | null;
+  LIVE_FORMAL_CANDIDATE_COUNT: number;
+  LIVE_FAST_LANE_COUNT: number;
+  LIVE_BULK_COUNT: number;
+  LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT: number;
+  LIVE_ENTRY_WINDOW_MISSED_COUNT: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE: number | null;
+  LIVE_DETECTION_LATENCY_P50: number | null;
+  LIVE_DETECTION_LATENCY_P95: number | null;
+  LIVE_FAST_LANE_DETECTION_LATENCY_P50: number | null;
+  LIVE_FAST_LANE_DETECTION_LATENCY_P95: number | null;
+  LIVE_BULK_DETECTION_LATENCY_P50: number | null;
+  LIVE_BULK_DETECTION_LATENCY_P95: number | null;
+  liveProductionCandidates: LiveCaptureCandidateRecord[];
+  controlledFixtureCandidates: LiveCaptureCandidateRecord[];
+  CONTROLLED_LIVE_FIXTURE: ControlledLiveFixtureSummary;
+  DEMO_LATENCY_FIXTURE: DemoLatencyFixtureSummary;
+  evidenceIsolationGuarantee: {
+    liveProductionIsolated: true;
+    controlledFixtureNeverCountedInLive: true;
+    demoFixtureNeverCountedInLive: true;
+    controlledTestPassingNeverMarkedLiveValidated: true;
+  };
+  notices: string[];
+  executionSafety: {
+    paperOnly: true;
+    liveOrdersDisabled: true;
+    neverAutoPlaceOrders: true;
+    externalNotificationCount: 0;
+  };
+}
+
+export interface PaperQualityLiveCaptureEventsResponse {
+  exchange: ExchangeId;
+  cycleId: string;
+  snapshotAt: string;
+  capturedAt: string;
+  statsVersion: number;
+  aggregationScope: FunnelAggregationScope;
+  snapshotConsistency: SnapshotConsistencyMode;
+  statsConsistency: 'VALID' | 'INVALID';
+  evidenceType: 'LIVE_PRODUCTION';
+  isDemo: false;
+  isTestFixture: false;
+  totalCloseEventCount: number;
+  totalFastLaneTriggered: number;
+  totalFastLaneCompleted: number;
+  fastLaneCompletionRate: number | null;
+  totalLiveFormalCandidatesFromCloseEvents: number;
+  latestCloseEvent: Confirmed15mCloseEventRecord | null;
+  events: Confirmed15mCloseEventRecord[];
+  report24h: LiveCloseEventWindowReport;
+  report72h: LiveCloseEventWindowReport;
+  demoAndControlledExcludedFromEvents: true;
+  notices: string[];
+  executionSafety: {
+    paperOnly: true;
+    liveOrdersDisabled: true;
+    neverAutoPlaceOrders: true;
+    externalNotificationCount: 0;
+  };
+}
+
+export interface PaperQualityLiveCaptureSummaryResponse {
+  exchange: ExchangeId;
+  cycleId: string;
+  snapshotAt: string;
+  capturedAt: string;
+  statsVersion: number;
+  aggregationScope: FunnelAggregationScope;
+  snapshotConsistency: SnapshotConsistencyMode;
+  statsConsistency: 'VALID' | 'INVALID';
+  evidenceType: 'LIVE_PRODUCTION';
+  isDemo: false;
+  isTestFixture: false;
+  liveValidationStatus: LiveCaptureValidationStatus;
+  liveSampleValidationStatus: LiveCaptureValidationStatus;
+  liveValidationStates: LiveCaptureValidationStatus[];
+  liveValidationMessage: string;
+  isLiveValidated: boolean;
+  strategyValidity: StrategyValidityStatus;
+  candidateDetectionLatencyP50: number | null;
+  candidateDetectionLatencyP95: number | null;
+  entryWindowMissedRate: number | null;
+  LIVE_FORMAL_CANDIDATE_COUNT: number;
+  LIVE_FAST_LANE_COUNT: number;
+  LIVE_BULK_COUNT: number;
+  LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT: number;
+  LIVE_ENTRY_WINDOW_MISSED_COUNT: number;
+  LIVE_ENTRY_WINDOW_MISSED_RATE: number | null;
+  LIVE_DETECTION_LATENCY_P50: number | null;
+  LIVE_DETECTION_LATENCY_P95: number | null;
+  LIVE_FAST_LANE_DETECTION_LATENCY_P50: number | null;
+  LIVE_FAST_LANE_DETECTION_LATENCY_P95: number | null;
+  LIVE_BULK_DETECTION_LATENCY_P50: number | null;
+  LIVE_BULK_DETECTION_LATENCY_P95: number | null;
+  CONTROLLED_LIVE_FIXTURE: ControlledLiveFixtureSummary;
+  DEMO_LATENCY_FIXTURE: DemoLatencyFixtureSummary;
+  fastLaneCompletionRate: number | null;
+  closeEventSummary: {
+    totalCloseEventCount: number;
+    totalFastLaneTriggered: number;
+    totalFastLaneCompleted: number;
+    fastLaneCompletionRate: number | null;
+    latestCloseEvent: Confirmed15mCloseEventRecord | null;
+  };
+  report24h: LiveCloseEventWindowReport;
+  report72h: LiveCloseEventWindowReport;
+  nearMissDistribution: NearMissDistributionSummary;
+  nearMissObservations: SmcNearMissSymbolRecord[];
+  signalQualityCalibration: SignalQualityCalibrationSummary;
+  observationShadowComparison: ObservationShadowComparisonSummary;
+  currentCycleFunnel: ScopedFunnelBlock;
+  monitoringWindowFunnel: ScopedFunnelBlock;
+  cumulativeFunnel: ScopedFunnelBlock;
+  historicalSignalsOutsideCurrentCycle: HistoricalSignalsOutsideCurrentCycleBlock;
+  historicalSignalsOutsideWindow: HistoricalSignalsOutsideWindowBlock;
+  permanentNotices: string[];
+  executionSafety: {
+    paperOnly: true;
+    liveOrdersDisabled: true;
+    neverAutoPlaceOrders: true;
+    externalNotificationCount: 0;
+  };
+}
+
+export interface SharedAtomicLiveCaptureBundle {
+  exchange: ExchangeId;
+  cycleId: string;
+  snapshotAt: string;
+  capturedAt: string;
+  statsVersion: number;
+  aggregationScope: FunnelAggregationScope;
+  snapshotConsistency: 'SHARED_ATOMIC_SNAPSHOT';
+  statsConsistency: 'VALID' | 'INVALID';
+  liveCapture: PaperQualityLiveCaptureResponse;
+  events: PaperQualityLiveCaptureEventsResponse;
+  summary: PaperQualityLiveCaptureSummaryResponse;
+}
+
+// ============================================================================
+// Feature 2: Derivatives Capital Structure (OI x Price, CVD, Funding, Liquidation Pools)
+// ============================================================================
+
+export type OiPriceRegime =
+  | 'LONG_BUILDUP'
+  | 'SHORT_COVERING'
+  | 'SHORT_BUILDUP'
+  | 'LONG_LIQUIDATION'
+  | 'NEUTRAL'
+  | 'UNAVAILABLE';
+
+export type CvdDivergenceType =
+  | 'BULLISH_ABSORPTION'
+  | 'BEARISH_EXHAUSTION'
+  | 'CONFIRMED_TREND'
+  | 'NONE'
+  | 'UNAVAILABLE';
+
+export interface LiquidityPoolLevel {
+  id: string;
+  side: 'BUY_SIDE_LIQ' | 'SELL_SIDE_LIQ';
+  price: number;
+  distancePercent: number;
+  strengthScore: number;
+  basisLabel: string;
+  estimatedClusterUsd: number | null;
+}
+
+export interface DerivativesStructurePoint {
+  openTime: number;
+  label: string;
+  close: number;
+  takerBuyQuoteVolume: number | null;
+  takerSellQuoteVolume: number | null;
+  barDeltaUsd: number | null;
+  cumulativeCvdUsd: number | null;
+  openInterest: number | null;
+  openInterestValue: number | null;
+}
+
+export interface DerivativesStructureAnalysis {
+  symbol: string;
+  timeframe: Timeframe;
+  evaluatedAt: string;
+  oiRegime: {
+    status: 'READY' | 'UNAVAILABLE';
+    regime: OiPriceRegime;
+    regimeLabelZh: string;
+    priceChangePct: number | null;
+    oiChangePct: number | null;
+    currentOiValue: number | null;
+    sampleCount: number;
+    interpretationZh: string;
+  };
+  cvd: {
+    status: 'READY' | 'UNAVAILABLE';
+    barCount: number;
+    netDeltaUsd: number | null;
+    latestBarDeltaUsd: number | null;
+    takerBuyRatioPct: number | null;
+    divergence: CvdDivergenceType;
+    divergenceLabelZh: string;
+    interpretationZh: string;
+  };
+  funding: {
+    status: 'READY' | 'UNAVAILABLE';
+    currentRate: number | null;
+    avgRate: number | null;
+    deltaBps: number | null;
+    annualizedPct: number | null;
+    squeezeBias:
+      | 'SHORT_SQUEEZE_RISK'
+      | 'LONG_SQUEEZE_RISK'
+      | 'BALANCED'
+      | 'UNAVAILABLE';
+    squeezeLabelZh: string;
+    sampleCount: number;
+  };
+  liquidityClusters: LiquidityPoolLevel[];
+  series: DerivativesStructurePoint[];
+  summaryZh: string;
+}
+
+// ============================================================================
+// Feature 5: Market Breadth & Sector Capital Rotation
+// ============================================================================
+
+export type MarketSectorKey =
+  | 'BTC_ETH'
+  | 'L1'
+  | 'L2'
+  | 'AI'
+  | 'MEME'
+  | 'DEFI'
+  | 'RWA_INFRA'
+  | 'OTHER';
+
+export interface MarketSectorInfo {
+  key: MarketSectorKey;
+  labelZh: string;
+}
+
+export interface MarketBreadthSummary {
+  totalSymbols: number;
+  advancingCount: number;
+  decliningCount: number;
+  advancingRatioPct: number;
+  medianChange24hPct: number;
+  avgChange24hPct: number;
+  avgBtcPearson15m: number | null;
+  highBtcCoupledCount: number;
+  highBtcCoupledRatioPct: number | null;
+  lowIndependentCount: number;
+  bullRadarCount: number;
+  bearRadarCount: number;
+  formalCandidateCount: number;
+  marketRegime:
+    | 'BROAD_RISK_ON'
+    | 'BROAD_RISK_OFF'
+    | 'BTC_LED_ROTATION'
+    | 'SELECTIVE_CHOP';
+  marketRegimeLabelZh: string;
+}
+
+export interface SectorRotationItem {
+  key: MarketSectorKey;
+  labelZh: string;
+  symbolCount: number;
+  totalQuoteVolume24h: number;
+  volumeSharePct: number;
+  avgChange24hPct: number;
+  advancingRatioPct: number;
+  bullRadarCount: number;
+  bearRadarCount: number;
+  independentCount: number;
+  avgBtcPearson15m: number | null;
+  topLeaderSymbol: string | null;
+  topLeaderChange24hPct: number | null;
+}
+
+// ============================================================================
+// Features 1 & 2: Spot-Perp Basis & Orderbook Depth / Slippage Microstructure
+// ============================================================================
+
+export interface OrderBookLevel {
+  price: number;
+  quantity: number;
+}
+
+export interface OrderBookSnapshot {
+  symbol: string;
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
+  provenance: DataProvenance;
+}
+
+export interface SpotTickerSnapshot {
+  symbol: string;
+  spotSymbol: string;
+  priceMultiplier: number;
+  spotPrice: number | null;
+  spotQuoteVolume24h: number | null;
+  spotPriceChangePercent24h: number | null;
+  provenance: DataProvenance;
+}
+
+export type SpotPerpBasisRegime =
+  | 'SPOT_LED_HEALTHY'
+  | 'PERP_OVERHEATED_PREMIUM'
+  | 'PERP_DISCOUNT_FEAR'
+  | 'BALANCED'
+  | 'UNAVAILABLE';
+
+export interface OrderBookWall {
+  side: 'BID' | 'ASK';
+  price: number;
+  quantity: number;
+  notionalUsd: number;
+  distancePct: number;
+  multipleOfMedian: number;
+}
+
+export interface SlippageTierEstimate {
+  notionalUsd: number;
+  buySlippageBps: number | null;
+  sellSlippageBps: number | null;
+  buyAvgFillPrice: number | null;
+  sellAvgFillPrice: number | null;
+  buyDepthCovered: boolean;
+  sellDepthCovered: boolean;
+}
+
+export interface MarketMicrostructureAnalysis {
+  symbol: string;
+  evaluatedAt: string;
+  spotPerpBasis: {
+    status: 'READY' | 'UNAVAILABLE';
+    spotSymbol: string | null;
+    spotPrice: number | null;
+    perpPrice: number;
+    basisPct: number | null;
+    basisBps: number | null;
+    spotQuoteVolume24h: number | null;
+    perpQuoteVolume24h: number;
+    perpToSpotVolumeRatio: number | null;
+    regime: SpotPerpBasisRegime;
+    regimeLabelZh: string;
+    interpretationZh: string;
+  };
+  orderbook: {
+    status: 'READY' | 'UNAVAILABLE';
+    bestBid: number | null;
+    bestAsk: number | null;
+    midPrice: number | null;
+    spreadBps: number | null;
+    bidDepth50bpsUsd: number | null;
+    askDepth50bpsUsd: number | null;
+    obi50bpsPct: number | null;
+    bidDepth100bpsUsd: number | null;
+    askDepth100bpsUsd: number | null;
+    obi100bpsPct: number | null;
+    imbalanceLabelZh: string;
+    bidWalls: OrderBookWall[];
+    askWalls: OrderBookWall[];
+    slippageTiers: SlippageTierEstimate[];
+    compactBids: OrderBookLevel[];
+    compactAsks: OrderBookLevel[];
+    interpretationZh: string;
+  };
+}
+
+// ============================================================================
+// Feature 3: Key Levels (PDH/PDL/DO/WO/VWAP) & Session Killzone / Funding Clock
+// ============================================================================
+
+export type TradingSessionKey =
+  | 'ASIA'
+  | 'LONDON_KILLZONE'
+  | 'NY_AM_KILLZONE'
+  | 'US_EQUITY_OPEN'
+  | 'NY_PM'
+  | 'OFF_HOURS';
+
+export interface KeyLevelAnchor {
+  key: 'PDH' | 'PDL' | 'DAILY_OPEN' | 'WEEKLY_OPEN' | 'VWAP';
+  labelZh: string;
+  shortLabel: string;
+  price: number;
+  distancePct: number;
+}
+
+export interface KeyLevelsAndSessionAnalysis {
+  symbol: string;
+  primaryTimeframe: Timeframe;
+  evaluatedAt: string;
+  lastPrice: number;
+  pdh: number | null;
+  pdl: number | null;
+  dailyOpen: number | null;
+  weeklyOpen: number | null;
+  vwap: number | null;
+  vwapUpper1: number | null;
+  vwapLower1: number | null;
+  priceVsVwapPct: number | null;
+  vwapPositionLabelZh: string;
+  anchors: KeyLevelAnchor[];
+  nearestKeyLevel: KeyLevelAnchor | null;
+  proximityWarningZh: string | null;
+  session: {
+    utcHour: number;
+    activeSession: TradingSessionKey;
+    sessionLabelZh: string;
+    volatilityNoteZh: string;
+    nextFundingTime: number | null;
+    fundingCountdownMs: number | null;
+    fundingWarningSoon: boolean;
+  };
+}
+
+// ============================================================================
+// Feature 5: Client-Side Interactive Price & Structure Alert Rules
+// ============================================================================
+
+export type PriceAlertConditionType =
+  | 'PRICE_ABOVE'
+  | 'PRICE_BELOW'
+  | 'TOUCH_OB'
+  | 'TOUCH_FVG'
+  | 'FUNDING_EXTREME'
+  | 'BTC_MOVE_SHOCK';
+
+export interface PriceAlertRule {
+  id: string;
+  symbol: string;
+  conditionType: PriceAlertConditionType;
+  targetPrice: number | null;
+  zoneLow: number | null;
+  zoneHigh: number | null;
+  thresholdPct: number | null;
+  note: string;
+  enabled: boolean;
+  triggered: boolean;
+  triggeredAt: string | null;
+  triggeredPrice: number | null;
+  createdAt: string;
+}
+
+export interface TriggeredAlertEvent {
+  id: string;
+  ruleId: string;
+  symbol: string;
+  conditionType: PriceAlertConditionType;
+  messageZh: string;
+  triggerPrice: number | null;
+  triggeredAt: string;
+}
+
+// ============================================================================
+// Auto-Backtest Scheduler & External Notifications (Telegram / Discord)
+// ============================================================================
+
+export type BacktestTriggerSource = 'MANUAL' | 'AUTO_SCHEDULED';
+
+export interface AutoBacktestConfig {
+  enabled: boolean;
+  intervalMs: number;
+  timeframe: Timeframe;
+  maxSymbolsPerRun: number;
+  includeWatchlist: boolean;
+  watchlistSymbols: string[];
+  exchange: ExchangeId;
+  updatedAt: string;
+}
+
+export interface AutoBacktestBatchRunRecord {
+  batchId: string;
+  exchange: ExchangeId;
+  timeframe: Timeframe;
+  startedAt: string;
+  completedAt: string | null;
+  status: 'SUCCESS' | 'SKIPPED_BUSY' | 'PARTIAL_ERROR' | 'API_ERROR';
+  targetSymbols: string[];
+  completedCount: number;
+  skippedCachedCount: number;
+  failedCount: number;
+  savedRunIds: string[];
+  note: string;
+  durationMs: number;
+}
+
+export interface AutoBacktestStatusResponse {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  running: boolean;
+  executingBatch: boolean;
+  config: AutoBacktestConfig;
+  lastBatchAt: string | null;
+  nextRunAt: string | null;
+  totalBatches: number;
+  recentBatches: AutoBacktestBatchRunRecord[];
+}
+
+export type ExternalNotificationChannel = 'TELEGRAM' | 'DISCORD';
+
+export type ExternalNotificationSignalTrack =
+  | 'FORMAL_SMC'
+  | 'EARLY_IGNITION'
+  | 'POSITION_SENTINEL'
+  | 'SYSTEM_WATCHDOG'
+  | 'TEST';
+
+export type ExternalNotificationStatus =
+  | 'DELIVERED'
+  | 'SEND_FAILED'
+  | 'NON_CANDIDATE_BLOCKED'
+  | 'COOLDOWN_BLOCKED'
+  | 'DEDUPED_BLOCKED'
+  | 'RATE_LIMITED_BLOCKED'
+  | 'SKIPPED_DISABLED'
+  | 'SKIPPED_UNCONFIGURED';
+
+export interface ExternalNotificationConfig {
+  telegramEnabled: boolean;
+  discordEnabled: boolean;
+  notifyFormalSmc: boolean;
+  notifyEarlyIgnition: boolean;
+  updatedAt: string;
+}
+
+export interface ExternalNotificationEnvReadiness {
+  telegramConfigured: boolean;
+  telegramMissingVars: string[];
+  discordConfigured: boolean;
+  discordMissingVars: string[];
+}
+
+export interface ExternalNotificationDispatchLog {
+  id: string;
+  channel: ExternalNotificationChannel;
+  symbol: string;
+  track: ExternalNotificationSignalTrack;
+  actionState: string;
+  status: ExternalNotificationStatus;
+  reason: string;
+  httpStatus: number | null;
+  isTest: boolean;
+  messagePreview: string;
+  dedupeKey: string | null;
+  cooldownUntil: string | null;
+  createdAt: string;
+}
+
+export interface ExternalNotificationStatusResponse {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  config: ExternalNotificationConfig;
+  envReadiness: ExternalNotificationEnvReadiness;
+  recentLogs: ExternalNotificationDispatchLog[];
+}
+
+// ============================================================================
+// Position Sentinel: Active Trade Live Trend & Reversal Guardian
+// ============================================================================
+
+export type PositionHealthState =
+  | 'TREND_INTACT'
+  | 'MOMENTUM_FADING'
+  | 'EARLY_REVERSAL'
+  | 'THESIS_BROKEN';
+
+export type PositionSentinelAlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+
+export type PositionSentinelEventType =
+  | 'PRICE_SHOCK_1M'
+  | 'VOLUME_SPIKE_ADVERSE'
+  | 'MICRO_CHOCH_5M_UNCONFIRMED'
+  | 'MICRO_CHOCH_5M_CONFIRMED'
+  | 'ADVERSE_FVG_5M'
+  | 'OI_DIVERGENCE'
+  | 'STRUCTURE_CHOCH_15M'
+  | 'HTF_BREAK_1H'
+  | 'STOP_PROXIMITY'
+  | 'THESIS_INVALIDATED'
+  | 'TRAILING_DEFENSE_RAISED';
+
+export type PositionSentinelSourceType = 'MANUAL' | 'PAPER_LEDGER';
+
+export interface PositionSentinelAlert {
+  id: string;
+  positionId: string;
+  symbol: string;
+  exchange: ExchangeId;
+  side: 'LONG' | 'SHORT';
+  severity: PositionSentinelAlertSeverity;
+  healthState: PositionHealthState;
+  eventType: PositionSentinelEventType;
+  titleZh: string;
+  detailZh: string;
+  priceAtEvent: number;
+  suggestedDefensePrice: number | null;
+  confirmedClose: boolean;
+  createdAt: string;
+}
+
+export interface PositionSentinelTrackedPosition {
+  id: string;
+  sourceType: PositionSentinelSourceType;
+  paperLedgerId: number | null;
+  symbol: string;
+  exchange: ExchangeId;
+  side: 'LONG' | 'SHORT';
+  timeframe: Timeframe;
+  entryPrice: number;
+  invalidationPrice: number;
+  targetPrice: number | null;
+  leverage: number;
+  active: boolean;
+  paused: boolean;
+  notes: string;
+  openedAt: string;
+  updatedAt: string;
+}
+
+export interface PositionSentinelSnapshot extends PositionSentinelTrackedPosition {
+  currentPrice: number;
+  markSource: 'WEBSOCKET' | 'REST_FAST' | 'CACHE';
+  lastTickAt: string | null;
+  unrealizedPnlPercent: number;
+  unrealizedPnlR: number;
+  distanceToInvalidationPercent: number;
+  distanceToTargetPercent: number | null;
+  healthState: PositionHealthState;
+  healthLabelZh: string;
+  healthScore: number;
+  atr15m: number | null;
+  move1mPct: number | null;
+  move3mPct: number | null;
+  move1mAtrMultiple: number | null;
+  liveBarRvol5m: number | null;
+  micro5mState: 'ALIGNED' | 'TESTING_SWING' | 'ADVERSE_CHOCH' | 'UNKNOWN';
+  structure15mState: 'ALIGNED' | 'WEAKENING' | 'REVERSED' | 'UNKNOWN';
+  htf1hBias: 'BULL' | 'BEAR' | 'NEUTRAL' | 'UNKNOWN';
+  oiDeltaPct: number | null;
+  oiWarningZh: string | null;
+  adverseFvgDetected: boolean;
+  adverseFvgRange: { low: number; high: number } | null;
+  suggestedDefensePrice: number | null;
+  suggestedDefenseLabel: string | null;
+  breakEvenReady: boolean;
+  activeWarnings: string[];
+  recentEvents: PositionSentinelAlert[];
+  lastEvaluatedAt: string | null;
+  lastError: string | null;
+  provenance: DataProvenance;
+}
+
+export interface PositionSentinelConfig {
+  enabled: boolean;
+  autoSyncPaperLedger: boolean;
+  wsStreamEnabled: boolean;
+  pollIntervalMs: number;
+  atrShockMultiplier: number;
+  rvolSpikeThreshold: number;
+  stopProximityPct: number;
+  notifyDiscord: boolean;
+  notifyTelegram: boolean;
+  notifyMinSeverity: 'WARNING' | 'CRITICAL';
+  alertCooldownMs: number;
+  updatedAt: string;
+}
+
+export interface PositionSentinelStatusResponse {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  config: PositionSentinelConfig;
+  isRunning: boolean;
+  wsConnectedExchanges: ExchangeId[];
+  positions: PositionSentinelSnapshot[];
+  recentAlerts: PositionSentinelAlert[];
+  summary: {
+    totalTracked: number;
+    intactCount: number;
+    fadingCount: number;
+    earlyReversalCount: number;
+    thesisBrokenCount: number;
+  };
+  lastCycleAt: string | null;
+}
+
+// ============================================================================
+// Multi-Symbol Portfolio Benchmark, System Watchdog & Validation Readiness
+// ============================================================================
+
+export interface PortfolioRiskConfig {
+  maxOpenPositions: number;
+  maxSameDirectionPositions: number;
+  dailyMaxDrawdownR: number;
+  consecutiveLossCooldownLimit: number;
+  cooldownBars: number;
+}
+
+export interface PortfolioBacktestTradeRecord extends BacktestTradeRecord {
+  symbol: string;
+}
+
+export interface PortfolioBlockedTradeEvent {
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  entryBarTime: number;
+  reasonCode:
+    | 'MAX_OPEN_POSITIONS'
+    | 'SAME_DIRECTION_CAP'
+    | 'DAILY_DRAWDOWN_CIRCUIT_BREAKER'
+    | 'CONSECUTIVE_LOSS_COOLDOWN';
+  reasonZh: string;
+  projectedNetR: number;
+}
+
+export interface PortfolioSymbolBacktestSummary {
+  symbol: string;
+  status: 'COMPLETED' | 'INSUFFICIENT_DATA' | 'FAILED';
+  metricStatus: BacktestMetricStatus;
+  confirmedBarsTested: number;
+  mtfHistoricalAligned: boolean;
+  rawTradesCount: number;
+  acceptedTradesCount: number;
+  blockedTradesCount: number;
+  winRate: number | null;
+  netWinRate: number | null;
+  averageR: number | null;
+  netAverageR: number | null;
+  profitFactor: number | null;
+  netProfitFactor: number | null;
+  maxDrawdownR: number | null;
+  netMaxDrawdownR: number | null;
+  errorMessage?: string;
+}
+
+export interface PortfolioBacktestResult {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  portfolioRunId: string;
+  exchange: ExchangeId;
+  timeframe: Timeframe;
+  barLimit: number;
+  smcRuleProfile?: SmcRuleProfile;
+  isDemo: boolean;
+  dataClassification: BacktestDataClassification;
+  lookaheadFree: boolean;
+  mtfHistoricalAlignedCount: number;
+  costConfig: TradingCostConfig;
+  riskConfig: PortfolioRiskConfig;
+  symbolsRequested: string[];
+  symbolsSucceeded: number;
+  symbolsWithTrades: number;
+  rawTotalTrades: number;
+  acceptedTradesCount: number;
+  blockedByRiskCapCount: number;
+  blockedBreakdown: {
+    maxOpenPositions: number;
+    sameDirectionCap: number;
+    dailyDrawdownCircuitBreaker: number;
+    consecutiveLossCooldown: number;
+  };
+  sampleSufficiency: SampleSufficiencyTier;
+  longCount: number;
+  shortCount: number;
+  winRate: number | null;
+  averageR: number | null;
+  expectancyR: number | null;
+  profitFactor: number | null;
+  maxDrawdownR: number | null;
+  netWinRate: number | null;
+  netAverageR: number | null;
+  netExpectancyR: number | null;
+  netProfitFactor: number | null;
+  netMaxDrawdownR: number | null;
+  totalGrossR: number | null;
+  totalNetR: number | null;
+  totalCostDragR: number | null;
+  avgCostDragPerTradeR: number | null;
+  symbolSummaries: PortfolioSymbolBacktestSummary[];
+  portfolioTrades: PortfolioBacktestTradeRecord[];
+  blockedEvents: PortfolioBlockedTradeEvent[];
+  createdAt: string;
+}
+
+export interface WatchdogConfig {
+  enabled: boolean;
+  heartbeatIntervalMs: number;
+  autoBackupIntervalMs: number;
+  alertOnStall: boolean;
+  alertOnDbRecovery: boolean;
+  alertOnApiErrorSpike: boolean;
+  apiErrorSpikeThreshold: number;
+  updatedAt: string;
+}
+
+export interface WatchdogEventRecord {
+  id: string;
+  eventType:
+    | 'HEARTBEAT'
+    | 'AUTO_BACKUP'
+    | 'WORKER_STALL'
+    | 'DB_RECOVERY'
+    | 'API_ERROR_SPIKE';
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
+  messageZh: string;
+  notifiedExternal: boolean;
+  createdAt: string;
+}
+
+export interface SystemWatchdogStatusResponse {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  running: boolean;
+  config: WatchdogConfig;
+  lastCheckAt: string | null;
+  lastHeartbeatAt: string | null;
+  lastAutoBackupAt: string | null;
+  alertsDispatchedCount: number;
+  autoBackupsCount: number;
+  recentEvents: WatchdogEventRecord[];
+}
+
+export interface ValidationReadinessCriterion {
+  id:
+    | 'NET_EXPECTANCY_POSITIVE'
+    | 'STATISTICAL_SAMPLE_SIZE'
+    | 'LIVE_EXECUTION_CAPTURE'
+    | 'PORTFOLIO_RISK_DISCIPLINE'
+    | 'OPERATIONAL_STABILITY';
+  titleZh: string;
+  status: 'PASSED' | 'PARTIAL' | 'PENDING' | 'FAILED';
+  currentValueLabel: string;
+  targetThresholdLabel: string;
+  detailZh: string;
+}
+
+export interface ValidationReadinessResponse {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  evaluatedAt: string;
+  overallStatus: 'VALIDATED' | 'IN_PROGRESS' | 'NOT_READY';
+  passedCount: number;
+  totalCount: number;
+  readinessScorePercent: number;
+  livePaperStats: {
+    totalTrackedSignals: number;
+    missedWindowCount: number;
+    captureRatePercent: number | null;
+    settledPaperTradesCount: number;
+    waitingLimitCount: number;
+    netExpectancyR: number | null;
+    netProfitFactor: number | null;
+  };
+  backtestStats: {
+    latestRealBacktestCount: number;
+    latestRealNetExpectancyR: number | null;
+    latestRealNetProfitFactor: number | null;
+    latestRealTradeCount: number;
+  };
+  criteria: ValidationReadinessCriterion[];
+}
+
+export interface SmcAbProfileComparisonRow {
+  profile: SmcRuleProfile;
+  profileLabelZh: string;
+  ruleVersion: string;
+  rawTotalTrades: number;
+  acceptedTradesCount: number;
+  blockedByRiskCapCount: number;
+  longCount: number;
+  shortCount: number;
+  sampleSufficiency: SampleSufficiencyTier;
+  winRate: number | null;
+  netWinRate: number | null;
+  averageR: number | null;
+  netAverageR: number | null;
+  expectancyR: number | null;
+  netExpectancyR: number | null;
+  profitFactor: number | null;
+  netProfitFactor: number | null;
+  maxDrawdownR: number | null;
+  netMaxDrawdownR: number | null;
+  totalGrossR: number | null;
+  totalNetR: number | null;
+  totalCostDragR: number | null;
+  avgCostDragPerTradeR: number | null;
+  portfolioResult: PortfolioBacktestResult;
+}
+
+export interface SmcAbComparisonResponse {
+  safety: typeof TRADING_SAFETY_FLAGS;
+  comparisonId: string;
+  exchange: ExchangeId;
+  timeframe: Timeframe;
+  barLimit: number;
+  isDemo: boolean;
+  dataClassification: BacktestDataClassification;
+  lookaheadFree: boolean;
+  symbolsRequested: string[];
+  symbolsSucceeded: number;
+  costConfig: TradingCostConfig;
+  riskConfig: PortfolioRiskConfig;
+  profiles: SmcAbProfileComparisonRow[];
+  recommendedProfile: SmcRuleProfile | null;
+  recommendationReasonZh: string;
+  createdAt: string;
+}
+

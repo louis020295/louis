@@ -19,6 +19,8 @@ import {
   MIN_HISTORY_SAMPLES,
 } from '../engine/VolumeAnomalyEngine.ts';
 import {
+  CandidateEvidenceType,
+  Confirmed15mCloseEventRecord,
   DataProvenance,
   ExchangeId,
   FinalTradeSignal,
@@ -60,6 +62,10 @@ import {
   Timeframe,
   TRADING_SAFETY_FLAGS,
 } from '../../src/types/market.ts';
+import {
+  enforceProvenanceIntegrity,
+  resolveCandidateEvidenceType,
+} from '../utils/provenanceQuarantine.ts';
 
 export const DEFAULT_SMC_QUEUE_CONFIG: SmcScanQueueConfig = {
   maxConcurrency: 2,
@@ -143,20 +149,37 @@ export class SmcBatchScanService {
 
   private config: SmcScanQueueConfig;
   private workerState: 'RUNNING' | 'PAUSED' | 'IDLE' = 'IDLE';
+  private workerStateByExchange = new Map<
+    ExchangeId,
+    'RUNNING' | 'PAUSED' | 'IDLE'
+  >();
   private activeExchange: ExchangeId = 'binance_usdm';
   private activeMode: 'live' | 'demo' = 'live';
-  private loopTimer: ReturnType<typeof setTimeout> | null = null;
+  private modeByExchange = new Map<ExchangeId, 'live' | 'demo'>();
+  private trackedLiveExchanges = new Set<ExchangeId>(['binance_usdm']);
+  private loopTimerByExchange = new Map<
+    ExchangeId,
+    ReturnType<typeof setTimeout>
+  >();
   private progressSampleTimer: ReturnType<typeof setInterval> | null = null;
-  private isProcessingTick = false;
-  private activeConcurrency = 0;
+  private closeTriggerTimer: ReturnType<typeof setInterval> | null = null;
+  private lastAutoTriggered15mCloseTimeByExchange = new Map<ExchangeId, number>();
+  private inFlight15mCloseTriggerByExchange = new Map<ExchangeId, boolean>();
+  private inFlightExpiredRefreshByExchange = new Map<ExchangeId, boolean>();
+  private periodicBarSyncInFlight = false;
+  private lastExpiredRefreshAttemptMsByExchange = new Map<ExchangeId, number>();
+  private expiredRefreshBackoffUntilMsByExchange = new Map<ExchangeId, number>();
+  private lastTickerSnapshotFetchedAtMsByExchange = new Map<ExchangeId, number>();
+  private isProcessingTickByExchange = new Map<ExchangeId, boolean>();
+  private activeConcurrencyByExchange = new Map<ExchangeId, number>();
   public maxActiveConcurrencyObserved = 0;
   public maxRunningJobCountObserved = 0;
-  private inFlightRequestCount = 0;
+  private inFlightRequestCountByExchange = new Map<ExchangeId, number>();
   public maxInFlightRequestCountObserved = 0;
-  private readonly httpWaitQueue: Array<() => void> = [];
-  private readonly requestTimestamps: number[] = [];
-  private consecutiveFastLaneJobs = 0;
-  private remainingBulkReservationJobs = 0;
+  private httpWaitQueueByExchange = new Map<ExchangeId, Array<() => void>>();
+  private requestTimestampsByExchange = new Map<ExchangeId, number[]>();
+  private consecutiveFastLaneJobsByExchange = new Map<ExchangeId, number>();
+  private remainingBulkReservationJobsByExchange = new Map<ExchangeId, number>();
   private runtimeCacheHitsByExchange = new Map<ExchangeId, number>();
   private runtimeCacheMissesByExchange = new Map<ExchangeId, number>();
   private latestTickerMapByExchange = new Map<
@@ -172,6 +195,7 @@ export class SmcBatchScanService {
   private activeRuleVersionByExchange = new Map<ExchangeId, string>();
   private inFlightPrewarmSymbolsByExchange = new Map<ExchangeId, Set<string>>();
   private isPrewarmingByExchange = new Map<ExchangeId, boolean>();
+  private isRefreshingExpiredCacheByExchange = new Map<ExchangeId, boolean>();
   private activePrewarmWorkerCount = 0;
   private inFlightTimeframePromises = new Map<
     string,
@@ -203,6 +227,62 @@ export class SmcBatchScanService {
   private completionTimestampsByExchange = new Map<ExchangeId, number[]>();
   private lastStalledSuspectedByExchange = new Map<ExchangeId, boolean>();
   private lastProgressEvidenceSampleMsByExchange = new Map<ExchangeId, number>();
+  private lastRealResumeAtMsByExchange = new Map<ExchangeId, number>();
+  private phase16DiagnosticsCacheByExchange = new Map<
+    string,
+    {
+      fingerprint: string;
+      nowMs: number;
+      result: SmcScanProgressHealthResponse;
+    }
+  >();
+  private consecutiveScheduleDbErrorsByExchange = new Map<ExchangeId, number>();
+
+  public getWorkerState(
+    exchange: ExchangeId = this.activeExchange
+  ): 'RUNNING' | 'PAUSED' | 'IDLE' {
+    return this.workerStateByExchange.get(exchange) ?? 'IDLE';
+  }
+
+  private setWorkerState(
+    exchange: ExchangeId,
+    state: 'RUNNING' | 'PAUSED' | 'IDLE'
+  ): void {
+    this.workerStateByExchange.set(exchange, state);
+    if (exchange === this.activeExchange) {
+      this.workerState = state;
+    }
+  }
+
+  public setActiveForegroundExchange(
+    exchange: ExchangeId,
+    mode: 'live' | 'demo' = 'live'
+  ): void {
+    this.activeExchange = exchange;
+    this.activeMode = mode;
+    this.modeByExchange.set(exchange, mode);
+    this.workerState = this.getWorkerState(exchange);
+    if (mode === 'live' && exchange !== 'demo_synthetic') {
+      this.trackedLiveExchanges.add(exchange);
+    }
+  }
+
+  public getActiveForegroundExchange(): ExchangeId {
+    return this.activeExchange;
+  }
+
+  public ensurePeriodicSyncForExchange(exchange: ExchangeId): void {
+    if (exchange !== 'demo_synthetic') {
+      this.trackedLiveExchanges.add(exchange);
+    }
+  }
+
+  public isExchangeLoopActive(exchange: ExchangeId): boolean {
+    return Boolean(
+      this.loopTimerByExchange.get(exchange) ||
+        this.isProcessingTickByExchange.get(exchange)
+    );
+  }
 
   constructor(params: {
     adapters: Record<ExchangeId, ExchangeAdapter>;
@@ -288,8 +368,15 @@ export class SmcBatchScanService {
     };
   }
 
-  public getInFlightRequestCount(): number {
-    return this.inFlightRequestCount;
+  public getInFlightRequestCount(exchange?: ExchangeId): number {
+    if (exchange) {
+      return this.inFlightRequestCountByExchange.get(exchange) ?? 0;
+    }
+    let total = 0;
+    for (const c of this.inFlightRequestCountByExchange.values()) {
+      total += c;
+    }
+    return total;
   }
 
   public updateConfig(partial: Partial<SmcScanQueueConfig>): SmcScanQueueConfig {
@@ -411,6 +498,47 @@ export class SmcBatchScanService {
     return `win_${bucket}`;
   }
 
+  private extract15mBucketStartMs(windowKey: string): number | null {
+    const winMatch = /^win_(\d{12,})$/.exec(windowKey);
+    if (winMatch) {
+      const ts = Number(winMatch[1]);
+      return Number.isFinite(ts) ? ts : null;
+    }
+    const win15mMatch = /^win_?15m_(\d+)/.exec(windowKey);
+    if (win15mMatch) {
+      const bucketIdx = Number(win15mMatch[1]);
+      return Number.isFinite(bucketIdx) ? bucketIdx * 900_000 : null;
+    }
+    return null;
+  }
+
+  public updateLatestMarketSnapshot(
+    exchange: ExchangeId,
+    tickers: MarketTicker[]
+  ): void {
+    if (!tickers || tickers.length === 0) return;
+    const tMap = new Map<string, MarketTicker>();
+    const symbolsWithTickerOi = new Set<string>();
+    for (const t of tickers) {
+      tMap.set(t.symbol, t);
+      if (t.openInterest !== null && t.openInterest !== undefined) {
+        symbolsWithTickerOi.add(t.symbol);
+      }
+    }
+    this.latestTickerMapByExchange.set(exchange, tMap);
+    this.lastTickerSnapshotFetchedAtMsByExchange.set(exchange, Date.now());
+    if (!this.totalContractsByExchange.has(exchange) && tickers.length > 0) {
+      this.totalContractsByExchange.set(exchange, tickers.length);
+    }
+    this.db.updateRuntimeHttpMetrics(exchange, {
+      maxHttpConcurrency: this.config.maxHttpConcurrency,
+      maxRequestsPerMinute: this.config.maxRequestsPerMinute,
+      requiresPerSymbolOiHttp:
+        exchange !== 'demo_synthetic' && symbolsWithTickerOi.size < tickers.length,
+      symbolsWithTickerOi,
+    });
+  }
+
   public resolveActiveWindowKey(
     exchange: ExchangeId,
     explicitWindowKey?: string
@@ -420,11 +548,17 @@ export class SmcBatchScanService {
       return explicitWindowKey;
     }
     const inMemory = this.activeWindowKeyByExchange.get(exchange);
-    if (inMemory) {
-      return inMemory;
-    }
-    const fromDb = this.db.getLatestActiveWindowKey(exchange);
+    const fromDb = inMemory ?? this.db.getLatestActiveWindowKey(exchange);
     if (fromDb) {
+      const bucketStartMs = this.extract15mBucketStartMs(fromDb);
+      const currentBucketStartMs = Math.floor(Date.now() / 900_000) * 900_000;
+      if (bucketStartMs !== null && currentBucketStartMs > bucketStartMs) {
+        if (!this.db.hasPendingScanJobs(exchange)) {
+          const rotated = this.computeWindowKey();
+          this.activeWindowKeyByExchange.set(exchange, rotated);
+          return rotated;
+        }
+      }
       this.activeWindowKeyByExchange.set(exchange, fromDb);
       return fromDb;
     }
@@ -503,6 +637,7 @@ export class SmcBatchScanService {
       }
     }
     this.latestTickerMapByExchange.set(exchange, tMap);
+    this.lastTickerSnapshotFetchedAtMsByExchange.set(exchange, Date.now());
 
     const cMap = new Map<string, ScannedCandidate>();
     for (const c of candidates) {
@@ -675,14 +810,18 @@ export class SmcBatchScanService {
         isFastLane = true;
       } else if (
         isCurrentOrPriorCandidateOrNearMiss ||
-        momentumVolumeTopSet.has(c.symbol)
+        (!prioritizeAllRadarAndNearMissOn15mClose &&
+          momentumVolumeTopSet.has(c.symbol))
       ) {
         priorityTier = 4;
         priorityLabel = isCurrentOrPriorCandidateOrNearMiss
           ? '4_SMC_CANDIDATE_OR_NEAR_MISS_FAST_LANE'
           : '4_MOMENTUM_VOLUME_TOP';
         isFastLane = true;
-      } else if (approachingSet.has(c.symbol) || nearBarTopSet.has(c.symbol)) {
+      } else if (
+        !prioritizeAllRadarAndNearMissOn15mClose &&
+        (approachingSet.has(c.symbol) || nearBarTopSet.has(c.symbol))
+      ) {
         priorityTier = 5;
         priorityLabel = '5_APPROACHING_NEXT_BAR_OPEN';
         isFastLane = true;
@@ -784,6 +923,7 @@ export class SmcBatchScanService {
     nearMissSymbols?: string[];
     evaluateImmediately?: boolean;
     nowMs?: number;
+    evidenceType?: CandidateEvidenceType;
   }): Promise<{
     triggeredAt: string;
     confirmedBarCloseTime: number;
@@ -792,6 +932,7 @@ export class SmcBatchScanService {
     fastLaneSymbols: string[];
     evaluatedFastLaneSymbols: string[];
     results: SmcScanResultRecord[];
+    closeEvent: Confirmed15mCloseEventRecord;
   }> {
     const {
       exchange,
@@ -847,7 +988,11 @@ export class SmcBatchScanService {
       lastFullRadarScanAt: triggeredAt,
     });
 
-    const allJobs = this.db.listSmcScanJobs(exchange, 600);
+    const jobFetchLimit = Math.max(
+      1500,
+      this.totalContractsByExchange.get(exchange) ?? 1500
+    );
+    const allJobs = this.db.listSmcScanJobs(exchange, jobFetchLimit);
     const fastLaneJobs = allJobs
       .filter((j) => j.isFastLane || j.priorityClass === 'FAST_LANE')
       .sort((a, b) => {
@@ -862,9 +1007,13 @@ export class SmcBatchScanService {
 
     const evaluatedFastLaneSymbols: string[] = [];
     const results: SmcScanResultRecord[] = [];
+    const fastQueueWaits: number[] = [];
 
     if (evaluateImmediately) {
       for (const fJob of fastLaneJobs) {
+        if (!this.canIssueRequest(5, Date.now(), exchange)) {
+          break;
+        }
         const claimIso = new Date(Date.now()).toISOString();
         const claimed = this.db.claimNextSmcScanJobs(exchange, 1, claimIso, {
           maxConcurrency: Math.max(1, this.config.maxConcurrency),
@@ -874,18 +1023,104 @@ export class SmcBatchScanService {
           priorityAgeMs: this.config.priorityAgeMs,
           forceBulkAntiStarvation: false,
         });
-        const jobToRun = claimed[0] ?? fJob;
+        const jobToRun = claimed[0];
+        if (!jobToRun) {
+          break;
+        }
         if (jobToRun.priorityClass !== 'FAST_LANE' && !jobToRun.isFastLane) {
           break;
         }
         await this.executeJob(jobToRun, 'live', false);
         evaluatedFastLaneSymbols.push(jobToRun.symbol);
+        if (
+          jobToRun.queueWaitMs !== null &&
+          jobToRun.queueWaitMs !== undefined &&
+          Number.isFinite(jobToRun.queueWaitMs)
+        ) {
+          fastQueueWaits.push(Number(jobToRun.queueWaitMs));
+        }
         const saved = this.db.getSmcScanResult(exchange, jobToRun.symbol);
         if (saved) {
           results.push(saved);
         }
       }
     }
+
+    const atomicAfter = this.db.getAtomicSmcSnapshot(exchange);
+    const diagAfter = this.db.computeCycleDiagnosticsAndFunnel(exchange);
+    const eventEvidenceType: CandidateEvidenceType =
+      params.evidenceType ?? 'LIVE_PRODUCTION';
+
+    // Strictly count only LIVE_PRODUCTION formal candidates in Live 15m close event metrics
+    const liveFormalResults = results.filter((r) => {
+      const evType = resolveCandidateEvidenceType({
+        exchange: r.exchange,
+        source: r.source ?? r.exchange,
+        isDemo: r.isDemo,
+        evidenceType: r.evidenceType,
+      });
+      return (
+        evType === 'LIVE_PRODUCTION' &&
+        (r.smcActionState === 'LONG CANDIDATE' ||
+          r.smcActionState === 'SHORT CANDIDATE')
+      );
+    });
+    const liveDetectedBeforeEntryCount = liveFormalResults.filter(
+      (r) => r.entryWindowStatus === 'DETECTED_BEFORE_NEXT_BAR_OPEN'
+    ).length;
+    const liveEntryMissedCount = liveFormalResults.filter(
+      (r) => r.entryWindowStatus === 'ENTRY_WINDOW_MISSED'
+    ).length;
+    const nearMissInBatch = results.filter(
+      (r) =>
+        r.nearMissStatus === 'NEAR_MISS_ONE_GATE' ||
+        r.nearMissStatus === 'NEAR_MISS_TWO_GATES'
+    ).length;
+
+    const computePct = (vals: number[], p: number): number | null => {
+      if (vals.length === 0) return null;
+      const sorted = [...vals].sort((a, b) => a - b);
+      const idx = Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)
+      );
+      return Math.round(sorted[idx]);
+    };
+
+    const barOpenTime =
+      confirmedBarCloseTime % 900_000 === 899_999
+        ? confirmedBarCloseTime - 900_000 + 1
+        : confirmedBarCloseTime - 900_000;
+
+    const resolvedCloseEventId = `evt15m_${exchange}_${confirmedBarCloseTime}_${atomicAfter.cycleId}`;
+    const closeEvent: Confirmed15mCloseEventRecord = {
+      closeEventId: resolvedCloseEventId,
+      eventId: resolvedCloseEventId,
+      exchange,
+      cycleId: atomicAfter.cycleId,
+      closeEventAt: triggeredAt,
+      barOpenTime,
+      barCloseTime: confirmedBarCloseTime,
+      triggeredFastLaneCount: enqRes.fastLaneEnqueuedCount,
+      completedFastLaneCount: evaluatedFastLaneSymbols.length,
+      formalCandidateCount: liveFormalResults.length,
+      nearMissCount:
+        nearMissInBatch > 0 ? nearMissInBatch : diagAfter.nearMissCount,
+      candidateDetectedBeforeEntryCount: liveDetectedBeforeEntryCount,
+      entryWindowMissedCount: liveEntryMissedCount,
+      pendingCount: atomicAfter.pendingCount,
+      queueWaitP50: computePct(fastQueueWaits, 50) ?? diagAfter.queueWaitP50,
+      queueWaitP95: computePct(fastQueueWaits, 95) ?? diagAfter.queueWaitP95,
+      workerState: this.getWorkerState(exchange),
+      cacheMode: atomicAfter.cacheMode,
+      snapshotAt: atomicAfter.snapshotAt,
+      statsVersion: atomicAfter.statsVersion,
+      evidenceType: eventEvidenceType,
+      isDemo: eventEvidenceType === 'DEMO_LATENCY_FIXTURE',
+      isTestFixture: eventEvidenceType !== 'LIVE_PRODUCTION',
+    };
+
+    this.db.save15mCloseEvent(closeEvent);
 
     return {
       triggeredAt,
@@ -895,7 +1130,75 @@ export class SmcBatchScanService {
       fastLaneSymbols: fastLaneJobs.map((j) => j.symbol),
       evaluatedFastLaneSymbols,
       results,
+      closeEvent,
     };
+  }
+
+  public recordConfirmed15mBarCloseSnapshot(
+    exchange: ExchangeId = 'binance_usdm',
+    nowMs = Date.now(),
+    evidenceType: CandidateEvidenceType = 'LIVE_PRODUCTION'
+  ): Confirmed15mCloseEventRecord {
+    const barOpenTime =
+      Math.floor(nowMs / (15 * 60 * 1000)) * (15 * 60 * 1000) - 15 * 60 * 1000;
+    const barCloseTime = barOpenTime + 15 * 60 * 1000 - 1;
+    const closeEventAt = new Date(barCloseTime).toISOString();
+    const atomic = this.db.getAtomicSmcSnapshot(exchange, nowMs);
+    const diag = this.db.computeCycleDiagnosticsAndFunnel(exchange);
+    const allJobs = this.db.listSmcScanJobs(
+      exchange,
+      Math.max(1500, this.totalContractsByExchange.get(exchange) ?? 1500)
+    );
+    const fastJobs = allJobs.filter(
+      (j) => j.isFastLane || j.priorityClass === 'FAST_LANE'
+    );
+    const completedFast = fastJobs.filter(
+      (j) => j.status === 'SUCCEEDED'
+    ).length;
+    const fastQueueWaits = fastJobs
+      .map((j) => j.queueWaitMs)
+      .filter((v): v is number => v !== null && v !== undefined && Number.isFinite(v));
+
+    const computePct = (vals: number[], p: number): number | null => {
+      if (vals.length === 0) return null;
+      const sorted = [...vals].sort((a, b) => a - b);
+      const idx = Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)
+      );
+      return Math.round(sorted[idx]);
+    };
+
+    const resolvedSnapEventId = `evt15m_${exchange}_${barCloseTime}_${atomic.cycleId}`;
+    const closeEvent: Confirmed15mCloseEventRecord = {
+      closeEventId: resolvedSnapEventId,
+      eventId: resolvedSnapEventId,
+      exchange,
+      cycleId: atomic.cycleId,
+      closeEventAt,
+      barOpenTime,
+      barCloseTime,
+      triggeredFastLaneCount: fastJobs.length,
+      completedFastLaneCount: completedFast,
+      formalCandidateCount: diag.LIVE_FORMAL_CANDIDATE_COUNT,
+      nearMissCount: diag.nearMissCount,
+      candidateDetectedBeforeEntryCount:
+        diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
+      entryWindowMissedCount: diag.LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      pendingCount: atomic.pendingCount,
+      queueWaitP50: diag.queueWaitP50 ?? computePct(fastQueueWaits, 50),
+      queueWaitP95: diag.queueWaitP95 ?? computePct(fastQueueWaits, 95),
+      workerState: this.getWorkerState(exchange),
+      cacheMode: atomic.cacheMode,
+      snapshotAt: atomic.snapshotAt,
+      statsVersion: atomic.statsVersion,
+      evidenceType,
+      isDemo: evidenceType === 'DEMO_LATENCY_FIXTURE',
+      isTestFixture: evidenceType !== 'LIVE_PRODUCTION',
+    };
+
+    this.db.save15mCloseEvent(closeEvent);
+    return closeEvent;
   }
 
   public async startScan(params: {
@@ -914,8 +1217,7 @@ export class SmcBatchScanService {
         ? 'demo_synthetic'
         : params.exchange ?? this.activeExchange;
 
-    this.activeExchange = exchange;
-    this.activeMode = mode;
+    this.setActiveForegroundExchange(exchange, mode);
 
     // Recover any interrupted jobs on start
     this.db.recoverInterruptedSmcJobs(exchange);
@@ -967,9 +1269,10 @@ export class SmcBatchScanService {
       mode,
     });
 
-    this.workerState = 'RUNNING';
+    this.setWorkerState(exchange, 'RUNNING');
+    this.lastRealResumeAtMsByExchange.set(exchange, Date.now());
     if (params.autoProcessLoop !== false) {
-      this.scheduleNextTick(15);
+      this.scheduleNextTick(exchange, mode, 15);
     }
 
     return this.getStatus(exchange, mode);
@@ -1013,7 +1316,10 @@ export class SmcBatchScanService {
     const symbolMetricsMap = this.prewarmMetricsByExchangeSymbol.get(exchange)!;
 
     // 1. Select Fast Lane targets (Tier 1..5: WATCHLIST, RADAR_LONG, RADAR_SHORT, MOMENTUM_VOLUME_TOP, APPROACHING_NEXT_BAR_OPEN)
-    const allJobs = this.db.listSmcScanJobs(exchange, 600);
+    const allJobs = this.db.listSmcScanJobs(
+      exchange,
+      Math.max(1500, this.totalContractsByExchange.get(exchange) ?? 1500)
+    );
     const fastLaneJobs = allJobs
       .filter(
         (j) =>
@@ -1158,6 +1464,7 @@ export class SmcBatchScanService {
     }
 
     this.isPrewarmingByExchange.set(exchange, true);
+    this.lastPrewarmProgressAtByExchange.set(exchange, new Date().toISOString());
     let totalChecks = alreadyWarmSymbolCount * 5;
     let totalCacheHits = alreadyWarmSymbolCount * 5;
 
@@ -1189,13 +1496,20 @@ export class SmcBatchScanService {
             await new Promise((r) => setTimeout(r, 10));
           }
 
-          const runningForSymbol = this.db
-            .listSmcScanJobs(exchange, 600)
-            .some((j) => j.symbol === symbol && j.status === 'RUNNING');
+          const latestSymJob = this.db.listSymbolSmcJobHistory(
+            exchange,
+            symbol,
+            1
+          )[0];
+          const runningForSymbol = latestSymJob?.status === 'RUNNING';
           if (runningForSymbol) {
             continue;
           }
 
+          this.lastPrewarmProgressAtByExchange.set(
+            exchange,
+            new Date().toISOString()
+          );
           inFlightSet.add(symbol);
           this.activePrewarmWorkerCount++;
           const symStartMs = Date.now();
@@ -1276,7 +1590,11 @@ export class SmcBatchScanService {
               (openInterest !== null && ticker?.lastPrice
                 ? openInterest * ticker.lastPrice
                 : null);
+            const oiFetchState: { provenance?: DataProvenance } = {};
             let oiFromCache = isCachedOiFresh;
+            let oiResolvedFreshly =
+              isCachedOiFresh ||
+              (ticker?.openInterest !== null && ticker?.openInterest !== undefined);
             let oiSlotWaitMs = 0;
             let oiHttpLatencyMs = 0;
 
@@ -1307,9 +1625,13 @@ export class SmcBatchScanService {
                   oiHttpLatencyMs = Math.max(0, Date.now() - oiStart);
                   openInterest = oiRes.openInterest;
                   openInterestValue = oiRes.openInterestValue;
+                  oiFetchState.provenance = oiRes.provenance;
                   oiFromCache = false;
-                  if (openInterest !== null && ticker) {
-                    ticker.openInterest = openInterest;
+                  if (openInterest !== null && openInterest !== undefined) {
+                    oiResolvedFreshly = true;
+                    if (ticker) {
+                      ticker.openInterest = openInterest;
+                    }
                   }
                 } finally {
                   this.releaseHttpSlot();
@@ -1333,7 +1655,7 @@ export class SmcBatchScanService {
             if (k1h.fromCache) totalCacheHits++;
             if (k4h.fromCache) totalCacheHits++;
 
-            // Persist OI + Funding into 15m cache row
+            // Persist OI + Funding into 15m cache row using clean k15m provenance (never computed-stale cache provenance)
             const latest15m = this.db.getSmcCandlesCache(
               exchange,
               symbol,
@@ -1342,12 +1664,36 @@ export class SmcBatchScanService {
             if (latest15m) {
               const oiRefNowMs = Math.max(
                 Date.now(),
-                Date.parse(latest15m.provenance.fetchedAt) || Date.now()
+                Date.parse(k15m.provenance.fetchedAt) || Date.now()
               );
-              const oiFetchedAt = new Date(oiRefNowMs).toISOString();
-              const oiExpiresAt = new Date(
+              const oiFetchedAtIso = new Date(oiRefNowMs).toISOString();
+              const oiExpiresAtIso = new Date(
                 oiRefNowMs + (this.config.oiCacheTtlMs ?? 900_000)
               ).toISOString();
+              const resolvedOiFetchedAt = oiFromCache
+                ? latest15m.oiFetchedAt ?? (oiResolvedFreshly ? oiFetchedAtIso : null)
+                : oiResolvedFreshly
+                  ? oiFetchedAtIso
+                  : null;
+              const resolvedOiExpiresAt = oiFromCache
+                ? latest15m.oiExpiresAt ?? (oiResolvedFreshly ? oiExpiresAtIso : null)
+                : oiResolvedFreshly
+                  ? oiExpiresAtIso
+                  : null;
+              const resolvedNextFunding =
+                ticker?.nextFundingTime ??
+                (latest15m.nextFundingTime && latest15m.nextFundingTime > oiRefNowMs
+                  ? latest15m.nextFundingTime
+                  : null);
+              const clean15mProv = enforceProvenanceIntegrity({
+                source: k15m.provenance.source,
+                fetchedAt: k15m.provenance.fetchedAt,
+                stale: k15m.provenance.stale || Boolean(oiFetchState.provenance?.stale),
+                fallback:
+                  k15m.provenance.fallback || Boolean(oiFetchState.provenance?.fallback),
+                missingData: k15m.provenance.missingData,
+                isDemo: k15m.provenance.isDemo,
+              });
               this.db.saveSmcCandlesCache({
                 symbol,
                 exchange,
@@ -1358,19 +1704,14 @@ export class SmcBatchScanService {
                   openInterestValue ?? latest15m.openInterestValue ?? null,
                 fundingRate:
                   ticker?.fundingRate ?? latest15m.fundingRate ?? null,
-                nextFundingTime:
-                  ticker?.nextFundingTime ?? latest15m.nextFundingTime ?? null,
-                oiFetchedAt: !oiFromCache
-                  ? oiFetchedAt
-                  : latest15m.oiFetchedAt ?? oiFetchedAt,
-                oiExpiresAt: !oiFromCache
-                  ? oiExpiresAt
-                  : latest15m.oiExpiresAt ?? oiExpiresAt,
+                nextFundingTime: resolvedNextFunding,
+                oiFetchedAt: resolvedOiFetchedAt,
+                oiExpiresAt: resolvedOiExpiresAt,
                 dataTimestamp: latest15m.dataTimestamp,
                 ruleVersion: latest15m.ruleVersion ?? expectedRuleVersion,
                 windowKey: latest15m.windowKey ?? activeWindowKey,
                 expiresAt: latest15m.expiresAt,
-                provenance: latest15m.provenance,
+                provenance: clean15mProv,
               });
             }
 
@@ -1429,6 +1770,10 @@ export class SmcBatchScanService {
               prewarmStatus: 'PARTIAL',
             });
           } finally {
+            this.lastPrewarmProgressAtByExchange.set(
+              exchange,
+              new Date().toISOString()
+            );
             inFlightSet.delete(symbol);
             this.activePrewarmWorkerCount = Math.max(
               0,
@@ -1508,24 +1853,74 @@ export class SmcBatchScanService {
     exchange = this.activeExchange,
     mode = this.activeMode
   ): SmcScanStatusResponse {
-    this.workerState = 'PAUSED';
-    if (this.loopTimer) {
-      clearTimeout(this.loopTimer);
-      this.loopTimer = null;
+    this.setWorkerState(exchange, 'PAUSED');
+    this.lastRealResumeAtMsByExchange.delete(exchange);
+    const existingTimer = this.loopTimerByExchange.get(exchange);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.loopTimerByExchange.delete(exchange);
     }
     return this.getStatus(exchange, mode);
+  }
+
+  public async waitForIdleTick(
+    timeoutMs = 5000,
+    exchange?: ExchangeId
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    const isBusy = () => {
+      const tickBusy = exchange
+        ? Boolean(this.isProcessingTickByExchange.get(exchange))
+        : Array.from(this.isProcessingTickByExchange.values()).some(Boolean);
+      const httpBusy = this.getInFlightRequestCount(exchange) > 0;
+      const closeBusy = exchange
+        ? Boolean(this.inFlight15mCloseTriggerByExchange.get(exchange))
+        : Array.from(this.inFlight15mCloseTriggerByExchange.values()).some(
+            Boolean
+          );
+      return tickBusy || httpBusy || closeBusy;
+    };
+    while (isBusy() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  public resumeScanLoopOnly(
+    exchange = this.activeExchange,
+    mode = this.activeMode,
+    options?: { preserveForeground?: boolean; delayMs?: number }
+  ): void {
+    if (!options?.preserveForeground) {
+      this.setActiveForegroundExchange(exchange, mode);
+    } else {
+      this.modeByExchange.set(exchange, mode);
+      if (mode === 'live' && exchange !== 'demo_synthetic') {
+        this.trackedLiveExchanges.add(exchange);
+      }
+    }
+    this.setWorkerState(exchange, 'RUNNING');
+    this.lastRealResumeAtMsByExchange.set(exchange, Date.now());
+    this.scheduleNextTick(exchange, mode, options?.delayMs ?? 15);
   }
 
   public resumeScan(
     exchange = this.activeExchange,
     mode = this.activeMode,
-    autoProcessLoop = true
+    autoProcessLoop = true,
+    options?: { preserveForeground?: boolean }
   ): SmcScanStatusResponse {
-    this.activeExchange = exchange;
-    this.activeMode = mode;
-    this.workerState = 'RUNNING';
+    if (!options?.preserveForeground) {
+      this.setActiveForegroundExchange(exchange, mode);
+    } else {
+      this.modeByExchange.set(exchange, mode);
+      if (mode === 'live' && exchange !== 'demo_synthetic') {
+        this.trackedLiveExchanges.add(exchange);
+      }
+    }
+    this.setWorkerState(exchange, 'RUNNING');
+    this.lastRealResumeAtMsByExchange.set(exchange, Date.now());
     if (autoProcessLoop) {
-      this.scheduleNextTick(15);
+      this.scheduleNextTick(exchange, mode, 15);
     }
     return this.getStatus(exchange, mode);
   }
@@ -1533,9 +1928,10 @@ export class SmcBatchScanService {
   public resume(
     exchange = this.activeExchange,
     mode = this.activeMode,
-    autoProcessLoop = true
+    autoProcessLoop = true,
+    options?: { preserveForeground?: boolean }
   ): SmcScanStatusResponse {
-    return this.resumeScan(exchange, mode, autoProcessLoop);
+    return this.resumeScan(exchange, mode, autoProcessLoop, options);
   }
 
   /**
@@ -1564,7 +1960,11 @@ export class SmcBatchScanService {
     const forceRefresh = params.forceRefresh ?? false;
 
     // Check if the symbol is already in the priority fast lane (RUNNING or QUEUED with fast-lane priority >= 999999)
-    const existingJobs = this.db.listSmcScanJobs(exchange, 600);
+    const jobFetchLimit = Math.max(
+      1500,
+      this.totalContractsByExchange.get(exchange) ?? 1500
+    );
+    const existingJobs = this.db.listSmcScanJobs(exchange, jobFetchLimit);
     const activeFastLaneJob = existingJobs.find(
       (j) =>
         j.symbol === symbol &&
@@ -1661,7 +2061,7 @@ export class SmcBatchScanService {
         if (claimed.length > 0) break;
         // If all worker slots are momentarily busy, wait briefly for a slot to free up without exceeding maxJobConcurrency
         const currentSymbolJob = this.db
-          .listSmcScanJobs(exchange, 600)
+          .listSmcScanJobs(exchange, jobFetchLimit)
           .find((j) => j.symbol === symbol);
         if (currentSymbolJob?.status === 'SUCCEEDED') break;
         await new Promise((r) => setTimeout(r, 15));
@@ -1670,12 +2070,13 @@ export class SmcBatchScanService {
       const targetJob =
         claimed.find((j) => j.symbol === symbol) ?? claimed[0] ?? null;
       if (targetJob) {
-        this.activeConcurrency++;
-        if (this.activeConcurrency > this.maxActiveConcurrencyObserved) {
-          this.maxActiveConcurrencyObserved = this.activeConcurrency;
+        const nextActive = (this.activeConcurrencyByExchange.get(exchange) ?? 0) + 1;
+        this.activeConcurrencyByExchange.set(exchange, nextActive);
+        if (nextActive > this.maxActiveConcurrencyObserved) {
+          this.maxActiveConcurrencyObserved = nextActive;
         }
         const currentDbRunning =
-          this.db.getSmcScanQueueStats(exchange).runningJobCount;
+          this.db.getRunningSmcJobCount(exchange);
         if (currentDbRunning > this.maxRunningJobCountObserved) {
           this.maxRunningJobCountObserved = currentDbRunning;
         }
@@ -1688,14 +2089,18 @@ export class SmcBatchScanService {
             true
           );
         } finally {
-          this.activeConcurrency = Math.max(0, this.activeConcurrency - 1);
+          const remaining = Math.max(
+            0,
+            (this.activeConcurrencyByExchange.get(exchange) ?? 1) - 1
+          );
+          this.activeConcurrencyByExchange.set(exchange, remaining);
         }
       }
-    } else if (this.workerState === 'RUNNING') {
-      this.scheduleNextTick(5);
+    } else if (this.getWorkerState(exchange) === 'RUNNING') {
+      this.scheduleNextTick(exchange, params.mode, 5);
     }
 
-    const updatedJobs = this.db.listSmcScanJobs(exchange, 600);
+    const updatedJobs = this.db.listSmcScanJobs(exchange, jobFetchLimit);
     const job = updatedJobs.find((j) => j.symbol === symbol) ?? null;
     const result = this.db.getSmcScanResult(exchange, symbol);
     return {
@@ -1742,12 +2147,12 @@ export class SmcBatchScanService {
     mode = this.activeMode,
     maxJobsToClaim?: number
   ): Promise<number> {
-    if (this.isProcessingTick) return 0;
-    this.isProcessingTick = true;
+    if (this.isProcessingTickByExchange.get(exchange)) return 0;
+    this.isProcessingTickByExchange.set(exchange, true);
 
     try {
-      const availableRequests = this.getAvailableRequests();
-      const maxJobsByRateLimit = Math.floor(availableRequests / 4);
+      const availableRequests = this.getAvailableRequests(Date.now(), exchange);
+      const maxJobsByRateLimit = Math.floor(availableRequests / 5);
       if (maxJobsByRateLimit <= 0) {
         return 0;
       }
@@ -1771,7 +2176,10 @@ export class SmcBatchScanService {
 
       const workerTask = async (role: SmcWorkerRole, slotIndex: number) => {
         while (claimedInBatch < maxBatchJobs) {
-          if (this.workerState === 'PAUSED') break;
+          if (this.getWorkerState(exchange) === 'PAUSED') break;
+          if (!this.canIssueRequest(5, Date.now(), exchange)) {
+            break;
+          }
 
           // Never allow Tier 6 Bulk worker to claim Bulk tasks while Fast Lane priority cache prewarm is running
           if (
@@ -1783,20 +2191,23 @@ export class SmcBatchScanService {
 
           // Anti-starvation check: after maxFastLaneBurst consecutive Fast Lane jobs, reserve bulkReservation slots for Bulk
           const maxBurst = this.config.maxFastLaneBurst ?? 8;
-          if (this.consecutiveFastLaneJobs >= maxBurst) {
-            this.remainingBulkReservationJobs = Math.max(
-              1,
-              this.config.bulkReservation ?? 1
+          const consecutiveFast =
+            this.consecutiveFastLaneJobsByExchange.get(exchange) ?? 0;
+          if (consecutiveFast >= maxBurst) {
+            this.remainingBulkReservationJobsByExchange.set(
+              exchange,
+              Math.max(1, this.config.bulkReservation ?? 1)
             );
-            this.consecutiveFastLaneJobs = 0;
+            this.consecutiveFastLaneJobsByExchange.set(exchange, 0);
           }
-          const forceBulkAntiStarvation =
-            this.remainingBulkReservationJobs > 0;
+          const remainingBulkRes =
+            this.remainingBulkReservationJobsByExchange.get(exchange) ?? 0;
+          const forceBulkAntiStarvation = remainingBulkRes > 0;
 
           const nowIso = new Date().toISOString();
           const claimed = this.db.claimNextSmcScanJobs(exchange, 1, nowIso, {
             maxConcurrency: concurrency,
-            workerId: `${this.workerId}-${role.toLowerCase()}-${slotIndex}`,
+            workerId: `${this.workerId}-${exchange}-${role.toLowerCase()}-${slotIndex}`,
             workerRole: role,
             leaseDurationMs: 60_000,
             priorityAgeMs: this.config.priorityAgeMs,
@@ -1814,21 +2225,31 @@ export class SmcBatchScanService {
             job.priorityTier <= 5 &&
             job.priorityClass === 'FAST_LANE';
           if (isFastJob) {
-            this.consecutiveFastLaneJobs++;
+            this.consecutiveFastLaneJobsByExchange.set(
+              exchange,
+              (this.consecutiveFastLaneJobsByExchange.get(exchange) ?? 0) + 1
+            );
           } else {
-            this.consecutiveFastLaneJobs = 0;
-            if (this.remainingBulkReservationJobs > 0) {
-              this.remainingBulkReservationJobs--;
+            this.consecutiveFastLaneJobsByExchange.set(exchange, 0);
+            const curBulkRes =
+              this.remainingBulkReservationJobsByExchange.get(exchange) ?? 0;
+            if (curBulkRes > 0) {
+              this.remainingBulkReservationJobsByExchange.set(
+                exchange,
+                curBulkRes - 1
+              );
             }
           }
 
-          this.activeConcurrency++;
-          if (this.activeConcurrency > this.maxActiveConcurrencyObserved) {
-            this.maxActiveConcurrencyObserved = this.activeConcurrency;
+          const nextActive =
+            (this.activeConcurrencyByExchange.get(exchange) ?? 0) + 1;
+          this.activeConcurrencyByExchange.set(exchange, nextActive);
+          if (nextActive > this.maxActiveConcurrencyObserved) {
+            this.maxActiveConcurrencyObserved = nextActive;
           }
 
           const currentDbRunning =
-            this.db.getSmcScanQueueStats(exchange).runningJobCount;
+            this.db.getRunningSmcJobCount(exchange);
           if (currentDbRunning > this.maxRunningJobCountObserved) {
             this.maxRunningJobCountObserved = currentDbRunning;
           }
@@ -1837,7 +2258,11 @@ export class SmcBatchScanService {
             await this.executeJob(job, mode, false);
             processedCount++;
           } finally {
-            this.activeConcurrency = Math.max(0, this.activeConcurrency - 1);
+            const remaining = Math.max(
+              0,
+              (this.activeConcurrencyByExchange.get(exchange) ?? 1) - 1
+            );
+            this.activeConcurrencyByExchange.set(exchange, remaining);
           }
         }
       };
@@ -1857,119 +2282,182 @@ export class SmcBatchScanService {
           postStats.queuedCount === 0 &&
           postStats.runningJobCount === 0 &&
           postStats.rateLimitedCount === 0 &&
-          this.workerState === 'RUNNING'
+          this.getWorkerState(exchange) === 'RUNNING'
         ) {
-          this.workerState = 'IDLE';
+          this.setWorkerState(exchange, 'IDLE');
         }
       }
 
       return processedCount;
     } finally {
-      this.isProcessingTick = false;
+      this.isProcessingTickByExchange.set(exchange, false);
     }
   }
 
-  private scheduleNextTick(delayMs = 250): void {
-    if (this.workerState !== 'RUNNING') return;
-    if (this.loopTimer) {
-      clearTimeout(this.loopTimer);
+  private scheduleNextTick(
+    exchange: ExchangeId = this.activeExchange,
+    mode: 'live' | 'demo' = this.modeByExchange.get(exchange) ?? this.activeMode,
+    delayMs = 250
+  ): void {
+    if (this.getWorkerState(exchange) !== 'RUNNING') return;
+    const existingTimer = this.loopTimerByExchange.get(exchange);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
     }
-    this.loopTimer = setTimeout(async () => {
-      this.loopTimer = null;
-      if (this.workerState !== 'RUNNING') return;
-      let targetExchange = this.activeExchange;
-      let targetMode = this.activeMode;
-      const currentStats = this.db.getSmcScanQueueStats(targetExchange);
-      if (
-        targetExchange === 'demo_synthetic' &&
-        currentStats.queuedCount === 0 &&
-        currentStats.rateLimitedCount === 0
-      ) {
-        const liveStats = this.db.getSmcScanQueueStats('binance_usdm');
-        if (liveStats.queuedCount > 0 || liveStats.rateLimitedCount > 0) {
-          targetExchange = 'binance_usdm';
-          targetMode = 'live';
-          this.activeExchange = 'binance_usdm';
-          this.activeMode = 'live';
+    const timer = setTimeout(async () => {
+      if (this.loopTimerByExchange.get(exchange) === timer) {
+        this.loopTimerByExchange.delete(exchange);
+      }
+      if (this.getWorkerState(exchange) !== 'RUNNING') return;
+      try {
+        const processed = await this.processNextBatch(exchange, mode);
+        this.consecutiveScheduleDbErrorsByExchange.set(exchange, 0);
+        const stats = this.db.getSmcScanQueueStats(exchange);
+        if (
+          this.getWorkerState(exchange) === 'RUNNING' &&
+          (stats.queuedCount > 0 || stats.rateLimitedCount > 0 || processed > 0)
+        ) {
+          const available = this.getAvailableRequests(Date.now(), exchange);
+          let nextDelay = stats.queuedCount > 0 ? 75 : 250;
+          if (available < 5) {
+            const oldestTs = this.getRequestTimestamps(exchange)[0];
+            nextDelay =
+              oldestTs !== undefined
+                ? Math.max(250, Math.min(5000, oldestTs + 60_000 - Date.now() + 50))
+                : 1000;
+          }
+          this.scheduleNextTick(exchange, mode, nextDelay);
+        } else if (
+          stats.queuedCount === 0 &&
+          stats.runningJobCount === 0 &&
+          stats.rateLimitedCount === 0
+        ) {
+          this.setWorkerState(exchange, 'IDLE');
+        }
+      } catch (err) {
+        if (RadarDatabase.isSqliteCorruptionError(err)) {
+          const nextErrs =
+            (this.consecutiveScheduleDbErrorsByExchange.get(exchange) ?? 0) + 1;
+          this.consecutiveScheduleDbErrorsByExchange.set(exchange, nextErrs);
+          const recovered = this.db.recoverFromRuntimeSqliteError(err, exchange);
+          if (recovered) {
+            this.consecutiveScheduleDbErrorsByExchange.set(exchange, 0);
+            console.warn(
+              `[SmcBatchScanService:${exchange}] scheduleNextTick recovered from runtime SQLite error:`,
+              err instanceof Error ? err.message : String(err)
+            );
+          } else if (nextErrs <= 3 || nextErrs % 10 === 0) {
+            console.error(
+              `[SmcBatchScanService:${exchange}] scheduleNextTick error:`,
+              err
+            );
+          }
+          if (this.getWorkerState(exchange) === 'RUNNING') {
+            const backoffDelay = recovered
+              ? 1000
+              : Math.min(60_000, 1000 * Math.pow(2, Math.min(6, nextErrs - 1)));
+            this.scheduleNextTick(exchange, mode, backoffDelay);
+          }
+        } else {
+          this.consecutiveScheduleDbErrorsByExchange.set(exchange, 0);
+          console.error(
+            `[SmcBatchScanService:${exchange}] scheduleNextTick error:`,
+            err
+          );
+          if (this.getWorkerState(exchange) === 'RUNNING') {
+            this.scheduleNextTick(exchange, mode, 1000);
+          }
         }
       }
-      const processed = await this.processNextBatch(targetExchange, targetMode);
-      const stats = this.db.getSmcScanQueueStats(targetExchange);
-      if (
-        this.workerState === 'RUNNING' &&
-        (stats.queuedCount > 0 || stats.rateLimitedCount > 0 || processed > 0)
-      ) {
-        const available = this.getAvailableRequests();
-        const nextDelay =
-          available < 4 ? 1000 : stats.queuedCount > 0 ? 10 : 250;
-        this.scheduleNextTick(nextDelay);
-      } else if (
-        stats.queuedCount === 0 &&
-        stats.runningJobCount === 0 &&
-        stats.rateLimitedCount === 0
-      ) {
-        this.workerState = 'IDLE';
-      }
     }, delayMs);
+    this.loopTimerByExchange.set(exchange, timer);
   }
 
-  private getAvailableRequests(nowMs = Date.now()): number {
-    while (
-      this.requestTimestamps.length > 0 &&
-      nowMs - this.requestTimestamps[0] >= 60_000
-    ) {
-      this.requestTimestamps.shift();
+  private getRequestTimestamps(exchange: ExchangeId): number[] {
+    let arr = this.requestTimestampsByExchange.get(exchange);
+    if (!arr) {
+      arr = [];
+      this.requestTimestampsByExchange.set(exchange, arr);
     }
-    return Math.max(
-      0,
-      this.config.maxRequestsPerMinute - this.requestTimestamps.length
-    );
+    return arr;
   }
 
-  private canIssueRequest(requiredRequests = 1, nowMs = Date.now()): boolean {
-    return this.getAvailableRequests(nowMs) >= requiredRequests;
+  private getAvailableRequests(
+    nowMs = Date.now(),
+    exchange: ExchangeId = this.activeExchange
+  ): number {
+    const timestamps = this.getRequestTimestamps(exchange);
+    while (timestamps.length > 0 && nowMs - timestamps[0] >= 60_000) {
+      timestamps.shift();
+    }
+    return Math.max(0, this.config.maxRequestsPerMinute - timestamps.length);
+  }
+
+  private canIssueRequest(
+    requiredRequests = 1,
+    nowMs = Date.now(),
+    exchange: ExchangeId = this.activeExchange
+  ): boolean {
+    return this.getAvailableRequests(nowMs, exchange) >= requiredRequests;
   }
 
   private recordRequestIssued(
     nowMs = Date.now(),
     exchange = this.activeExchange
   ): void {
-    this.requestTimestamps.push(nowMs);
-    this.getAvailableRequests(nowMs);
+    const timestamps = this.getRequestTimestamps(exchange);
+    timestamps.push(nowMs);
+    this.getAvailableRequests(nowMs, exchange);
     this.db.updateRuntimeHttpMetrics(exchange, {
       incrementCompletedHttpRequests: 1,
-      currentRequestsInWindow: this.requestTimestamps.length,
+      currentRequestsInWindow: timestamps.length,
       maxHttpConcurrency: this.config.maxHttpConcurrency,
       maxRequestsPerMinute: this.config.maxRequestsPerMinute,
     });
   }
 
-  private async acquireHttpSlot(): Promise<number> {
+  private async acquireHttpSlot(
+    exchange: ExchangeId = this.activeExchange
+  ): Promise<number> {
     const maxHttp = Math.max(1, this.config.maxHttpConcurrency);
-    if (this.inFlightRequestCount < maxHttp) {
-      this.inFlightRequestCount++;
-      if (this.inFlightRequestCount > this.maxInFlightRequestCountObserved) {
-        this.maxInFlightRequestCountObserved = this.inFlightRequestCount;
+    const current = this.inFlightRequestCountByExchange.get(exchange) ?? 0;
+    if (current < maxHttp) {
+      const next = current + 1;
+      this.inFlightRequestCountByExchange.set(exchange, next);
+      if (next > this.maxInFlightRequestCountObserved) {
+        this.maxInFlightRequestCountObserved = next;
       }
       return 0;
     }
     const waitStart = Date.now();
+    let queue = this.httpWaitQueueByExchange.get(exchange);
+    if (!queue) {
+      queue = [];
+      this.httpWaitQueueByExchange.set(exchange, queue);
+    }
     await new Promise<void>((resolve) => {
-      this.httpWaitQueue.push(resolve);
+      queue!.push(resolve);
     });
     const waitedMs = Math.max(0, Date.now() - waitStart);
-    this.inFlightRequestCount++;
-    if (this.inFlightRequestCount > this.maxInFlightRequestCountObserved) {
-      this.maxInFlightRequestCountObserved = this.inFlightRequestCount;
+    const nextAfterWait =
+      (this.inFlightRequestCountByExchange.get(exchange) ?? 0) + 1;
+    this.inFlightRequestCountByExchange.set(exchange, nextAfterWait);
+    if (nextAfterWait > this.maxInFlightRequestCountObserved) {
+      this.maxInFlightRequestCountObserved = nextAfterWait;
     }
     return waitedMs;
   }
 
-  private releaseHttpSlot(): void {
-    this.inFlightRequestCount = Math.max(0, this.inFlightRequestCount - 1);
-    const next = this.httpWaitQueue.shift();
-    if (next) {
-      next();
+  private releaseHttpSlot(exchange: ExchangeId = this.activeExchange): void {
+    const next = Math.max(
+      0,
+      (this.inFlightRequestCountByExchange.get(exchange) ?? 0) - 1
+    );
+    this.inFlightRequestCountByExchange.set(exchange, next);
+    const queue = this.httpWaitQueueByExchange.get(exchange);
+    const waiter = queue?.shift();
+    if (waiter) {
+      waiter();
     }
   }
 
@@ -2032,7 +2520,7 @@ export class SmcBatchScanService {
         (this.runtimeCacheMissesByExchange.get(exchange) ?? 0) + 1
       );
 
-      if (!this.canIssueRequest(1, Date.now())) {
+      if (!this.canIssueRequest(1, Date.now(), exchange)) {
         throw new ExchangeApiUnavailableError(
           `SMC Queue rate limit guard (${this.config.maxRequestsPerMinute} req/min) reached while fetching ${symbol} ${timeframe}`,
           adapter.displayName,
@@ -2053,7 +2541,7 @@ export class SmcBatchScanService {
       const canUseIncrementalFetch = priorConfirmedKlines.length >= 45;
       const fetchLimit = canUseIncrementalFetch ? 20 : 60;
 
-      const slotWaitMs = await this.acquireHttpSlot();
+      const slotWaitMs = await this.acquireHttpSlot(exchange);
       const httpStartMs = Date.now();
       this.recordRequestIssued(httpStartMs, exchange);
 
@@ -2063,7 +2551,7 @@ export class SmcBatchScanService {
         res = await adapter.fetchKlines(symbol, timeframe, fetchLimit);
         httpLatencyMs = Math.max(0, Date.now() - httpStartMs);
       } finally {
-        this.releaseHttpSlot();
+        this.releaseHttpSlot(exchange);
       }
 
       // Merge prior confirmed klines with newly fetched confirmed klines by openTime when incremental append is active
@@ -2102,26 +2590,81 @@ export class SmcBatchScanService {
       const dataTimestamp = latestClosed ? latestClosed.closeTime : refNowMs;
       const activeWindowKey = this.resolveActiveWindowKey(exchange);
 
+      const existingOiExpMs = existingCache?.oiExpiresAt
+        ? Date.parse(existingCache.oiExpiresAt)
+        : NaN;
+      const isExistingOiFresh =
+        timeframe === '15m' &&
+        !forceRefresh &&
+        existingCache?.openInterest !== null &&
+        existingCache?.openInterest !== undefined &&
+        Number.isFinite(existingOiExpMs) &&
+        existingOiExpMs > refNowMs;
+      const hasFreshTickerOi =
+        timeframe === '15m' &&
+        ticker?.openInterest !== null &&
+        ticker?.openInterest !== undefined;
+
       const oiFetchedIso =
-        existingCache?.oiFetchedAt ??
-        (ticker?.openInterest !== null && ticker?.openInterest !== undefined
-          ? res.provenance.fetchedAt
-          : null);
+        timeframe !== '15m'
+          ? null
+          : isExistingOiFresh
+            ? existingCache!.oiFetchedAt
+            : hasFreshTickerOi
+              ? res.provenance.fetchedAt
+              : null;
       const oiExpiresIso =
-        existingCache?.oiExpiresAt ??
-        (ticker?.openInterest !== null && ticker?.openInterest !== undefined
-          ? new Date(
-              refNowMs + (this.config.oiCacheTtlMs ?? 900_000)
-            ).toISOString()
-          : null);
+        timeframe !== '15m'
+          ? null
+          : isExistingOiFresh
+            ? existingCache!.oiExpiresAt
+            : hasFreshTickerOi
+              ? new Date(
+                  refNowMs + (this.config.oiCacheTtlMs ?? 900_000)
+                ).toISOString()
+              : null;
       const resolvedOi =
-        existingCache?.openInterest ?? ticker?.openInterest ?? null;
+        timeframe === '15m'
+          ? isExistingOiFresh
+            ? existingCache!.openInterest
+            : ticker?.openInterest ?? null
+          : ticker?.openInterest ?? existingCache?.openInterest ?? null;
       const resolvedOiVal =
-        existingCache?.openInterestValue ??
-        ticker?.openInterestValue ??
-        (resolvedOi !== null && ticker?.lastPrice
-          ? resolvedOi * ticker.lastPrice
-          : null);
+        timeframe === '15m'
+          ? isExistingOiFresh
+            ? existingCache!.openInterestValue
+            : ticker?.openInterestValue ??
+              (resolvedOi !== null && ticker?.lastPrice
+                ? resolvedOi * ticker.lastPrice
+                : null)
+          : ticker?.openInterestValue ??
+            existingCache?.openInterestValue ??
+            (resolvedOi !== null && ticker?.lastPrice
+              ? resolvedOi * ticker.lastPrice
+              : null);
+
+      const tickerFundingValid =
+        ticker?.fundingRate !== null &&
+        ticker?.fundingRate !== undefined &&
+        (ticker.nextFundingTime === null ||
+          ticker.nextFundingTime === undefined ||
+          ticker.nextFundingTime > refNowMs);
+      const existingFundingValid =
+        existingCache?.fundingRate !== null &&
+        existingCache?.fundingRate !== undefined &&
+        (!existingCache.nextFundingTime ||
+          existingCache.nextFundingTime > refNowMs);
+
+      const resolvedFundingRate = tickerFundingValid
+        ? ticker!.fundingRate
+        : existingFundingValid
+          ? existingCache!.fundingRate
+          : ticker?.fundingRate ?? existingCache?.fundingRate ?? null;
+      const resolvedNextFundingTime = tickerFundingValid
+        ? ticker?.nextFundingTime ?? null
+        : existingFundingValid
+          ? existingCache?.nextFundingTime ?? null
+          : ticker?.nextFundingTime ?? null;
 
       this.db.saveSmcCandlesCache({
         symbol,
@@ -2130,9 +2673,8 @@ export class SmcBatchScanService {
         klines: mergedKlines,
         openInterest: resolvedOi,
         openInterestValue: resolvedOiVal,
-        fundingRate: ticker?.fundingRate ?? existingCache?.fundingRate ?? null,
-        nextFundingTime:
-          ticker?.nextFundingTime ?? existingCache?.nextFundingTime ?? null,
+        fundingRate: resolvedFundingRate,
+        nextFundingTime: resolvedNextFundingTime,
         oiFetchedAt: oiFetchedIso,
         oiExpiresAt: oiExpiresIso,
         dataTimestamp,
@@ -2142,8 +2684,10 @@ export class SmcBatchScanService {
         provenance: res.provenance,
       });
 
+      const unclosedFetched = res.klines.filter((k) => !k.isClosed);
+
       return {
-        klines: mergedKlines,
+        klines: [...mergedKlines, ...unclosedFetched],
         provenance: res.provenance,
         fromCache: false,
         httpLatencyMs,
@@ -2212,10 +2756,13 @@ export class SmcBatchScanService {
         (openInterest !== null && ticker?.lastPrice
           ? openInterest * ticker.lastPrice
           : null);
-      let oiProvenance: DataProvenance | undefined = undefined;
+      const oiFetchState: { provenance?: DataProvenance } = {};
       let oiHttpLatencyMs = 0;
       let oiSlotWaitMs = 0;
       let oiFromCache = isCachedOiFresh;
+      let oiResolvedFreshly =
+        isCachedOiFresh ||
+        (ticker?.openInterest !== null && ticker?.openInterest !== undefined);
 
       const isOiExpired =
         Boolean(cached15mBefore?.oiExpiresAt) &&
@@ -2227,11 +2774,11 @@ export class SmcBatchScanService {
         if (!shouldFetchOi) {
           return;
         }
-        if (!this.canIssueRequest(1)) {
+        if (!this.canIssueRequest(1, Date.now(), exchange)) {
           return;
         }
         try {
-          oiSlotWaitMs = await this.acquireHttpSlot();
+          oiSlotWaitMs = await this.acquireHttpSlot(exchange);
           const oiStartMs = Date.now();
           this.recordRequestIssued(oiStartMs, exchange);
           try {
@@ -2242,13 +2789,16 @@ export class SmcBatchScanService {
             oiHttpLatencyMs = Math.max(0, Date.now() - oiStartMs);
             openInterest = oiRes.openInterest;
             openInterestValue = oiRes.openInterestValue;
-            oiProvenance = oiRes.provenance;
+            oiFetchState.provenance = oiRes.provenance;
             oiFromCache = false;
-            if (openInterest !== null && ticker) {
-              ticker.openInterest = openInterest;
+            if (openInterest !== null && openInterest !== undefined) {
+              oiResolvedFreshly = true;
+              if (ticker) {
+                ticker.openInterest = openInterest;
+              }
             }
           } finally {
-            this.releaseHttpSlot();
+            this.releaseHttpSlot(exchange);
           }
         } catch {
           // OI is optional if endpoint fails; missingData will record it
@@ -2315,7 +2865,7 @@ export class SmcBatchScanService {
       ).value;
       const httpWallMs = Math.max(0, Date.now() - httpPhaseStartMs);
 
-      // Persist updated OI into 15m cache row if newly fetched or resolved from ticker
+      // Persist updated OI into 15m cache row using clean k15m + oi provenance (never computed-stale cache provenance)
       if (openInterest !== null) {
         const latest15mCache = this.db.getSmcCandlesCache(
           exchange,
@@ -2325,18 +2875,38 @@ export class SmcBatchScanService {
         if (latest15mCache) {
           const oiRefNowMs = Math.max(
             Date.now(),
-            Date.parse(latest15mCache.provenance.fetchedAt) || Date.now()
+            Date.parse(k15m.provenance.fetchedAt) || Date.now()
           );
-          const oiFetchedAt =
-            !oiFromCache || !latest15mCache.oiFetchedAt
-              ? new Date(oiRefNowMs).toISOString()
-              : latest15mCache.oiFetchedAt;
-          const oiExpiresAt =
-            !oiFromCache || !latest15mCache.oiExpiresAt
-              ? new Date(
-                  oiRefNowMs + (this.config.oiCacheTtlMs ?? 900_000)
-                ).toISOString()
-              : latest15mCache.oiExpiresAt;
+          const freshOiIso = new Date(oiRefNowMs).toISOString();
+          const freshOiExpiresIso = new Date(
+            oiRefNowMs + (this.config.oiCacheTtlMs ?? 900_000)
+          ).toISOString();
+          const oiFetchedAt = oiFromCache
+            ? latest15mCache.oiFetchedAt ?? (oiResolvedFreshly ? freshOiIso : null)
+            : oiResolvedFreshly
+              ? freshOiIso
+              : null;
+          const oiExpiresAt = oiFromCache
+            ? latest15mCache.oiExpiresAt ??
+              (oiResolvedFreshly ? freshOiExpiresIso : null)
+            : oiResolvedFreshly
+              ? freshOiExpiresIso
+              : null;
+          const resolvedNextFunding =
+            ticker?.nextFundingTime ??
+            (latest15mCache.nextFundingTime &&
+            latest15mCache.nextFundingTime > oiRefNowMs
+              ? latest15mCache.nextFundingTime
+              : null);
+          const clean15mProv = enforceProvenanceIntegrity({
+            source: k15m.provenance.source,
+            fetchedAt: k15m.provenance.fetchedAt,
+            stale: k15m.provenance.stale || Boolean(oiFetchState.provenance?.stale),
+            fallback:
+              k15m.provenance.fallback || Boolean(oiFetchState.provenance?.fallback),
+            missingData: k15m.provenance.missingData,
+            isDemo: k15m.provenance.isDemo,
+          });
           this.db.saveSmcCandlesCache({
             symbol,
             exchange,
@@ -2347,15 +2917,14 @@ export class SmcBatchScanService {
               openInterestValue ?? latest15mCache.openInterestValue ?? null,
             fundingRate:
               ticker?.fundingRate ?? latest15mCache.fundingRate ?? null,
-            nextFundingTime:
-              ticker?.nextFundingTime ?? latest15mCache.nextFundingTime ?? null,
+            nextFundingTime: resolvedNextFunding,
             oiFetchedAt,
             oiExpiresAt,
             dataTimestamp: latest15mCache.dataTimestamp,
             ruleVersion: latest15mCache.ruleVersion,
             windowKey: latest15mCache.windowKey,
             expiresAt: latest15mCache.expiresAt,
-            provenance: latest15mCache.provenance,
+            provenance: clean15mProv,
           });
         }
       }
@@ -2445,7 +3014,7 @@ export class SmcBatchScanService {
           ...k15m.provenance.missingData,
           ...k1h.provenance.missingData,
           ...k4h.provenance.missingData,
-          ...((oiProvenance as DataProvenance | undefined)?.missingData ?? []),
+          ...(oiFetchState.provenance?.missingData ?? []),
           ...(openInterest === null ? ['openInterest'] : []),
           ...(resolvedFundingRate === null ? ['fundingRate'] : []),
         ]),
@@ -2916,29 +3485,57 @@ export class SmcBatchScanService {
     } catch (err) {
       const errorMsg =
         err instanceof Error ? err.message : 'SMC background evaluation failed';
+      const isLocalRateLimitGuard =
+        /SMC Queue rate limit guard|Client-side rate limit guard/i.test(
+          errorMsg
+        );
       const isRateLimit =
+        isLocalRateLimitGuard ||
         (err instanceof ExchangeApiUnavailableError &&
           (err.statusCode === 429 || err.isRateLimited)) ||
         /429|rate limit|too many requests/i.test(errorMsg);
       const isHttp503 =
-        (err instanceof ExchangeApiUnavailableError &&
+        !isLocalRateLimitGuard &&
+        ((err instanceof ExchangeApiUnavailableError &&
           err.statusCode === 503) ||
-        /503|service unavailable|bad gateway|gateway timeout/i.test(errorMsg);
+          /503|service unavailable|bad gateway|gateway timeout/i.test(errorMsg));
 
-      this.db.recordPhase17ErrorEvent(exchange, {
-        is429: isRateLimit,
-        is503: isHttp503,
-        errorMessage: errorMsg,
-      });
+      if (!isLocalRateLimitGuard) {
+        this.db.recordPhase17ErrorEvent(exchange, {
+          is429: isRateLimit,
+          is503: isHttp503,
+          errorMessage: errorMsg,
+        });
 
-      this.consecutiveExchangeErrorsByExchange.set(
-        exchange,
-        (this.consecutiveExchangeErrorsByExchange.get(exchange) ?? 0) + 1
-      );
+        this.consecutiveExchangeErrorsByExchange.set(
+          exchange,
+          (this.consecutiveExchangeErrorsByExchange.get(exchange) ?? 0) + 1
+        );
+      }
 
+      const isTransientDbLock = /SQLITE_BUSY|database is locked/i.test(errorMsg);
+      const isTransientMalformedJson =
+        !isHttp503 &&
+        /invalid\/truncated JSON|Unexpected end of JSON|returned empty response body/i.test(
+          errorMsg
+        );
       const nextRetryCount = job.retryCount + 1;
       if (job.id !== undefined) {
-        if (isRateLimit && nextRetryCount <= this.config.maxRetries) {
+        if (isLocalRateLimitGuard) {
+          // Local pacing guard must pause/re-wait cleanly without counting as upstream failure or permanently failing jobs
+          const oldestTs = this.getRequestTimestamps(exchange)[0];
+          const backoffMs =
+            oldestTs !== undefined
+              ? Math.max(500, Math.min(5000, oldestTs + 60_000 - Date.now() + 50))
+              : Math.min(5000, this.config.baseBackoffMs);
+          const nextRetryAt = new Date(Date.now() + backoffMs).toISOString();
+          this.db.markSmcJobRateLimited(
+            job.id,
+            errorMsg,
+            job.retryCount,
+            nextRetryAt
+          );
+        } else if (isRateLimit && nextRetryCount <= this.config.maxRetries) {
           this.db.updateRuntimeHttpMetrics(exchange, {
             incrementRateLimitEvents: 1,
           });
@@ -2946,6 +3543,20 @@ export class SmcBatchScanService {
             this.config.baseBackoffMs * Math.pow(2, nextRetryCount - 1);
           const nextRetryAt = new Date(Date.now() + backoffMs).toISOString();
           this.db.markSmcJobRateLimited(
+            job.id,
+            errorMsg,
+            nextRetryCount,
+            nextRetryAt
+          );
+        } else if (
+          (isTransientDbLock &&
+            nextRetryCount <= Math.max(3, this.config.maxRetries)) ||
+          (isTransientMalformedJson && nextRetryCount <= 1)
+        ) {
+          const nextRetryAt = new Date(
+            Date.now() + 250 * nextRetryCount
+          ).toISOString();
+          this.db.markSmcJobFailedRetryable(
             job.id,
             errorMsg,
             nextRetryCount,
@@ -2970,8 +3581,9 @@ export class SmcBatchScanService {
       stalledThresholdMs?: number;
     }
   ): void {
+    this.lastRealResumeAtMsByExchange.delete(exchange);
     if (state.workerState !== undefined) {
-      this.workerState = state.workerState;
+      this.setWorkerState(exchange, state.workerState);
     }
     if (state.isPrewarming !== undefined) {
       this.isPrewarmingByExchange.set(exchange, state.isPrewarming);
@@ -3018,18 +3630,46 @@ export class SmcBatchScanService {
     atomic: ReturnType<RadarDatabase['getAtomicSmcSnapshot']>,
     resolvedExchange: ExchangeId,
     mode: 'live' | 'demo',
-    nowMs = Date.now()
+    nowMs = Date.now(),
+    options?: { includeCycleDiagnostics?: boolean }
   ): SmcScanProgressHealthResponse {
     const stalledThresholdMs = this.config.stalledThresholdMs ?? 45_000;
+    const exWorkerState = this.getWorkerState(resolvedExchange);
     const isPrewarming =
       this.isPrewarmingByExchange.get(resolvedExchange) === true;
+    const includeDiag = options?.includeCycleDiagnostics !== false;
+    const availableRequestsNow = this.getAvailableRequests(
+      nowMs,
+      resolvedExchange
+    );
+    const isLoopActive = this.isExchangeLoopActive(resolvedExchange);
+    const is15mTriggerActive =
+      this.inFlight15mCloseTriggerByExchange.get(resolvedExchange) === true;
+    const consecutiveErrorsKey =
+      this.consecutiveExchangeErrorsByExchange.get(resolvedExchange) ?? 0;
+    const dbStructFp = this.db.getDbStructuralFingerprint(resolvedExchange);
+    const cacheKey = `${resolvedExchange}:${mode}:${includeDiag ? 1 : 0}`;
+    const fingerprint = `${dbStructFp}:${atomic.scanCycleId}:${atomic.statsVersion}:${atomic.evaluatedCount}:${atomic.pendingCount}:${atomic.runningJobCount}:${atomic.failedCount}:${atomic.rateLimitedCount}:${atomic.cacheStatus}:${exWorkerState}:${isPrewarming}:${isLoopActive}:${is15mTriggerActive}:${consecutiveErrorsKey}:${availableRequestsNow > 0 ? 1 : 0}:${this.config.maxConcurrency}:${stalledThresholdMs}`;
+    const cachedP16 = this.phase16DiagnosticsCacheByExchange.get(cacheKey);
+    if (
+      cachedP16 &&
+      cachedP16.fingerprint === fingerprint &&
+      nowMs >= cachedP16.nowMs &&
+      nowMs - cachedP16.nowMs < 750
+    ) {
+      return cachedP16.result;
+    }
 
     const breakdown = this.db.getPhase16PendingBreakdown(
       resolvedExchange,
       nowMs,
       {
         isPrewarming,
+        availableRequests: availableRequestsNow,
+        batchSize: this.config.batchSize,
         stalledThresholdMs,
+        cycleId: atomic.cycleId,
+        cycleMode: atomic.cacheMode,
       }
     );
 
@@ -3067,6 +3707,10 @@ export class SmcBatchScanService {
 
     // Evaluate Section 三: Stuck Diagnostics Rules
     const stalledReasonsSet = new Set<SmcStalledReason>();
+    const isTriggerOrLoopActive =
+      runningJobCount > 0 ||
+      this.isExchangeLoopActive(resolvedExchange) ||
+      this.inFlight15mCloseTriggerByExchange.get(resolvedExchange) === true;
 
     if (pendingCount > 0) {
       // 1. LEASE_EXPIRED: runningJob heartbeat / lease expired
@@ -3088,9 +3732,10 @@ export class SmcBatchScanService {
         stalledReasonsSet.add('LEASE_EXPIRED');
       }
 
-      // 2. QUEUE_NOT_STARTED: pending tasks exist, worker is not RUNNING (IDLE or PAUSED), and pending tasks have aged beyond threshold
+      // 2. QUEUE_NOT_STARTED: pending tasks exist, worker is not RUNNING (IDLE or PAUSED), no active job/loop/15m trigger running, and pending tasks have aged beyond threshold
       if (
-        this.workerState !== 'RUNNING' &&
+        exWorkerState !== 'RUNNING' &&
+        !isTriggerOrLoopActive &&
         oldestPendingAgeMs !== null &&
         oldestPendingAgeMs >= stalledThresholdMs
       ) {
@@ -3174,19 +3819,42 @@ export class SmcBatchScanService {
         ? Math.max(0, nowMs - lastCompletedMs)
         : oldestPendingAgeMs ?? 0;
 
-      const effectiveNoProgressThresholdMs = Math.min(
+      const baseNoProgressThresholdMs = Math.min(
         stalledThresholdMs,
         10 * 60 * 1000
       );
+      const availableRequestsForBatch = this.getAvailableRequests(
+        nowMs,
+        resolvedExchange
+      );
+      const exTimestamps = this.getRequestTimestamps(resolvedExchange);
+      const waitingForLocalRateLimitWindow =
+        availableRequestsForBatch < 5 &&
+        exTimestamps.length > 0 &&
+        nowMs - exTimestamps[0] < 60_000;
+      const effectiveNoProgressThresholdMs = waitingForLocalRateLimitWindow
+        ? Math.max(baseNoProgressThresholdMs, 75_000)
+        : baseNoProgressThresholdMs;
+      const resumeAnchorMs =
+        this.lastRealResumeAtMsByExchange.get(resolvedExchange);
+      const inResumeGraceWindow =
+        resumeAnchorMs !== undefined &&
+        nowMs >= resumeAnchorMs &&
+        nowMs - resumeAnchorMs < effectiveNoProgressThresholdMs;
+      const inActivePrewarmGrace =
+        isPrewarming && prewarmAgeMs < stalledThresholdMs;
       if (
-        this.workerState === 'RUNNING' &&
+        exWorkerState === 'RUNNING' &&
+        !inResumeGraceWindow &&
+        !inActivePrewarmGrace &&
         (oldestPendingAgeMs ?? 0) >= effectiveNoProgressThresholdMs &&
         progressAgeMs >= effectiveNoProgressThresholdMs &&
         completedAgeMs >= effectiveNoProgressThresholdMs
       ) {
         stalledReasonsSet.add('WORKER_NO_PROGRESS');
       } else if (
-        this.workerState !== 'RUNNING' &&
+        exWorkerState !== 'RUNNING' &&
+        !isTriggerOrLoopActive &&
         (oldestPendingAgeMs ?? 0) >= 10 * 60 * 1000 &&
         progressAgeMs >= 10 * 60 * 1000 &&
         completedAgeMs >= 10 * 60 * 1000
@@ -3310,7 +3978,7 @@ export class SmcBatchScanService {
             atomic.rateLimitedCount > 0 ||
             failedRetryableCount > 0
           ? 'DEGRADED'
-          : this.workerState !== 'RUNNING' && pendingCount === 0
+          : exWorkerState !== 'RUNNING' && pendingCount === 0
             ? 'IDLE'
             : 'HEALTHY';
 
@@ -3341,9 +4009,9 @@ export class SmcBatchScanService {
             : 'HEALTHY';
 
     const monitorWorkerState: SmcMonitorWorkerState =
-      this.progressSampleTimer !== null || this.workerState === 'RUNNING'
+      this.progressSampleTimer !== null || exWorkerState === 'RUNNING'
         ? 'RUNNING'
-        : this.workerState === 'PAUSED'
+        : exWorkerState === 'PAUSED'
           ? 'PAUSED'
           : 'RUNNING';
 
@@ -3352,18 +4020,20 @@ export class SmcBatchScanService {
         ? 'IDLE'
         : runningJobCount > 0
           ? 'RUNNING'
-          : this.workerState === 'PAUSED'
+          : exWorkerState === 'PAUSED'
             ? 'PAUSED'
-            : 'IDLE';
+            : exWorkerState === 'RUNNING'
+              ? 'RUNNING'
+              : 'IDLE';
 
     const queueWorkerState: SmcQueueWorkerState =
       !concurrencyValid ||
       pendingBreakdownConsistency === 'INVALID' ||
       stalledSuspected
         ? 'ERROR'
-        : this.workerState === 'PAUSED'
+        : exWorkerState === 'PAUSED'
           ? 'PAUSED'
-          : this.workerState === 'IDLE' &&
+          : exWorkerState === 'IDLE' &&
               pendingCount > 0 &&
               runningJobCount === 0 &&
               atomic.evaluatedCount === 0
@@ -3373,7 +4043,11 @@ export class SmcBatchScanService {
     const windows = this.db.getOrSyncLongRunningWindows(
       resolvedExchange,
       nowMs,
-      maxConcurrency
+      maxConcurrency,
+      {
+        atomic,
+        p16: breakdown,
+      }
     );
     const activeWin24h = windows['24h'];
     const counters = this.db.getRestartAndRecoveryCounters(
@@ -3396,7 +4070,7 @@ export class SmcBatchScanService {
             ? '掃描已完成'
             : '正常背景評估中';
 
-    return {
+    const p16Result: SmcScanProgressHealthResponse = {
       safety: TRADING_SAFETY_FLAGS,
       liveOrders: TRADING_SAFETY_FLAGS.liveOrders,
       executionPolicy: TRADING_SAFETY_FLAGS.executionPolicy,
@@ -3409,7 +4083,7 @@ export class SmcBatchScanService {
       cycleId: atomic.cycleId,
       scanCycleId: atomic.scanCycleId,
       cycleStatus: resolvedCycleStatus,
-      workerState: this.workerState,
+      workerState: exWorkerState,
       monitorWorkerState,
       scanWorkerState,
       queueWorkerState,
@@ -3476,8 +4150,11 @@ export class SmcBatchScanService {
       stuckJobs,
       statsVersion: atomic.statsVersion,
       snapshotAt: atomic.snapshotAt,
-      ...(() => {
-        const diag = this.db.computeCycleDiagnosticsAndFunnel(resolvedExchange);
+      ...(options?.includeCycleDiagnostics === false
+        ? {}
+        : (() => {
+            const diag =
+              this.db.computeCycleDiagnosticsAndFunnel(resolvedExchange, atomic);
         return {
           aggregationScope: diag.aggregationScope,
           evaluationUniverseSize: diag.evaluationUniverseSize,
@@ -3496,12 +4173,14 @@ export class SmcBatchScanService {
           historicalSignalsOutsideWindow: diag.historicalSignalsOutsideWindow,
           formalCandidateLatencySla: diag.formalCandidateLatencySla,
           DEMO_LATENCY_FIXTURE: diag.DEMO_LATENCY_FIXTURE,
+          CONTROLLED_LIVE_FIXTURE: diag.CONTROLLED_LIVE_FIXTURE,
           LIVE_FORMAL_CANDIDATE_COUNT: diag.LIVE_FORMAL_CANDIDATE_COUNT,
           LIVE_FAST_LANE_COUNT: diag.LIVE_FAST_LANE_COUNT,
           LIVE_BULK_COUNT: diag.LIVE_BULK_COUNT,
           LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT:
             diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
           LIVE_ENTRY_WINDOW_MISSED_COUNT: diag.LIVE_ENTRY_WINDOW_MISSED_COUNT,
+          LIVE_ENTRY_WINDOW_MISSED_RATE: diag.LIVE_ENTRY_WINDOW_MISSED_RATE,
           LIVE_DETECTION_LATENCY_P50: diag.LIVE_DETECTION_LATENCY_P50,
           LIVE_DETECTION_LATENCY_P95: diag.LIVE_DETECTION_LATENCY_P95,
           LIVE_FAST_LANE_DETECTION_LATENCY_P50:
@@ -3510,6 +4189,12 @@ export class SmcBatchScanService {
             diag.LIVE_FAST_LANE_DETECTION_LATENCY_P95,
           LIVE_BULK_DETECTION_LATENCY_P50: diag.LIVE_BULK_DETECTION_LATENCY_P50,
           LIVE_BULK_DETECTION_LATENCY_P95: diag.LIVE_BULK_DETECTION_LATENCY_P95,
+          liveValidationStatus: diag.liveValidationStatus,
+          liveSampleValidationStatus: diag.liveSampleValidationStatus,
+          liveValidationStates: diag.liveValidationStates,
+          liveValidationMessage: diag.liveValidationMessage,
+          isLiveValidated: diag.isLiveValidated,
+          signalQualityCalibration: diag.signalQualityCalibration,
           smcGateDiagnostics: diag.smcGateDiagnostics,
           paperEligibilityAudit: diag.paperEligibilityAudit,
           scopedGateStatistics: diag.scopedGateStatistics,
@@ -3559,8 +4244,14 @@ export class SmcBatchScanService {
           rootCauseVerdict: diag.rootCauseVerdict,
           rootCauseExplanation: diag.rootCauseExplanation,
         };
-      })(),
+      })()),
     };
+    this.phase16DiagnosticsCacheByExchange.set(cacheKey, {
+      fingerprint,
+      nowMs,
+      result: p16Result,
+    });
+    return p16Result;
   }
 
   private toProgressEvidenceSample(
@@ -3576,6 +4267,7 @@ export class SmcBatchScanService {
     const monitoringWindowId = windows['24h'].monitoringWindowId;
     const cacheHealth: 'HEALTHY' | 'PREWARMING' | 'DEGRADED' | 'COLD' =
       this.isPrewarmingByExchange.get(diag.exchange) === true ||
+      this.isRefreshingExpiredCacheByExchange.get(diag.exchange) === true ||
       atomic.cacheStatus === '正在預熱'
         ? 'PREWARMING'
         : atomic.staleCacheCount > 0 ||
@@ -3623,28 +4315,732 @@ export class SmcBatchScanService {
     };
   }
 
+  public async checkAndTriggerConfirmed15mBarClose(
+    exchange: ExchangeId = 'binance_usdm',
+    nowMs = Date.now(),
+    allowCorruptionRetry = true
+  ): Promise<boolean> {
+    if (exchange === 'demo_synthetic' || this.activeMode === 'demo') {
+      return false;
+    }
+    if (this.getWorkerState(exchange) === 'PAUSED') {
+      return false;
+    }
+    if (this.inFlight15mCloseTriggerByExchange.get(exchange)) {
+      return false;
+    }
+
+    let lockAcquired = false;
+    try {
+      const bar15mMs = 15 * 60 * 1000;
+      const currentBarOpenMs = Math.floor(nowMs / bar15mMs) * bar15mMs;
+      const confirmedBarCloseTime = currentBarOpenMs - 1;
+      const msSinceBarOpen = nowMs - currentBarOpenMs;
+      // Wait at least 3s after bar close boundary for exchange candle confirmation
+      if (msSinceBarOpen < 3_000) {
+        return false;
+      }
+
+      const queueStatsBeforeTrigger = this.db.getSmcScanQueueStats(exchange);
+      const hasActiveDrainingQueue =
+        queueStatsBeforeTrigger.queuedCount > 0 ||
+        queueStatsBeforeTrigger.runningJobCount > 0 ||
+        queueStatsBeforeTrigger.rateLimitedCount > 0;
+      if (hasActiveDrainingQueue && msSinceBarOpen > 120_000) {
+        // Do not wipe an already-draining 522-symbol queue on mid-bar startup/recovery
+        return false;
+      }
+
+      const lastTriggered =
+        this.lastAutoTriggered15mCloseTimeByExchange.get(exchange) ?? 0;
+      if (confirmedBarCloseTime <= lastTriggered) {
+        return false;
+      }
+
+      const existingEvents = this.db.list15mCloseEvents(exchange, {
+        limit: 10,
+        includeFixtures: false,
+      });
+      const alreadyTriggeredForBar = existingEvents.some(
+        (ev) =>
+          ev.evidenceType === 'LIVE_PRODUCTION' &&
+          ev.barCloseTime === confirmedBarCloseTime &&
+          ev.triggeredFastLaneCount > 0
+      );
+      if (alreadyTriggeredForBar) {
+        this.lastAutoTriggered15mCloseTimeByExchange.set(
+          exchange,
+          confirmedBarCloseTime
+        );
+        return false;
+      }
+
+      this.inFlight15mCloseTriggerByExchange.set(exchange, true);
+      lockAcquired = true;
+
+      const adapter = this.adapters[exchange];
+      if (!adapter || adapter.isDemo) {
+        return false;
+      }
+      const snapshot = await adapter.fetchMarketSnapshot();
+      if (snapshot.provenance.isDemo) {
+        return false;
+      }
+      this.db.recordTickerVolumeSnapshot(exchange, snapshot.tickers);
+      const historicalVolumeMap = this.db.getBulkHistoricalVolumeMap(
+        exchange,
+        40,
+        '15m'
+      );
+      const preScan = runMarketScan(snapshot.tickers, snapshot.provenance, {
+        mode: 'live',
+        exchange,
+        volumeTimeframe: '15m',
+        historicalVolumeMap,
+      });
+      const existingNearMiss = this.db
+        .listNearMissObservations(exchange, {
+          includeFixtures: false,
+          limit: 100,
+        })
+        .map((n) => n.symbol);
+
+      await this.triggerConfirmed15mBarCloseFastLane({
+        exchange,
+        confirmedBarCloseTime,
+        tickers: snapshot.tickers,
+        candidates: preScan.candidates,
+        watchlistSymbols: DEFAULT_PRIORITY_WATCHLIST,
+        nearMissSymbols: existingNearMiss,
+        evaluateImmediately: false,
+        nowMs: Date.now(),
+        evidenceType: 'LIVE_PRODUCTION',
+      });
+      this.lastAutoTriggered15mCloseTimeByExchange.set(
+        exchange,
+        confirmedBarCloseTime
+      );
+      this.resumeScanLoopOnly(exchange, 'live', {
+        preserveForeground: true,
+        delayMs: 25,
+      });
+      return true;
+    } catch (err) {
+      if (lockAcquired) {
+        this.inFlight15mCloseTriggerByExchange.set(exchange, false);
+        lockAcquired = false;
+      }
+      if (RadarDatabase.isSqliteCorruptionError(err)) {
+        const recovered = this.db.recoverFromRuntimeSqliteError(err, exchange);
+        if (recovered) {
+          console.warn(
+            `[SmcBatchScanService:${exchange}] checkAndTriggerConfirmed15mBarClose recovered from runtime SQLite error:`,
+            err instanceof Error ? err.message : String(err)
+          );
+          if (allowCorruptionRetry) {
+            return this.checkAndTriggerConfirmed15mBarClose(
+              exchange,
+              nowMs,
+              false
+            );
+          }
+          return false;
+        }
+      }
+      console.error(
+        '[SmcBatchScanService] checkAndTriggerConfirmed15mBarClose error:',
+        err
+      );
+      return false;
+    } finally {
+      if (lockAcquired) {
+        this.inFlight15mCloseTriggerByExchange.set(exchange, false);
+      }
+    }
+  }
+
+  public async refreshExpiredCachesIfNeeded(
+    exchange: ExchangeId = 'binance_usdm',
+    options?: {
+      force?: boolean;
+      nowMs?: number;
+      maxSymbolsPerRun?: number;
+    }
+  ): Promise<{
+    refreshedSymbolCount: number;
+    fundingMetadataUpdatedCount: number;
+    remainingExpiredCount: number;
+    skipped: boolean;
+  }> {
+    const nowMs = options?.nowMs ?? Date.now();
+    if (exchange === 'demo_synthetic' || this.activeMode === 'demo') {
+      return {
+        refreshedSymbolCount: 0,
+        fundingMetadataUpdatedCount: 0,
+        remainingExpiredCount: 0,
+        skipped: true,
+      };
+    }
+    if (this.getWorkerState(exchange) === 'PAUSED') {
+      return {
+        refreshedSymbolCount: 0,
+        fundingMetadataUpdatedCount: 0,
+        remainingExpiredCount: 0,
+        skipped: true,
+      };
+    }
+    const adapter = this.adapters[exchange];
+    if (!adapter || adapter.isDemo) {
+      return {
+        refreshedSymbolCount: 0,
+        fundingMetadataUpdatedCount: 0,
+        remainingExpiredCount: 0,
+        skipped: true,
+      };
+    }
+    if (
+      this.inFlightExpiredRefreshByExchange.get(exchange) ||
+      this.inFlight15mCloseTriggerByExchange.get(exchange) ||
+      this.isPrewarmingByExchange.get(exchange) ||
+      this.isRefreshingExpiredCacheByExchange.get(exchange)
+    ) {
+      return {
+        refreshedSymbolCount: 0,
+        fundingMetadataUpdatedCount: 0,
+        remainingExpiredCount: 0,
+        skipped: true,
+      };
+    }
+
+    if (!options?.force) {
+      const backoffUntil =
+        this.expiredRefreshBackoffUntilMsByExchange.get(exchange) ?? 0;
+      if (nowMs < backoffUntil) {
+        return {
+          refreshedSymbolCount: 0,
+          fundingMetadataUpdatedCount: 0,
+          remainingExpiredCount: 0,
+          skipped: true,
+        };
+      }
+      const lastAttempt =
+        this.lastExpiredRefreshAttemptMsByExchange.get(exchange) ?? 0;
+      if (nowMs - lastAttempt < 10_000) {
+        return {
+          refreshedSymbolCount: 0,
+          fundingMetadataUpdatedCount: 0,
+          remainingExpiredCount: 0,
+          skipped: true,
+        };
+      }
+    }
+
+    const expectedRuleVersion =
+      this.activeRuleVersionByExchange.get(exchange) ?? SMC_RULE_VERSION;
+    const knownTickers = this.latestTickerMapByExchange.get(exchange);
+
+    const initialNeeds = this.db.listCacheRefreshNeeds(
+      exchange,
+      undefined,
+      expectedRuleVersion,
+      nowMs
+    );
+    if (initialNeeds.totalTargetSymbols === 0) {
+      return {
+        refreshedSymbolCount: 0,
+        fundingMetadataUpdatedCount: 0,
+        remainingExpiredCount: 0,
+        skipped: true,
+      };
+    }
+
+    if (
+      initialNeeds.symbolsNeedingFetch.length === 0 &&
+      !initialNeeds.needsTickerSnapshotRefresh
+    ) {
+      return {
+        refreshedSymbolCount: 0,
+        fundingMetadataUpdatedCount: 0,
+        remainingExpiredCount: 0,
+        skipped: false,
+      };
+    }
+
+    this.inFlightExpiredRefreshByExchange.set(exchange, true);
+    this.lastExpiredRefreshAttemptMsByExchange.set(exchange, nowMs);
+    let fundingMetadataUpdatedCount = 0;
+    let refreshedSymbolCount = 0;
+
+    try {
+      const lastSnapMs =
+        this.lastTickerSnapshotFetchedAtMsByExchange.get(exchange) ?? 0;
+      const shouldFetchTickerSnapshot =
+        !knownTickers ||
+        knownTickers.size === 0 ||
+        initialNeeds.needsTickerSnapshotRefresh ||
+        nowMs - lastSnapMs > 60_000;
+
+      if (shouldFetchTickerSnapshot && this.canIssueRequest(1, Date.now(), exchange)) {
+        try {
+          const slotWaitMs = await this.acquireHttpSlot(exchange);
+          void slotWaitMs;
+          const snapStartMs = Date.now();
+          this.recordRequestIssued(snapStartMs, exchange);
+          let snapshot: Awaited<ReturnType<ExchangeAdapter['fetchMarketSnapshot']>>;
+          try {
+            snapshot = await adapter.fetchMarketSnapshot();
+          } finally {
+            this.releaseHttpSlot(exchange);
+          }
+          if (!snapshot.provenance.isDemo && snapshot.tickers.length > 0) {
+            this.updateLatestMarketSnapshot(exchange, snapshot.tickers);
+            const tMap = this.latestTickerMapByExchange.get(exchange);
+            if (tMap) {
+              fundingMetadataUpdatedCount =
+                this.db.refreshFundingMetadataInCandlesCache(
+                  exchange,
+                  tMap,
+                  Date.now()
+                );
+            }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/429|rate limit|too many requests|503|unavailable/i.test(msg)) {
+            this.expiredRefreshBackoffUntilMsByExchange.set(
+              exchange,
+              Date.now() + 30_000
+            );
+          }
+        }
+      }
+
+      const needs = this.db.listCacheRefreshNeeds(
+        exchange,
+        undefined,
+        expectedRuleVersion,
+        Date.now()
+      );
+
+      if (needs.symbolsNeedingFetch.length === 0) {
+        if (fundingMetadataUpdatedCount > 0) {
+          const activeWindowKey = this.resolveActiveWindowKey(exchange);
+          const totalUniv =
+            this.totalContractsByExchange.get(exchange) ||
+            needs.totalTargetSymbols;
+          const cov = this.db.getCacheCoverageMetrics(
+            exchange,
+            totalUniv,
+            false,
+            expectedRuleVersion
+          );
+          this.db.savePrewarmSnapshot({
+            snapshotId: `snap_${exchange}_${activeWindowKey}`,
+            databaseInstanceId: this.db.databaseInstanceId,
+            exchange,
+            ruleVersion: expectedRuleVersion,
+            windowKey: activeWindowKey,
+            createdAt: new Date().toISOString(),
+            symbolCount: totalUniv,
+            timeframeCoverage: {
+              '5m': cov['5mCacheCoverage'],
+              '15m': cov['15mCacheCoverage'],
+              '1h': cov['1hCacheCoverage'],
+              '4h': cov['4hCacheCoverage'],
+            },
+            oiFundingCoverage: {
+              oiCoverage: cov.oiCacheCoverage,
+              fundingCoverage: cov.fundingCacheCoverage,
+            },
+            freshUntil: new Date(
+              Date.now() + (this.config.cacheTtlMsByTimeframe['5m'] ?? 300_000)
+            ).toISOString(),
+          });
+        }
+        return {
+          refreshedSymbolCount: 0,
+          fundingMetadataUpdatedCount,
+          remainingExpiredCount: 0,
+          skipped: false,
+        };
+      }
+
+      if (!this.inFlightPrewarmSymbolsByExchange.has(exchange)) {
+        this.inFlightPrewarmSymbolsByExchange.set(exchange, new Set());
+      }
+      const inFlightSet = this.inFlightPrewarmSymbolsByExchange.get(exchange)!;
+      this.isRefreshingExpiredCacheByExchange.set(exchange, true);
+      this.lastPrewarmProgressAtByExchange.set(
+        exchange,
+        new Date().toISOString()
+      );
+
+      // Avoid duplicating work for symbols currently queued for fresh evaluation unless explicitly forced
+      const activeQueuedOrRunningSymbols = !options?.force
+        ? new Set(
+            this.db
+              .listSmcScanJobs(
+                exchange,
+                Math.max(1500, this.totalContractsByExchange.get(exchange) ?? 1500)
+              )
+              .filter(
+                (j) =>
+                  j.status === 'QUEUED' ||
+                  j.status === 'RUNNING' ||
+                  j.status === 'RATE_LIMITED'
+              )
+              .map((j) => j.symbol)
+          )
+        : new Set<string>();
+      const candidateItems = needs.symbolsNeedingFetch.filter(
+        (item) => !activeQueuedOrRunningSymbols.has(item.symbol)
+      );
+      const effectiveCap =
+        options?.maxSymbolsPerRun && options.maxSymbolsPerRun > 0
+          ? options.maxSymbolsPerRun
+          : 40;
+      const maxBatch = Math.min(effectiveCap, candidateItems.length);
+      const targets = candidateItems.slice(0, maxBatch);
+      const activeWindowKey = this.resolveActiveWindowKey(exchange);
+
+      let cursor = 0;
+      let rateLimitedStop = false;
+      const maxWorkers = Math.max(
+        1,
+        Math.min(2, this.config.maxHttpConcurrency >= 4 ? 2 : 1)
+      );
+
+      try {
+        const refreshWorker = async () => {
+          while (cursor < targets.length && !rateLimitedStop) {
+            if (this.getWorkerState(exchange) === 'PAUSED') {
+              break;
+            }
+            const item = targets[cursor++];
+            if (!item || inFlightSet.has(item.symbol)) continue;
+
+            const neededHttpReqs =
+              item.timeframes.length + (item.needsOi ? 1 : 0);
+            if (!this.canIssueRequest(Math.max(1, neededHttpReqs), Date.now(), exchange)) {
+              break;
+            }
+
+            const latestSymJob = this.db.listSymbolSmcJobHistory(
+              exchange,
+              item.symbol,
+              1
+            )[0];
+            if (latestSymJob?.status === 'RUNNING') {
+              continue;
+            }
+
+            inFlightSet.add(item.symbol);
+            try {
+              const ticker = this.latestTickerMapByExchange
+                .get(exchange)
+                ?.get(item.symbol);
+              const tfsToFetch = item.timeframes;
+
+              const fetchedState: {
+                k15m?: {
+                  klines: Kline[];
+                  provenance: DataProvenance;
+                  fromCache: boolean;
+                  httpLatencyMs: number;
+                  slotWaitMs: number;
+                };
+                oi?: {
+                  openInterest: number | null;
+                  openInterestValue: number | null;
+                  provenance: DataProvenance;
+                };
+              } = {};
+
+              const tasks: Array<Promise<void>> = [];
+              for (const tf of tfsToFetch) {
+                tasks.push(
+                  (async () => {
+                    const res = await this.fetchOrGetCachedTimeframe(
+                      adapter,
+                      exchange,
+                      item.symbol,
+                      tf,
+                      false
+                    );
+                    if (tf === '15m') {
+                      fetchedState.k15m = res;
+                    }
+                  })()
+                );
+              }
+              if (item.needsOi) {
+                tasks.push(
+                  (async () => {
+                    if (!this.canIssueRequest(1, Date.now(), exchange)) return;
+                    await this.acquireHttpSlot(exchange);
+                    const oiStart = Date.now();
+                    this.recordRequestIssued(oiStart, exchange);
+                    try {
+                      fetchedState.oi = await adapter.fetchOpenInterest(
+                        item.symbol,
+                        ticker?.lastPrice
+                      );
+                    } finally {
+                      this.releaseHttpSlot(exchange);
+                    }
+                  })()
+                );
+              }
+
+              await Promise.all(tasks);
+
+              if (item.needsOi) {
+                const raw15m = this.db.getSmcCandlesCache(
+                  exchange,
+                  item.symbol,
+                  '15m'
+                );
+                if (raw15m && raw15m.klines.length > 0) {
+                  const baseProv =
+                    fetchedState.k15m?.provenance ??
+                    enforceProvenanceIntegrity({
+                      source: raw15m.provenance.source,
+                      fetchedAt: raw15m.provenance.fetchedAt,
+                      stale: false,
+                      fallback: raw15m.provenance.fallback,
+                      missingData: raw15m.provenance.missingData,
+                      isDemo: raw15m.provenance.isDemo,
+                    });
+                  const oiVal =
+                    fetchedState.oi?.openInterest ?? ticker?.openInterest ?? null;
+                  const oiDollarVal =
+                    fetchedState.oi?.openInterestValue ??
+                    ticker?.openInterestValue ??
+                    (oiVal !== null && ticker?.lastPrice
+                      ? oiVal * ticker.lastPrice
+                      : null);
+                  const hasValidOi =
+                    oiVal !== null && oiVal !== undefined;
+                  const oiRefNowMs = Math.max(
+                    Date.now(),
+                    Date.parse(baseProv.fetchedAt) || Date.now()
+                  );
+                  const clean15mProv = enforceProvenanceIntegrity({
+                    source: baseProv.source,
+                    fetchedAt: baseProv.fetchedAt,
+                    stale:
+                      baseProv.stale ||
+                      Boolean(fetchedState.oi?.provenance?.stale),
+                    fallback:
+                      baseProv.fallback ||
+                      Boolean(fetchedState.oi?.provenance?.fallback),
+                    missingData: baseProv.missingData,
+                    isDemo: baseProv.isDemo,
+                  });
+                  this.db.saveSmcCandlesCache({
+                    symbol: item.symbol,
+                    exchange,
+                    timeframe: '15m',
+                    klines: raw15m.klines,
+                    openInterest: hasValidOi ? oiVal : null,
+                    openInterestValue: hasValidOi ? oiDollarVal : null,
+                    fundingRate:
+                      ticker?.fundingRate ?? raw15m.fundingRate ?? null,
+                    nextFundingTime:
+                      ticker?.nextFundingTime ??
+                      (raw15m.nextFundingTime &&
+                      raw15m.nextFundingTime > oiRefNowMs
+                        ? raw15m.nextFundingTime
+                        : null),
+                    oiFetchedAt: hasValidOi
+                      ? new Date(oiRefNowMs).toISOString()
+                      : null,
+                    oiExpiresAt: hasValidOi
+                      ? new Date(
+                          oiRefNowMs + (this.config.oiCacheTtlMs ?? 900_000)
+                        ).toISOString()
+                      : null,
+                    dataTimestamp: raw15m.dataTimestamp,
+                    ruleVersion: raw15m.ruleVersion ?? expectedRuleVersion,
+                    windowKey: raw15m.windowKey ?? activeWindowKey,
+                    expiresAt: raw15m.expiresAt,
+                    provenance: clean15mProv,
+                  });
+                }
+              }
+
+              refreshedSymbolCount++;
+              this.lastPrewarmProgressAtByExchange.set(
+                exchange,
+                new Date().toISOString()
+              );
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              if (
+                (err instanceof ExchangeApiUnavailableError &&
+                  (err.statusCode === 429 || err.isRateLimited)) ||
+                /429|rate limit|too many requests/i.test(msg)
+              ) {
+                this.db.updateRuntimeHttpMetrics(exchange, {
+                  incrementRateLimitEvents: 1,
+                });
+                this.expiredRefreshBackoffUntilMsByExchange.set(
+                  exchange,
+                  Date.now() + 30_000
+                );
+                rateLimitedStop = true;
+              }
+            } finally {
+              inFlightSet.delete(item.symbol);
+            }
+          }
+        };
+
+        const workerCount = Math.min(maxWorkers, targets.length);
+        const workers: Array<Promise<void>> = [];
+        for (let i = 0; i < workerCount; i++) {
+          workers.push(refreshWorker());
+        }
+        await Promise.all(workers);
+
+        const postNeeds = this.db.listCacheRefreshNeeds(
+          exchange,
+          undefined,
+          expectedRuleVersion,
+          Date.now()
+        );
+        const totalUniv =
+          this.totalContractsByExchange.get(exchange) ||
+          postNeeds.totalTargetSymbols;
+        const cov = this.db.getCacheCoverageMetrics(
+          exchange,
+          totalUniv,
+          false,
+          expectedRuleVersion
+        );
+        this.db.savePrewarmSnapshot({
+          snapshotId: `snap_${exchange}_${activeWindowKey}`,
+          databaseInstanceId: this.db.databaseInstanceId,
+          exchange,
+          ruleVersion: expectedRuleVersion,
+          windowKey: activeWindowKey,
+          createdAt: new Date().toISOString(),
+          symbolCount: totalUniv,
+          timeframeCoverage: {
+            '5m': cov['5mCacheCoverage'],
+            '15m': cov['15mCacheCoverage'],
+            '1h': cov['1hCacheCoverage'],
+            '4h': cov['4hCacheCoverage'],
+          },
+          oiFundingCoverage: {
+            oiCoverage: cov.oiCacheCoverage,
+            fundingCoverage: cov.fundingCacheCoverage,
+          },
+          freshUntil: new Date(
+            Date.now() + (this.config.cacheTtlMsByTimeframe['5m'] ?? 300_000)
+          ).toISOString(),
+        });
+
+        return {
+          refreshedSymbolCount,
+          fundingMetadataUpdatedCount,
+          remainingExpiredCount: postNeeds.symbolsNeedingFetch.length,
+          skipped: false,
+        };
+      } finally {
+        this.isRefreshingExpiredCacheByExchange.set(exchange, false);
+      }
+    } finally {
+      this.inFlightExpiredRefreshByExchange.set(exchange, false);
+    }
+  }
+
   public startProgressSamplingLoop(
     exchange: ExchangeId = 'binance_usdm',
     intervalMs = 60_000
   ): void {
     this.stopProgressSamplingLoop();
-    this.db.getOrSyncLongRunningWindows(
-      exchange,
-      Date.now(),
-      this.config.maxConcurrency
-    );
-    this.captureProgressEvidenceSample(exchange, 'live', Date.now());
+    if (exchange !== 'demo_synthetic') {
+      this.trackedLiveExchanges.add(exchange);
+    }
+    try {
+      this.db.getOrSyncLongRunningWindows(
+        exchange,
+        Date.now(),
+        this.config.maxConcurrency
+      );
+      this.captureProgressEvidenceSample(exchange, 'live', Date.now());
+    } catch (err) {
+      console.error('[SmcBatchScanService] Initial progress sample warning:', err);
+    }
+    if (exchange !== 'demo_synthetic') {
+      try {
+        this.recordConfirmed15mBarCloseSnapshot(
+          exchange,
+          Date.now(),
+          'LIVE_PRODUCTION'
+        );
+      } catch {
+        // ignore
+      }
+      const runPeriodicBarAndCacheSync = async () => {
+        if (this.periodicBarSyncInFlight) return;
+        this.periodicBarSyncInFlight = true;
+        try {
+          const fg = this.activeExchange;
+          const orderedExchanges = Array.from(this.trackedLiveExchanges).sort(
+            (a, b) => (a === fg ? -1 : b === fg ? 1 : 0)
+          );
+          for (const ex of orderedExchanges) {
+            if (ex === 'demo_synthetic') continue;
+            const triggered15m =
+              await this.checkAndTriggerConfirmed15mBarClose(ex);
+            if (!triggered15m) {
+              await this.refreshExpiredCachesIfNeeded(ex, {
+                maxSymbolsPerRun: 40,
+              });
+            }
+          }
+        } catch (err) {
+          console.error(
+            '[SmcBatchScanService] 15m close / cache refresh warning:',
+            err
+          );
+        } finally {
+          this.periodicBarSyncInFlight = false;
+        }
+      };
+      void runPeriodicBarAndCacheSync();
+      this.closeTriggerTimer = setInterval(() => {
+        void runPeriodicBarAndCacheSync();
+      }, 3_000);
+    }
     this.progressSampleTimer = setInterval(() => {
       try {
         const now = Date.now();
-        this.db.getOrSyncLongRunningWindows(
-          exchange,
-          now,
-          this.config.maxConcurrency
-        );
-        this.captureProgressEvidenceSample(exchange, 'live', now);
-      } catch {
-        // ignore transient sampling error
+        const targets =
+          exchange === 'demo_synthetic'
+            ? [exchange]
+            : Array.from(this.trackedLiveExchanges);
+        for (const ex of targets) {
+          this.db.getOrSyncLongRunningWindows(
+            ex,
+            now,
+            this.config.maxConcurrency
+          );
+          this.captureProgressEvidenceSample(ex, 'live', now);
+          if (ex !== 'demo_synthetic') {
+            this.recordConfirmed15mBarCloseSnapshot(
+              ex,
+              now,
+              'LIVE_PRODUCTION'
+            );
+          }
+        }
+      } catch (err) {
+        if (RadarDatabase.isSqliteCorruptionError(err)) {
+          this.db.recoverFromRuntimeSqliteError(err, exchange);
+        }
       }
     }, Math.max(10_000, intervalMs));
   }
@@ -3653,6 +5049,10 @@ export class SmcBatchScanService {
     if (this.progressSampleTimer) {
       clearInterval(this.progressSampleTimer);
       this.progressSampleTimer = null;
+    }
+    if (this.closeTriggerTimer) {
+      clearInterval(this.closeTriggerTimer);
+      this.closeTriggerTimer = null;
     }
   }
 
@@ -3666,13 +5066,15 @@ export class SmcBatchScanService {
   public getProgressAndHealth(
     exchange = this.activeExchange,
     mode = this.activeMode,
-    nowMs = Date.now()
+    nowMs = Date.now(),
+    options?: { includeCycleDiagnostics?: boolean }
   ): SmcScanProgressHealthResponse {
     const resolvedExchange: ExchangeId =
       mode === 'demo' ? 'demo_synthetic' : exchange;
-    this.getAvailableRequests(nowMs);
+    this.getAvailableRequests(nowMs, resolvedExchange);
+    const exTimestamps = this.getRequestTimestamps(resolvedExchange);
     this.db.updateRuntimeHttpMetrics(resolvedExchange, {
-      currentRequestsInWindow: this.requestTimestamps.length,
+      currentRequestsInWindow: exTimestamps.length,
       maxHttpConcurrency: this.config.maxHttpConcurrency,
       maxRequestsPerMinute: this.config.maxRequestsPerMinute,
     });
@@ -3681,7 +5083,8 @@ export class SmcBatchScanService {
       atomic,
       resolvedExchange,
       mode,
-      nowMs
+      nowMs,
+      { includeCycleDiagnostics: options?.includeCycleDiagnostics }
     );
     const lastSampleMs =
       this.lastProgressEvidenceSampleMsByExchange.get(resolvedExchange) ?? 0;
@@ -3811,8 +5214,9 @@ export class SmcBatchScanService {
     this.lastProgressAtByExchange.set(resolvedExchange, nowIso);
 
     if (params?.resumeWorker !== false) {
-      this.workerState = 'RUNNING';
-      this.scheduleNextTick(10);
+      this.setWorkerState(resolvedExchange, 'RUNNING');
+      this.lastRealResumeAtMsByExchange.set(resolvedExchange, Date.now());
+      this.scheduleNextTick(resolvedExchange, mode, 10);
     }
 
     return record;
@@ -3824,7 +5228,9 @@ export class SmcBatchScanService {
   ): SystemDatabaseHealthResponse {
     const resolvedExchange: ExchangeId =
       mode === 'demo' ? 'demo_synthetic' : exchange;
-    const progress = this.getProgressAndHealth(resolvedExchange, mode);
+    const progress = this.getProgressAndHealth(resolvedExchange, mode, Date.now(), {
+      includeCycleDiagnostics: false,
+    });
     return this.db.performDatabaseHealthCheck(resolvedExchange, {
       runBackup: false,
       workerState: progress.workerState,
@@ -3866,7 +5272,9 @@ export class SmcBatchScanService {
         sqliteReconnected: true,
       });
     }
-    const progress = this.getProgressAndHealth(resolvedExchange, mode);
+    const progress = this.getProgressAndHealth(resolvedExchange, mode, Date.now(), {
+      includeCycleDiagnostics: false,
+    });
     return this.db.performDatabaseHealthCheck(resolvedExchange, {
       runBackup: params?.createBackup ?? true,
       workerState: progress.workerState,
@@ -4107,8 +5515,8 @@ export class SmcBatchScanService {
     if (retryResult.retriedCount > 0) {
       const nowIso = new Date(nowMs).toISOString();
       this.lastProgressAtByExchange.set(resolvedExchange, nowIso);
-      if (this.workerState === 'RUNNING') {
-        this.scheduleNextTick(10);
+      if (this.getWorkerState(resolvedExchange) === 'RUNNING') {
+        this.scheduleNextTick(resolvedExchange, mode, 10);
       }
     }
 
@@ -4141,7 +5549,8 @@ export class SmcBatchScanService {
       atomic,
       resolvedExchange,
       mode,
-      Date.now()
+      Date.now(),
+      { includeCycleDiagnostics: false }
     );
     const estimatedRemainingDuration = p16.estimatedRemainingDuration;
     const estimatedRemainingSeconds =
@@ -4162,7 +5571,7 @@ export class SmcBatchScanService {
       mode,
       monitoringWindowId: p16.monitoringWindowId,
       windowStatus: p16.windowStatus,
-      workerState: this.workerState,
+      workerState: this.getWorkerState(resolvedExchange),
       monitorWorkerState: p16.monitorWorkerState,
       scanWorkerState: p16.scanWorkerState,
       queueWorkerState: p16.queueWorkerState,
@@ -4213,7 +5622,7 @@ export class SmcBatchScanService {
       runningJobCount: p16.runningJobCount,
       concurrencyValid: p16.concurrencyValid,
       runningCount: p16.runningJobCount,
-      inFlightRequestCount: this.inFlightRequestCount,
+      inFlightRequestCount: this.getInFlightRequestCount(resolvedExchange),
       succeededCount: atomic.succeededCount,
       failedCount: atomic.failedCount,
       rateLimitedCount: atomic.rateLimitedCount,
@@ -4359,11 +5768,13 @@ export class SmcBatchScanService {
       oiCacheCoverage: atomic.oiCacheCoverage,
       fundingCacheCoverage: atomic.fundingCacheCoverage,
       cacheStatus:
-        this.isPrewarmingByExchange.get(resolvedExchange) === true
+        this.isPrewarmingByExchange.get(resolvedExchange) === true ||
+        this.isRefreshingExpiredCacheByExchange.get(resolvedExchange) === true
           ? '正在預熱'
           : atomic.cacheStatus,
       cacheStatusLabel:
-        this.isPrewarmingByExchange.get(resolvedExchange) === true
+        this.isPrewarmingByExchange.get(resolvedExchange) === true ||
+        this.isRefreshingExpiredCacheByExchange.get(resolvedExchange) === true
           ? '正在預熱'
           : atomic.cacheStatusLabel,
       latestPrewarmSnapshot: atomic.latestPrewarmSnapshot,
@@ -4381,7 +5792,10 @@ export class SmcBatchScanService {
       },
       recentJobs: atomic.recentJobs,
       ...(() => {
-        const diag = this.db.computeCycleDiagnosticsAndFunnel(resolvedExchange);
+        const diag = this.db.computeCycleDiagnosticsAndFunnel(
+          resolvedExchange,
+          atomic
+        );
         return {
           aggregationScope: diag.aggregationScope,
           evaluationUniverseSize: diag.evaluationUniverseSize,
@@ -4400,12 +5814,14 @@ export class SmcBatchScanService {
           historicalSignalsOutsideWindow: diag.historicalSignalsOutsideWindow,
           formalCandidateLatencySla: diag.formalCandidateLatencySla,
           DEMO_LATENCY_FIXTURE: diag.DEMO_LATENCY_FIXTURE,
+          CONTROLLED_LIVE_FIXTURE: diag.CONTROLLED_LIVE_FIXTURE,
           LIVE_FORMAL_CANDIDATE_COUNT: diag.LIVE_FORMAL_CANDIDATE_COUNT,
           LIVE_FAST_LANE_COUNT: diag.LIVE_FAST_LANE_COUNT,
           LIVE_BULK_COUNT: diag.LIVE_BULK_COUNT,
           LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT:
             diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
           LIVE_ENTRY_WINDOW_MISSED_COUNT: diag.LIVE_ENTRY_WINDOW_MISSED_COUNT,
+          LIVE_ENTRY_WINDOW_MISSED_RATE: diag.LIVE_ENTRY_WINDOW_MISSED_RATE,
           LIVE_DETECTION_LATENCY_P50: diag.LIVE_DETECTION_LATENCY_P50,
           LIVE_DETECTION_LATENCY_P95: diag.LIVE_DETECTION_LATENCY_P95,
           LIVE_FAST_LANE_DETECTION_LATENCY_P50:
@@ -4414,6 +5830,12 @@ export class SmcBatchScanService {
             diag.LIVE_FAST_LANE_DETECTION_LATENCY_P95,
           LIVE_BULK_DETECTION_LATENCY_P50: diag.LIVE_BULK_DETECTION_LATENCY_P50,
           LIVE_BULK_DETECTION_LATENCY_P95: diag.LIVE_BULK_DETECTION_LATENCY_P95,
+          liveValidationStatus: diag.liveValidationStatus,
+          liveSampleValidationStatus: diag.liveSampleValidationStatus,
+          liveValidationStates: diag.liveValidationStates,
+          liveValidationMessage: diag.liveValidationMessage,
+          isLiveValidated: diag.isLiveValidated,
+          signalQualityCalibration: diag.signalQualityCalibration,
           smcGateDiagnostics: diag.smcGateDiagnostics,
           paperEligibilityAudit: diag.paperEligibilityAudit,
           scopedGateStatistics: diag.smcGateDiagnostics.scopedGateStatistics,
@@ -4482,9 +5904,9 @@ export class SmcBatchScanService {
   } {
     const resolvedExchange: ExchangeId =
       mode === 'demo' ? 'demo_synthetic' : exchange;
-    this.getAvailableRequests(Date.now());
+    this.getAvailableRequests(Date.now(), resolvedExchange);
     this.db.updateRuntimeHttpMetrics(resolvedExchange, {
-      currentRequestsInWindow: this.requestTimestamps.length,
+      currentRequestsInWindow: this.getRequestTimestamps(resolvedExchange).length,
       maxHttpConcurrency: this.config.maxHttpConcurrency,
       maxRequestsPerMinute: this.config.maxRequestsPerMinute,
     });
@@ -4551,9 +5973,9 @@ export class SmcBatchScanService {
   ): SmcScanStatusResponse {
     const resolvedExchange: ExchangeId =
       mode === 'demo' ? 'demo_synthetic' : exchange;
-    this.getAvailableRequests(Date.now());
+    this.getAvailableRequests(Date.now(), resolvedExchange);
     this.db.updateRuntimeHttpMetrics(resolvedExchange, {
-      currentRequestsInWindow: this.requestTimestamps.length,
+      currentRequestsInWindow: this.getRequestTimestamps(resolvedExchange).length,
       maxHttpConcurrency: this.config.maxHttpConcurrency,
       maxRequestsPerMinute: this.config.maxRequestsPerMinute,
     });
@@ -4571,7 +5993,10 @@ export class SmcBatchScanService {
       mode === 'demo' ? 'demo_synthetic' : exchange;
     const atomic = this.db.getAtomicSmcSnapshot(resolvedExchange);
     const result = atomic.resultsMap.get(cleanSymbol) ?? null;
-    const jobs = this.db.listSmcScanJobs(resolvedExchange, 600);
+    const jobs = this.db.listSmcScanJobs(
+      resolvedExchange,
+      Math.max(1500, this.totalContractsByExchange.get(resolvedExchange) ?? 1500)
+    );
     const latestJob = jobs.find((j) => j.symbol === cleanSymbol) ?? null;
 
     return {
@@ -4586,7 +6011,7 @@ export class SmcBatchScanService {
       statsVersion: atomic.statsVersion,
       totalJobs: atomic.totalJobs,
       runningJobCount: atomic.runningJobCount,
-      inFlightRequestCount: this.inFlightRequestCount,
+      inFlightRequestCount: this.getInFlightRequestCount(resolvedExchange),
       smcEvaluationStatus: result?.smcEvaluationStatus ?? 'PENDING',
       smcActionState: result?.smcActionState ?? 'PENDING',
       marketRadarCategory: result?.marketRadarCategory ?? null,
@@ -4608,9 +6033,19 @@ export class SmcBatchScanService {
 
   public stop(): void {
     this.workerState = 'PAUSED';
-    if (this.loopTimer) {
-      clearTimeout(this.loopTimer);
-      this.loopTimer = null;
+    const knownExchanges = new Set<ExchangeId>([
+      this.activeExchange,
+      ...this.workerStateByExchange.keys(),
+      ...this.loopTimerByExchange.keys(),
+    ]);
+    for (const ex of knownExchanges) {
+      this.workerStateByExchange.set(ex, 'PAUSED');
     }
+    this.lastRealResumeAtMsByExchange.clear();
+    for (const timer of this.loopTimerByExchange.values()) {
+      clearTimeout(timer);
+    }
+    this.loopTimerByExchange.clear();
+    this.stopProgressSamplingLoop();
   }
 }

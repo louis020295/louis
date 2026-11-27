@@ -18,14 +18,25 @@ import {
   MarketTicker,
   SampleSufficiencyTier,
   SignalRuleMode,
+  SmcRuleProfile,
   Timeframe,
+  TradingCostConfig,
   TRADING_SAFETY_FLAGS,
   WalkForwardBacktestResult,
   WalkForwardStage,
   WalkForwardWindowResult,
 } from '../../src/types/market.ts';
 import { MARKET_SCAN_RULE_VERSION, runMarketScan } from './MarketScanner.ts';
-import { evaluateSmcStructure, SMC_RULE_VERSION } from './SmcRuleEngine.ts';
+import {
+  evaluateSmcStructure,
+  getSmcRuleVersionForProfile,
+  normalizeSmcRuleProfile,
+  SMC_RULE_VERSION,
+} from './SmcRuleEngine.ts';
+import {
+  calculateTradeTradingCosts,
+  normalizeTradingCostConfig,
+} from './TradingCostModel.ts';
 import {
   DEFAULT_AGGREGATION_WINDOWS,
   evaluateHistoricalVolumeAnomaly,
@@ -42,6 +53,11 @@ export interface RunBacktestInput {
   exchange?: ExchangeId;
   timeframe: Timeframe;
   klines: Kline[];
+  higherTimeframeKlines?: {
+    '1h'?: Kline[];
+    '4h'?: Kline[];
+  };
+  costConfig?: Partial<TradingCostConfig>;
   /**
    * Point-in-time historical Open Interest series (`oi.timestamp <= currentBar.closeTime`).
    * Required for Lookahead-Free evaluation. Current scalar `openInterest` is NEVER used to backfill historical bars.
@@ -60,6 +76,7 @@ export interface RunBacktestInput {
   fundingRate?: number | null;
   provenance: DataProvenance;
   ruleVersion?: string;
+  smcRuleProfile?: SmcRuleProfile;
   marketRadarCategoryOverride?: MarketRadarCategory;
   evalStartIndex?: number;
   evalEndIndex?: number;
@@ -71,12 +88,18 @@ export interface RunWalkForwardInput {
   exchange?: ExchangeId;
   timeframe: Timeframe;
   klines: Kline[];
+  higherTimeframeKlines?: {
+    '1h'?: Kline[];
+    '4h'?: Kline[];
+  };
+  costConfig?: Partial<TradingCostConfig>;
   historicalOpenInterest?: HistoricalOpenInterestPoint[];
   historicalFundingRates?: HistoricalFundingRatePoint[];
   openInterest?: number | null;
   fundingRate?: number | null;
   provenance: DataProvenance;
   ruleVersion?: string;
+  smcRuleProfile?: SmcRuleProfile;
 }
 
 export const MIN_CONFIRMED_BARS_FOR_BACKTEST = 45;
@@ -236,14 +259,20 @@ export class BacktestEngine {
       exchange = 'binance_usdm',
       timeframe,
       klines,
+      higherTimeframeKlines,
+      costConfig: rawCostConfig,
       historicalOpenInterest,
       historicalFundingRates,
       provenance: rawProvenance,
       ruleVersion: customRuleVersion,
+      smcRuleProfile: rawRuleProfile,
       marketRadarCategoryOverride,
     } = input;
 
-    const effectiveRuleVersion = customRuleVersion || this.ruleVersion;
+    const resolvedRuleProfile = normalizeSmcRuleProfile(rawRuleProfile);
+    const resolvedCostConfig = normalizeTradingCostConfig(rawCostConfig);
+    const defaultProfileRuleVersion = `${getSmcRuleVersionForProfile(resolvedRuleProfile)}+${MARKET_SCAN_RULE_VERSION}`;
+    const effectiveRuleVersion = customRuleVersion || defaultProfileRuleVersion;
     const provenance = enforceProvenanceIntegrity(rawProvenance);
     const backtestRunId =
       input.backtestRunId ||
@@ -255,6 +284,16 @@ export class BacktestEngine {
     // 1. Strictly filter only confirmed closed candles (isClosed === true)
     const confirmedKlines = klines.filter((k) => k.isClosed === true);
     const unclosedIgnored = klines.length - confirmedKlines.length;
+    const confirmedHtf1h = (higherTimeframeKlines?.['1h'] ?? [])
+      .filter((k) => k.isClosed === true)
+      .sort((a, b) => a.openTime - b.openTime);
+    const confirmedHtf4h = (higherTimeframeKlines?.['4h'] ?? [])
+      .filter((k) => k.isClosed === true)
+      .sort((a, b) => a.openTime - b.openTime);
+    const mtfHistoricalAligned =
+      timeframe === '1h' || timeframe === '4h'
+        ? true
+        : confirmedHtf1h.length >= 20 || confirmedHtf4h.length >= 10;
 
     const startIdx =
       input.evalStartIndex !== undefined
@@ -303,6 +342,7 @@ export class BacktestEngine {
         exchange,
         timeframe,
         ruleVersion: effectiveRuleVersion,
+        smcRuleProfile: resolvedRuleProfile,
         scannerRuleVersion: this.scannerRuleVersion,
         startTime: startTimeIso,
         endTime: endTimeIso,
@@ -330,6 +370,15 @@ export class BacktestEngine {
         profitFactor: null,
         averageWinR: null,
         averageLossR: null,
+        costConfig: resolvedCostConfig,
+        netWinRate: null,
+        netAverageR: null,
+        netExpectancyR: null,
+        netProfitFactor: null,
+        netMaxDrawdownR: null,
+        totalCostDragR: null,
+        avgCostDragPerTradeR: null,
+        mtfHistoricalAligned,
         averageHoldingTime: null,
         averageHoldingTimeMs: null,
         averageHoldingBars: null,
@@ -417,13 +466,23 @@ export class BacktestEngine {
     let shadow2CandidateCount = 0;
     const shadow1RMultiples: number[] = [];
     const shadow2RMultiples: number[] = [];
+    const shadow1NetRMultiples: number[] = [];
+    const shadow2NetRMultiples: number[] = [];
+    const shadow1CostDrags: number[] = [];
+    const shadow2CostDrags: number[] = [];
     const tfDurationMs = getTimeframeDurationMs(timeframe);
 
     const simulateBarTradeRMultiple = (
       barIndex: number,
       dir: 'LONG' | 'SHORT',
-      atrVal: number
-    ): { rMultiple: number; exitIdx: number } | null => {
+      atrVal: number,
+      pointInTimeFundingRate: number | null
+    ): {
+      rMultiple: number;
+      netRMultiple: number;
+      totalCostR: number;
+      exitIdx: number;
+    } | null => {
       const nextEntryBar = confirmedKlines[barIndex + 1];
       if (!nextEntryBar || !atrVal || atrVal <= 0) return null;
       const refEntry = nextEntryBar.open;
@@ -439,36 +498,65 @@ export class BacktestEngine {
           : Number((refEntry - rewardDist).toPrecision(6));
       const holdLimit = Math.min(endIdx, barIndex + 15);
       let finalExitIdx = barIndex + 1;
+      let finalExitPrice = nextEntryBar.close;
+      let finalExitTime = nextEntryBar.closeTime;
       let finalR = 0;
+      let exitIsLimitFill = false;
       for (let fIdx = barIndex + 1; fIdx <= holdLimit; fIdx++) {
         const b = confirmedKlines[fIdx];
         finalExitIdx = fIdx;
+        finalExitTime = b.closeTime;
         if (dir === 'LONG') {
           if (b.low <= invPrice) {
+            finalExitPrice = invPrice;
             finalR = -1.0;
             break;
           }
           if (b.high >= tgtPrice) {
+            finalExitPrice = tgtPrice;
             finalR = Number((rewardDist / riskDist).toFixed(2));
+            exitIsLimitFill = true;
             break;
           }
         } else {
           if (b.high >= invPrice) {
+            finalExitPrice = invPrice;
             finalR = -1.0;
             break;
           }
           if (b.low <= tgtPrice) {
+            finalExitPrice = tgtPrice;
             finalR = Number((rewardDist / riskDist).toFixed(2));
+            exitIsLimitFill = true;
             break;
           }
         }
         if (fIdx === holdLimit) {
+          finalExitPrice = b.close;
           const diff =
             dir === 'LONG' ? b.close - refEntry : refEntry - b.close;
           finalR = Number((diff / riskDist).toFixed(2));
         }
       }
-      return { rMultiple: finalR, exitIdx: finalExitIdx };
+      const costs = calculateTradeTradingCosts({
+        direction: dir,
+        entryPrice: refEntry,
+        invalidationPrice: invPrice,
+        exitPrice: finalExitPrice,
+        entryTimeMs: nextEntryBar.openTime,
+        exitTimeMs: finalExitTime,
+        entryOrderType: resolvedCostConfig.entryOrderType ?? 'MARKET',
+        exitIsLimitFill,
+        fundingRatePer8h: pointInTimeFundingRate,
+        costConfig: resolvedCostConfig,
+      });
+      const netRMultiple = Number((finalR - costs.totalCostR).toFixed(2));
+      return {
+        rMultiple: finalR,
+        netRMultiple,
+        totalCostR: costs.totalCostR,
+        exitIdx: finalExitIdx,
+      };
     };
 
     // Walk forward bar-by-bar strictly without lookahead
@@ -618,11 +706,27 @@ export class BacktestEngine {
       });
       const stepCandidate = stepScan.candidates[0];
 
+      // Strictly slice higher-timeframe confirmed klines with closeTime <= signalBar.closeTime (zero lookahead!)
+      const visibleHtf1h =
+        confirmedHtf1h.length > 0 && timeframe !== '1h' && timeframe !== '4h'
+          ? confirmedHtf1h.filter((k) => k.closeTime <= signalBar.closeTime)
+          : undefined;
+      const visibleHtf4h =
+        confirmedHtf4h.length > 0 && timeframe !== '4h'
+          ? confirmedHtf4h.filter((k) => k.closeTime <= signalBar.closeTime)
+          : undefined;
+
       const stepAnalysis = evaluateSmcStructure({
         symbol,
         primaryTimeframe: timeframe,
         klinesByTimeframe: {
           [timeframe]: visibleHistory,
+          ...(visibleHtf1h && visibleHtf1h.length > 0
+            ? { '1h': visibleHtf1h }
+            : {}),
+          ...(visibleHtf4h && visibleHtf4h.length > 0
+            ? { '4h': visibleHtf4h }
+            : {}),
         },
         openInterest: pointInTimeOi,
         historicalVolume: volAnomaly,
@@ -630,6 +734,7 @@ export class BacktestEngine {
         extremeFunding: stepCandidate?.extremeFunding ?? false,
         lowLiquidityHighVolatility:
           stepCandidate?.lowLiquidityHighVolatility ?? false,
+        ruleProfile: resolvedRuleProfile,
         provenance,
       });
 
@@ -809,11 +914,14 @@ export class BacktestEngine {
                 ? 'LONG'
                 : 'SHORT'
               : barIntendedDir,
-            stepAnalysis.atr14
+            stepAnalysis.atr14,
+            pointInTimeFunding
           );
           if (sim1) {
             shadow1ActiveUntilIndex = sim1.exitIdx;
             shadow1RMultiples.push(sim1.rMultiple);
+            shadow1NetRMultiples.push(sim1.netRMultiple);
+            shadow1CostDrags.push(sim1.totalCostR);
           }
         }
       }
@@ -828,11 +936,14 @@ export class BacktestEngine {
                 ? 'LONG'
                 : 'SHORT'
               : barIntendedDir,
-            stepAnalysis.atr14
+            stepAnalysis.atr14,
+            pointInTimeFunding
           );
           if (sim2) {
             shadow2ActiveUntilIndex = sim2.exitIdx;
             shadow2RMultiples.push(sim2.rMultiple);
+            shadow2NetRMultiples.push(sim2.netRMultiple);
+            shadow2CostDrags.push(sim2.totalCostR);
           }
         }
       }
@@ -888,6 +999,7 @@ export class BacktestEngine {
       let rMultiple = 0;
       let outcome: 'WIN' | 'LOSS' | 'TIMEOUT_FLAT' = 'TIMEOUT_FLAT';
       let holdingBars = 1;
+      let exitIsLimitFill = false;
 
       const maxHoldEnd = Math.min(endIdx, i + 15);
       for (let f = i + 1; f <= maxHoldEnd; f++) {
@@ -907,6 +1019,7 @@ export class BacktestEngine {
             exitPrice = structuralTargetPrice;
             rMultiple = Number((rewardDistance / riskDistance).toFixed(2));
             outcome = 'WIN';
+            exitIsLimitFill = true;
             break;
           }
         } else {
@@ -920,6 +1033,7 @@ export class BacktestEngine {
             exitPrice = structuralTargetPrice;
             rMultiple = Number((rewardDistance / riskDistance).toFixed(2));
             outcome = 'WIN';
+            exitIsLimitFill = true;
             break;
           }
         }
@@ -939,6 +1053,20 @@ export class BacktestEngine {
                 : 'TIMEOUT_FLAT';
         }
       }
+
+      const tradeCosts = calculateTradeTradingCosts({
+        direction,
+        entryPrice: referenceEntryPrice,
+        invalidationPrice: structuralInvalidationPrice,
+        exitPrice,
+        entryTimeMs: entryBar.openTime,
+        exitTimeMs: exitBarTime,
+        entryOrderType: resolvedCostConfig.entryOrderType ?? 'MARKET',
+        exitIsLimitFill,
+        fundingRatePer8h: pointInTimeFunding,
+        costConfig: resolvedCostConfig,
+      });
+      const netRMultiple = Number((rMultiple - tradeCosts.totalCostR).toFixed(2));
 
       if (outcome === 'TIMEOUT_FLAT') {
         expiredCount++;
@@ -982,6 +1110,13 @@ export class BacktestEngine {
         structuralTargetPrice,
         exitPrice,
         rMultiple,
+        grossRMultiple: rMultiple,
+        feeCostR: tradeCosts.feeCostR,
+        slippageCostR: tradeCosts.slippageCostR,
+        fundingCostR: tradeCosts.fundingCostR,
+        totalCostR: tradeCosts.totalCostR,
+        netRMultiple,
+        fundingRateUsed: tradeCosts.fundingRateUsed,
         outcome,
         evidencesSummary:
           `${scanTag} ${passedLabels || 'SMC 結構共振'} · ${volTag}`.trim(),
@@ -1026,6 +1161,57 @@ export class BacktestEngine {
     const shortCount = trades.filter((t) => t.direction === 'SHORT').length;
     const evaluatedBarsCount = Math.max(0, endIdx - startIdx - 1);
 
+    const computeNetSummaryFromSeries = (
+      netSeries: number[],
+      costSeries: number[]
+    ) => {
+      if (netSeries.length === 0) {
+        return {
+          netWinRate: null,
+          netAverageR: null,
+          netExpectancyR: null,
+          netProfitFactor: null,
+          netMaxDrawdownR: null,
+          totalCostDragR: null,
+          avgCostDragPerTradeR: null,
+        };
+      }
+      const nWins = netSeries.filter((r) => r > 0);
+      const nLosses = netSeries.filter((r) => r < 0);
+      const netWinRate = Number(
+        ((nWins.length / netSeries.length) * 100).toFixed(1)
+      );
+      const totalNetR = netSeries.reduce((a, b) => a + b, 0);
+      const netAvgR = Number((totalNetR / netSeries.length).toFixed(2));
+      const nGrossProfit = nWins.reduce((a, b) => a + b, 0);
+      const nGrossLoss = Math.abs(nLosses.reduce((a, b) => a + b, 0));
+      const netPf =
+        nGrossLoss > 0
+          ? Number((nGrossProfit / nGrossLoss).toFixed(2))
+          : nGrossProfit > 0
+            ? Number(nGrossProfit.toFixed(2))
+            : null;
+      let nCum = 0;
+      let nPk = 0;
+      let nMdd = 0;
+      for (const r of netSeries) {
+        nCum += r;
+        if (nCum > nPk) nPk = nCum;
+        const dd = nPk - nCum;
+        if (dd > nMdd) nMdd = dd;
+      }
+      const totalCost = costSeries.reduce((a, b) => a + b, 0);
+      return {
+        netWinRate,
+        netAverageR: netAvgR,
+        netExpectancyR: netAvgR,
+        netProfitFactor: netPf,
+        netMaxDrawdownR: Number(nMdd.toFixed(2)),
+        totalCostDragR: Number(totalCost.toFixed(2)),
+        avgCostDragPerTradeR: Number((totalCost / netSeries.length).toFixed(3)),
+      };
+    };
+
     const buildModeMetrics = (
       mode:
         | 'STRICT_PRODUCTION'
@@ -1036,6 +1222,8 @@ export class BacktestEngine {
       candCount: number,
       nmCount: number,
       rMultiples: number[],
+      netRMultiples: number[],
+      costDrags: number[],
       modeTrades: BacktestTradeRecord[] = []
     ): BacktestShadowModeMetrics => {
       const closedCount = rMultiples.length;
@@ -1067,6 +1255,12 @@ export class BacktestEngine {
           profitFactor: null,
           maxDrawdownR: null,
           expectancyR: null,
+          netWinRate: null,
+          netAverageR: null,
+          netProfitFactor: null,
+          netMaxDrawdownR: null,
+          netExpectancyR: null,
+          totalCostDragR: null,
           sampleSufficiency: sufficiency,
           dataStaleCount: staleBarCount,
           missingDataCount: missingBarCount,
@@ -1098,6 +1292,7 @@ export class BacktestEngine {
         const dd = pkR - cumR;
         if (dd > mddR) mddR = dd;
       }
+      const netSummary = computeNetSummaryFromSeries(netRMultiples, costDrags);
 
       return {
         mode,
@@ -1116,6 +1311,12 @@ export class BacktestEngine {
         profitFactor: modePf,
         maxDrawdownR: Number(mddR.toFixed(2)),
         expectancyR: modeAvgR,
+        netWinRate: netSummary.netWinRate,
+        netAverageR: netSummary.netAverageR,
+        netProfitFactor: netSummary.netProfitFactor,
+        netMaxDrawdownR: netSummary.netMaxDrawdownR,
+        netExpectancyR: netSummary.netExpectancyR,
+        totalCostDragR: netSummary.totalCostDragR,
         sampleSufficiency: sufficiency,
         dataStaleCount: staleBarCount,
         missingDataCount: missingBarCount,
@@ -1124,6 +1325,8 @@ export class BacktestEngine {
     };
 
     const strictRMultiples = trades.map((t) => t.rMultiple);
+    const strictNetRMultiples = trades.map((t) => t.netRMultiple ?? t.rMultiple);
+    const strictCostDrags = trades.map((t) => t.totalCostR ?? 0);
     const strictProdMetrics = buildModeMetrics(
       'STRICT_PRODUCTION',
       '正式交易訊號模式 (全部 SMC Gate 通過)',
@@ -1131,6 +1334,8 @@ export class BacktestEngine {
       signalCount,
       nearMissOneGateBarCount + nearMissTwoGatesBarCount,
       strictRMultiples,
+      strictNetRMultiples,
+      strictCostDrags,
       trades
     );
     const shadowOneMetrics = buildModeMetrics(
@@ -1140,6 +1345,8 @@ export class BacktestEngine {
       shadow1CandidateCount,
       nearMissOneGateBarCount,
       shadow1RMultiples,
+      shadow1NetRMultiples,
+      shadow1CostDrags,
       []
     );
     const shadowTwoMetrics = buildModeMetrics(
@@ -1149,6 +1356,8 @@ export class BacktestEngine {
       shadow2CandidateCount,
       nearMissOneGateBarCount + nearMissTwoGatesBarCount,
       shadow2RMultiples,
+      shadow2NetRMultiples,
+      shadow2CostDrags,
       []
     );
     const modeComparison: BacktestModeComparisonMatrix = {
@@ -1174,6 +1383,7 @@ export class BacktestEngine {
         exchange,
         timeframe,
         ruleVersion: effectiveRuleVersion,
+        smcRuleProfile: resolvedRuleProfile,
         scannerRuleVersion: this.scannerRuleVersion,
         startTime: startTimeIso,
         endTime: endTimeIso,
@@ -1199,6 +1409,15 @@ export class BacktestEngine {
         profitFactor: null,
         averageWinR: null,
         averageLossR: null,
+        costConfig: resolvedCostConfig,
+        netWinRate: null,
+        netAverageR: null,
+        netExpectancyR: null,
+        netProfitFactor: null,
+        netMaxDrawdownR: null,
+        totalCostDragR: null,
+        avgCostDragPerTradeR: null,
+        mtfHistoricalAligned,
         averageHoldingTime: null,
         averageHoldingTimeMs: null,
         averageHoldingBars: null,
@@ -1267,6 +1486,11 @@ export class BacktestEngine {
       }
     }
 
+    const strictNetSummary = computeNetSummaryFromSeries(
+      strictNetRMultiples,
+      strictCostDrags
+    );
+
     const averageHoldingTimeMs = Math.round(
       trades.reduce((s, t) => s + (t.holdingTimeMs ?? tfDurationMs), 0) /
         totalTrades
@@ -1289,6 +1513,7 @@ export class BacktestEngine {
       exchange,
       timeframe,
       ruleVersion: effectiveRuleVersion,
+      smcRuleProfile: resolvedRuleProfile,
       scannerRuleVersion: this.scannerRuleVersion,
       startTime: startTimeIso,
       endTime: endTimeIso,
@@ -1314,6 +1539,15 @@ export class BacktestEngine {
       profitFactor,
       averageWinR,
       averageLossR,
+      costConfig: resolvedCostConfig,
+      netWinRate: strictNetSummary.netWinRate,
+      netAverageR: strictNetSummary.netAverageR,
+      netExpectancyR: strictNetSummary.netExpectancyR,
+      netProfitFactor: strictNetSummary.netProfitFactor,
+      netMaxDrawdownR: strictNetSummary.netMaxDrawdownR,
+      totalCostDragR: strictNetSummary.totalCostDragR,
+      avgCostDragPerTradeR: strictNetSummary.avgCostDragPerTradeR,
+      mtfHistoricalAligned,
       averageHoldingTime,
       averageHoldingTimeMs,
       averageHoldingBars,
@@ -1353,13 +1587,19 @@ export class BacktestEngine {
       exchange = 'binance_usdm',
       timeframe,
       klines,
+      higherTimeframeKlines,
+      costConfig: rawCostConfig,
       historicalOpenInterest,
       historicalFundingRates,
       provenance: rawProvenance,
       ruleVersion: customRuleVersion,
+      smcRuleProfile: rawRuleProfile,
     } = input;
 
-    const frozenRuleVersion = customRuleVersion || this.ruleVersion;
+    const resolvedRuleProfile = normalizeSmcRuleProfile(rawRuleProfile);
+    const resolvedCostConfig = normalizeTradingCostConfig(rawCostConfig);
+    const defaultProfileRuleVersion = `${getSmcRuleVersionForProfile(resolvedRuleProfile)}+${MARKET_SCAN_RULE_VERSION}`;
+    const frozenRuleVersion = customRuleVersion || defaultProfileRuleVersion;
     const provenance = enforceProvenanceIntegrity(rawProvenance);
     const backtestRunId =
       input.backtestRunId ||
@@ -1422,6 +1662,12 @@ export class BacktestEngine {
           profitFactor: null,
           maxDrawdownR: null,
           expectancyR: null,
+          netWinRate: null,
+          netAverageR: null,
+          netProfitFactor: null,
+          netMaxDrawdownR: null,
+          netExpectancyR: null,
+          totalCostDragR: null,
           averageHoldingTime: null,
           averageHoldingTimeMs: null,
           averageHoldingBars: null,
@@ -1438,6 +1684,17 @@ export class BacktestEngine {
       const visibleFunding = (historicalFundingRates ?? []).filter(
         (pt) => pt.timestamp <= windowEndCloseTime
       );
+      const visibleHigherTf: RunBacktestInput['higherTimeframeKlines'] | undefined =
+        higherTimeframeKlines
+          ? {
+              '1h': higherTimeframeKlines['1h']?.filter(
+                (k) => k.closeTime <= windowEndCloseTime
+              ),
+              '4h': higherTimeframeKlines['4h']?.filter(
+                (k) => k.closeTime <= windowEndCloseTime
+              ),
+            }
+          : undefined;
 
       const subRes = this.runDeterministicBacktest({
         backtestRunId: `${backtestRunId}_${stage.toLowerCase()}`,
@@ -1445,10 +1702,13 @@ export class BacktestEngine {
         exchange,
         timeframe,
         klines: confirmedKlines.slice(0, wEnd + 1),
+        higherTimeframeKlines: visibleHigherTf,
+        costConfig: resolvedCostConfig,
         historicalOpenInterest: visibleOi,
         historicalFundingRates: visibleFunding,
         provenance,
         ruleVersion: frozenRuleVersion,
+        smcRuleProfile: resolvedRuleProfile,
         evalStartIndex: wStart,
         evalEndIndex: wEnd,
       });
@@ -1492,6 +1752,12 @@ export class BacktestEngine {
         profitFactor: subRes.profitFactor ?? null,
         maxDrawdownR: subRes.maxDrawdownR ?? null,
         expectancyR: subRes.expectancyR ?? null,
+        netWinRate: subRes.netWinRate ?? null,
+        netAverageR: subRes.netAverageR ?? null,
+        netProfitFactor: subRes.netProfitFactor ?? null,
+        netMaxDrawdownR: subRes.netMaxDrawdownR ?? null,
+        netExpectancyR: subRes.netExpectancyR ?? null,
+        totalCostDragR: subRes.totalCostDragR ?? null,
         averageHoldingTime: subRes.averageHoldingTime ?? null,
         averageHoldingTimeMs: subRes.averageHoldingTimeMs ?? null,
         averageHoldingBars: subRes.averageHoldingBars ?? null,
@@ -1542,10 +1808,13 @@ export class BacktestEngine {
       exchange,
       timeframe,
       klines,
+      higherTimeframeKlines,
+      costConfig: resolvedCostConfig,
       historicalOpenInterest,
       historicalFundingRates,
       provenance,
       ruleVersion: frozenRuleVersion,
+      smcRuleProfile: resolvedRuleProfile,
     });
 
     if (confirmedKlines.length < MIN_CONFIRMED_BARS_FOR_WALK_FORWARD) {
@@ -1562,6 +1831,13 @@ export class BacktestEngine {
       fullReport.expectancyR = null;
       fullReport.profitFactor = null;
       fullReport.maxDrawdownR = null;
+      fullReport.netWinRate = null;
+      fullReport.netAverageR = null;
+      fullReport.netExpectancyR = null;
+      fullReport.netProfitFactor = null;
+      fullReport.netMaxDrawdownR = null;
+      fullReport.totalCostDragR = null;
+      fullReport.avgCostDragPerTradeR = null;
       fullReport.averageHoldingTime = null;
       fullReport.longCount = null;
       fullReport.shortCount = null;

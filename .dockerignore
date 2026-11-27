@@ -1,0 +1,9 @@
+node_modules
+dist
+data
+.env
+.aistudio
+public/screenshots
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

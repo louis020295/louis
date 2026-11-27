@@ -26,40 +26,78 @@ import {
   VenueSnapshotInput,
 } from './server/engine/CrossExchangeDivergenceEngine.ts';
 import {
+  BTC_BENCHMARK_SYMBOL,
+  computeBtcCorrelationAnalysis,
+  computeBtcCorrelationSummary,
+  evaluateBtcMarketRegime,
+} from './server/engine/BtcCorrelationEngine.ts';
+import { computeDerivativesStructure } from './server/engine/DerivativesStructureEngine.ts';
+import { computeKeyLevelsAndSession } from './server/engine/KeyLevelsSessionEngine.ts';
+import { computeMarketMicrostructure } from './server/engine/MicrostructureEngine.ts';
+import {
+  classifySymbolSector,
+  computeMarketBreadthAndSectors,
+} from './server/engine/SectorBreadthEngine.ts';
+import {
   DEFAULT_SCANNER_CONFIG,
   MARKET_SCAN_RULE_VERSION,
   runMarketScan,
 } from './server/engine/MarketScanner.ts';
-import { evaluateSmcStructure } from './server/engine/SmcRuleEngine.ts';
+import {
+  computeEntryZoneAnalysis,
+  evaluateSmcStructure,
+  normalizeSmcRuleProfile,
+} from './server/engine/SmcRuleEngine.ts';
+import { classifyTradeHorizon } from './server/engine/TradeHorizonClassifier.ts';
 import {
   evaluateHistoricalVolumeAnomaly,
   MAX_SANE_ROBUST_ZSCORE,
 } from './server/engine/VolumeAnomalyEngine.ts';
+import { AutoBacktestScheduler } from './server/services/AutoBacktestScheduler.ts';
 import { BackgroundScannerScheduler } from './server/services/BackgroundScannerScheduler.ts';
 import { BacktestService } from './server/services/BacktestService.ts';
+import {
+  ExternalEnvCredentials,
+  ExternalNotificationService,
+  FetchLike,
+} from './server/services/ExternalNotificationService.ts';
 import { generateGeminiExplanation } from './server/services/GeminiExplainService.ts';
 import { PaperShadowMonitor } from './server/services/PaperShadowMonitor.ts';
+import { PositionSentinelService } from './server/services/PositionSentinelService.ts';
 import { SignalOutcomeTracker } from './server/services/SignalOutcomeTracker.ts';
 import { SmcBatchScanService } from './server/services/SmcBatchScanService.ts';
+import { SystemWatchdogService } from './server/services/SystemWatchdogService.ts';
 import {
   DecisionTraceApiResponse,
   EvaluationAggregationMode,
   ExchangeId,
+  ExternalNotificationChannel,
   FullMarketGateStatistics,
   GeminiExplainRequest,
   HistoricalVolumeMetrics,
+  Kline,
   NotificationOutboxChannel,
   NotificationPayload,
+  PaperFillStatus,
   PaperMonitorReportWindow,
   PaperQualityWindow,
+  PaperStrategyTrack,
+  PortfolioBacktestResult,
+  PortfolioRiskConfig,
   ScanCategory,
+  ScannedCandidate,
   SmcActionState,
   SmcAnalysisResult,
   SmcEvaluationStatus,
+  SmcRuleProfile,
   SmcScanQueueConfig,
   SymbolDetailResponse,
   Timeframe,
+  TradingCostConfig,
   TRADING_SAFETY_FLAGS,
+  ValidationReadinessCriterion,
+  ValidationReadinessResponse,
+  WatchdogConfig,
 } from './src/types/market.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -71,6 +109,8 @@ export interface CreateAppOptions {
   customDbPath?: string;
   skipViteMiddleware?: boolean;
   smcQueueConfig?: Partial<SmcScanQueueConfig>;
+  customExternalFetch?: FetchLike;
+  customExternalEnv?: () => ExternalEnvCredentials;
 }
 
 export interface RegisteredRouteInfo {
@@ -211,6 +251,34 @@ export async function createApp(options: CreateAppOptions = {}) {
     smcBatchScanner,
   });
 
+  let latestLiveCandidates: ScannedCandidate[] = [];
+  const externalNotificationService = new ExternalNotificationService({
+    db,
+    fetchImpl: options.customExternalFetch,
+    envProvider: options.customExternalEnv,
+  });
+  const positionSentinel = new PositionSentinelService({
+    db,
+    adapters,
+    externalNotificationService,
+    disableWebSockets: Boolean(options.skipViteMiddleware || process.env.NODE_ENV === 'test'),
+  });
+  const autoBacktestScheduler = new AutoBacktestScheduler({
+    db,
+    backtestService,
+    getLatestCandidatesFn: () => latestLiveCandidates,
+    isExchangeBusyFn: (ex) => {
+      const st = smcBatchScanner.getStatus(ex);
+      return Boolean(st.runningCount > 0 && st.rateLimitedCount > 0);
+    },
+  });
+  const systemWatchdog = new SystemWatchdogService({
+    radarDb: db,
+    smcScanner: smcBatchScanner,
+    externalNotifications: externalNotificationService,
+  });
+  let latestPortfolioBacktestResult: PortfolioBacktestResult | null = null;
+
   function resolveAdapter(
     modeParam?: string,
     exchangeParam?: string
@@ -249,6 +317,11 @@ export async function createApp(options: CreateAppOptions = {}) {
       snapshot: Awaited<ReturnType<ExchangeAdapter['fetchMarketSnapshot']>>;
     }
   >();
+  const inFlightLiveSnapshotRequests = new Map<
+    ExchangeId,
+    Promise<Awaited<ReturnType<ExchangeAdapter['fetchMarketSnapshot']>>>
+  >();
+  const lastRecordedVolumeSnapshotKey = new Map<ExchangeId, string>();
 
   async function getOrFetchLiveSnapshot(
     adapter: ExchangeAdapter,
@@ -261,15 +334,30 @@ export async function createApp(options: CreateAppOptions = {}) {
       if (cached && Date.now() - cached.fetchedAtMs <= maxAgeMs) {
         return cached.snapshot;
       }
+      const inFlight = inFlightLiveSnapshotRequests.get(exchangeId);
+      if (inFlight) {
+        return inFlight;
+      }
     }
-    const snapshot = await adapter.fetchMarketSnapshot();
+    const fetchPromise = adapter.fetchMarketSnapshot().then((snapshot) => {
+      if (resolvedMode === 'live') {
+        recentLiveSnapshotCache.set(exchangeId, {
+          fetchedAtMs: Date.now(),
+          snapshot,
+        });
+      }
+      return snapshot;
+    });
     if (resolvedMode === 'live') {
-      recentLiveSnapshotCache.set(exchangeId, {
-        fetchedAtMs: Date.now(),
-        snapshot,
-      });
+      inFlightLiveSnapshotRequests.set(exchangeId, fetchPromise);
     }
-    return snapshot;
+    try {
+      return await fetchPromise;
+    } finally {
+      if (resolvedMode === 'live') {
+        inFlightLiveSnapshotRequests.delete(exchangeId);
+      }
+    }
   }
 
   // Health & Safety Policy Endpoint
@@ -292,6 +380,16 @@ export async function createApp(options: CreateAppOptions = {}) {
         isDemo: a.isDemo,
         status: a.status,
       })),
+    });
+  });
+
+  app.get('/healthz', (_req: Request, res: Response) => {
+    res.json({
+      ok: true,
+      uptimeSec: Math.round(process.uptime()),
+      safety: TRADING_SAFETY_FLAGS,
+      databasePath: db.dbPath,
+      watchdogRunning: systemWatchdog.getStatus().running,
     });
   });
 
@@ -325,37 +423,39 @@ export async function createApp(options: CreateAppOptions = {}) {
         adapter,
         exchangeId,
         resolvedMode,
-        2500
+        5000
       );
 
-      // Record snapshot into SQLite historical_volume_samples collector
-      db.recordTickerVolumeSnapshot(exchangeId, snapshot.tickers);
+      // Record snapshot into SQLite historical_volume_samples collector (skip duplicate writes for the exact same cached snapshot)
+      const snapshotKey = `${exchangeId}:${snapshot.provenance.fetchedAt}:${snapshot.tickers.length}`;
+      if (
+        resolvedMode === 'demo' ||
+        lastRecordedVolumeSnapshotKey.get(exchangeId) !== snapshotKey
+      ) {
+        db.recordTickerVolumeSnapshot(exchangeId, snapshot.tickers);
 
-      // Update any open paper trading ledger positions with latest prices
-      const priceMap = new Map<string, number>();
-      for (const t of snapshot.tickers) {
-        priceMap.set(t.symbol, t.lastPrice);
+        // Update any open paper trading ledger positions with latest prices
+        const priceMap = new Map<string, number>();
+        for (const t of snapshot.tickers) {
+          priceMap.set(t.symbol, t.lastPrice);
+        }
+        db.updateOpenPaperEntriesWithPrices(exchangeId, priceMap);
+        if (resolvedMode === 'live') {
+          lastRecordedVolumeSnapshotKey.set(exchangeId, snapshotKey);
+          smcBatchScanner.updateLatestMarketSnapshot(exchangeId, snapshot.tickers);
+        }
+      } else if (resolvedMode === 'live') {
+        smcBatchScanner.updateLatestMarketSnapshot(exchangeId, snapshot.tickers);
       }
-      db.updateOpenPaperEntriesWithPrices(exchangeId, priceMap);
 
       let historicalVolumeMap =
         resolvedMode === 'demo'
           ? buildDemoHistoricalVolumeMap()
           : db.getBulkHistoricalVolumeMap(exchangeId, 40, '15m');
 
-      const preScan = runMarketScan(snapshot.tickers, snapshot.provenance, {
-        minQuoteVolume24h,
-        mode: resolvedMode,
-        exchange: exchangeId,
-        volumeTimeframe: '15m',
-        historicalVolumeMap,
-      });
-      const radarScanDurationMs = Math.max(0, Date.now() - radarStartMs);
-      const lastFullRadarScanAt = new Date().toISOString();
-
       const currentQueueStats = db.getSmcScanQueueStats(exchangeId);
       const monitorWindowCompleted =
-        paperShadowMonitor.getStatus().windowStatus === 'COMPLETED' &&
+        paperShadowMonitor.getWindowStatusLight() === 'COMPLETED' &&
         currentQueueStats.evaluatedCount >= 400;
       const shouldPreserveLiveCycleSnapshot =
         resolvedMode === 'live' &&
@@ -364,9 +464,34 @@ export async function createApp(options: CreateAppOptions = {}) {
         currentQueueStats.totalJobs > 0 &&
         req.query.forceRefreshSmc !== 'true';
 
-      if (
+      const needPreScan =
+        resolvedMode === 'demo' ||
         (!monitorWindowCompleted && !shouldPreserveLiveCycleSnapshot) ||
-        req.query.forceRefreshSmc === 'true'
+        req.query.forceRefreshSmc === 'true';
+
+      const preScan = needPreScan
+        ? runMarketScan(snapshot.tickers, snapshot.provenance, {
+            minQuoteVolume24h,
+            mode: resolvedMode,
+            exchange: exchangeId,
+            volumeTimeframe: '15m',
+            historicalVolumeMap,
+          })
+        : null;
+      const radarScanDurationMs = Math.max(0, Date.now() - radarStartMs);
+      const lastFullRadarScanAt = new Date().toISOString();
+
+      if (resolvedMode === 'live') {
+        smcBatchScanner.setActiveForegroundExchange(exchangeId, resolvedMode);
+        smcBatchScanner.ensurePeriodicSyncForExchange(exchangeId);
+      } else {
+        smcBatchScanner.setActiveForegroundExchange('demo_synthetic', 'demo');
+      }
+
+      if (
+        preScan &&
+        ((!monitorWindowCompleted && !shouldPreserveLiveCycleSnapshot) ||
+          req.query.forceRefreshSmc === 'true')
       ) {
         smcBatchScanner.enqueueMarketUniverse({
           exchange: exchangeId,
@@ -376,20 +501,38 @@ export async function createApp(options: CreateAppOptions = {}) {
           radarScanDurationMs,
           lastFullRadarScanAt,
         });
+      }
 
+      if (
+        resolvedMode === 'live' &&
+        !options.skipViteMiddleware &&
+        process.env.NODE_ENV !== 'test' &&
+        req.query.autoStartSmc !== 'false'
+      ) {
+        const postEnqueueQueueStats = preScan
+          ? db.getSmcScanQueueStats(exchangeId)
+          : currentQueueStats;
+        const currentExWorkerState = smcBatchScanner.getWorkerState(exchangeId);
+        const hasPendingWork =
+          postEnqueueQueueStats.queuedCount > 0 ||
+          postEnqueueQueueStats.rateLimitedCount > 0 ||
+          (postEnqueueQueueStats.pendingCount > 0 &&
+            postEnqueueQueueStats.runningJobCount === 0);
         if (
-          resolvedMode === 'live' &&
-          !options.skipViteMiddleware &&
-          process.env.NODE_ENV !== 'test' &&
-          req.query.autoStartSmc !== 'false' &&
-          smcBatchScanner.getStatus(exchangeId, resolvedMode).workerState ===
-            'IDLE'
+          currentExWorkerState !== 'PAUSED' &&
+          hasPendingWork &&
+          (currentExWorkerState === 'IDLE' ||
+            !smcBatchScanner.isExchangeLoopActive(exchangeId))
         ) {
-          smcBatchScanner.resumeScan(exchangeId, resolvedMode, true);
+          smcBatchScanner.resumeScanLoopOnly(exchangeId, resolvedMode, {
+            delayMs: 250,
+          });
         }
       }
 
-      if (resolvedMode === 'demo') {
+      const demoKlinesMap = new Map<string, Partial<Record<Timeframe, Kline[]>>>();
+
+      if (resolvedMode === 'demo' && preScan) {
         for (const t of snapshot.tickers) {
           const preCandidate = preScan.candidates.find(
             (c) => c.symbol === t.symbol
@@ -401,6 +544,10 @@ export async function createApp(options: CreateAppOptions = {}) {
             adapter.fetchKlines(t.symbol, '1h', 90),
             adapter.fetchKlines(t.symbol, '4h', 90),
           ]);
+          demoKlinesMap.set(t.symbol, {
+            '15m': k15m.klines,
+            '1h': k1h.klines,
+          });
           const series15m = historicalVolumeMap.get(t.symbol) ?? [];
           const current15mVol =
             t.latestConfirmed15mQuoteVolume ??
@@ -481,6 +628,35 @@ export async function createApp(options: CreateAppOptions = {}) {
       const { smcMap: atomicSmcMap, status: atomicSmcStatus } =
         smcBatchScanner.getConsistentSmcScanState(exchangeId, resolvedMode);
 
+      if (
+        resolvedMode === 'live' &&
+        req.query.autoStartSmc !== 'false' &&
+        atomicSmcStatus.workerState !== 'PAUSED' &&
+        (req.query.refreshExpiredCache === 'true' ||
+          (!options.skipViteMiddleware &&
+            process.env.NODE_ENV !== 'test' &&
+            ((atomicSmcStatus.expiredCacheCount ?? 0) > 0 ||
+              (atomicSmcStatus.staleCacheCount ?? 0) > 0 ||
+              (atomicSmcStatus.prewarmRequiredCount ?? 0) > 0)))
+      ) {
+        const forceCacheRefresh = req.query.refreshExpiredCache === 'true';
+        setTimeout(() => {
+          void smcBatchScanner
+            .refreshExpiredCachesIfNeeded(exchangeId, {
+              maxSymbolsPerRun: 40,
+              force: forceCacheRefresh,
+            })
+            .catch(() => {});
+        }, 250);
+      }
+
+      const cachedKlinesMap =
+        resolvedMode === 'demo'
+          ? demoKlinesMap
+          : db.getBulkCachedClosedKlinesMap(exchangeId, ['15m', '1h'], 55);
+      const btcK15 = cachedKlinesMap.get(BTC_BENCHMARK_SYMBOL)?.['15m'] ?? [];
+      const btcK1h = cachedKlinesMap.get(BTC_BENCHMARK_SYMBOL)?.['1h'] ?? [];
+
       const scanResult = runMarketScan(snapshot.tickers, snapshot.provenance, {
         minQuoteVolume24h,
         mode: resolvedMode,
@@ -488,6 +664,8 @@ export async function createApp(options: CreateAppOptions = {}) {
         volumeTimeframe: '15m',
         historicalVolumeMap,
         smcMap: atomicSmcMap,
+        btcKlines15m: btcK15,
+        btcKlines1h: btcK1h,
       });
 
       if (minQuoteVolume24h <= 0) {
@@ -508,6 +686,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       scanResult.lastCompletedCycleDuration =
         atomicSmcStatus.lastCompletedCycleDuration;
       scanResult.statsConsistency = atomicSmcStatus.statsConsistency;
+      scanResult.snapshotConsistency = 'INDEPENDENT_ENDPOINT_SNAPSHOT';
       scanResult.databaseInstanceId = atomicSmcStatus.databaseInstanceId;
       scanResult.snapshotAt = atomicSmcStatus.snapshotAt;
       scanResult.statsVersion = atomicSmcStatus.statsVersion;
@@ -607,6 +786,8 @@ export async function createApp(options: CreateAppOptions = {}) {
         scanResult.formalCandidateLatencySla =
           atomicSmcStatus.formalCandidateLatencySla;
         scanResult.DEMO_LATENCY_FIXTURE = atomicSmcStatus.DEMO_LATENCY_FIXTURE;
+        scanResult.CONTROLLED_LIVE_FIXTURE =
+          atomicSmcStatus.CONTROLLED_LIVE_FIXTURE;
         scanResult.LIVE_FORMAL_CANDIDATE_COUNT =
           atomicSmcStatus.LIVE_FORMAL_CANDIDATE_COUNT ?? 0;
         scanResult.LIVE_FAST_LANE_COUNT =
@@ -616,6 +797,8 @@ export async function createApp(options: CreateAppOptions = {}) {
           atomicSmcStatus.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT ?? 0;
         scanResult.LIVE_ENTRY_WINDOW_MISSED_COUNT =
           atomicSmcStatus.LIVE_ENTRY_WINDOW_MISSED_COUNT ?? 0;
+        scanResult.LIVE_ENTRY_WINDOW_MISSED_RATE =
+          atomicSmcStatus.LIVE_ENTRY_WINDOW_MISSED_RATE ?? null;
         scanResult.LIVE_DETECTION_LATENCY_P50 =
           atomicSmcStatus.LIVE_DETECTION_LATENCY_P50 ?? null;
         scanResult.LIVE_DETECTION_LATENCY_P95 =
@@ -628,6 +811,22 @@ export async function createApp(options: CreateAppOptions = {}) {
           atomicSmcStatus.LIVE_BULK_DETECTION_LATENCY_P50 ?? null;
         scanResult.LIVE_BULK_DETECTION_LATENCY_P95 =
           atomicSmcStatus.LIVE_BULK_DETECTION_LATENCY_P95 ?? null;
+        scanResult.liveValidationStatus =
+          atomicSmcStatus.liveValidationStatus ?? 'NO_LIVE_FORMAL_CANDIDATE';
+        scanResult.liveSampleValidationStatus =
+          atomicSmcStatus.liveSampleValidationStatus ??
+          'LIVE_VALIDATION_INSUFFICIENT_SAMPLE';
+        scanResult.liveValidationStates =
+          atomicSmcStatus.liveValidationStates ?? [
+            'NO_LIVE_FORMAL_CANDIDATE',
+            'LIVE_VALIDATION_INSUFFICIENT_SAMPLE',
+          ];
+        scanResult.liveValidationMessage =
+          atomicSmcStatus.liveValidationMessage ??
+          '尚無真實 Live 候選，無法評估實盤捕捉延遲';
+        scanResult.isLiveValidated = atomicSmcStatus.isLiveValidated ?? false;
+        scanResult.signalQualityCalibration =
+          atomicSmcStatus.signalQualityCalibration;
         scanResult.smcGateDiagnostics =
           atomicSmcStatus.smcGateDiagnostics ?? scanResult.smcGateDiagnostics;
         scanResult.scopedGateStatistics =
@@ -744,17 +943,30 @@ export async function createApp(options: CreateAppOptions = {}) {
         scanResult.queueWaitP50 = atomicSmcStatus.queueWaitP50 ?? null;
         scanResult.queueWaitP95 = atomicSmcStatus.queueWaitP95 ?? null;
         scanResult.DEMO_LATENCY_FIXTURE = atomicSmcStatus.DEMO_LATENCY_FIXTURE;
+        scanResult.CONTROLLED_LIVE_FIXTURE =
+          atomicSmcStatus.CONTROLLED_LIVE_FIXTURE;
         scanResult.LIVE_FORMAL_CANDIDATE_COUNT = 0;
         scanResult.LIVE_FAST_LANE_COUNT = 0;
         scanResult.LIVE_BULK_COUNT = 0;
         scanResult.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT = 0;
         scanResult.LIVE_ENTRY_WINDOW_MISSED_COUNT = 0;
+        scanResult.LIVE_ENTRY_WINDOW_MISSED_RATE = null;
         scanResult.LIVE_DETECTION_LATENCY_P50 = null;
         scanResult.LIVE_DETECTION_LATENCY_P95 = null;
         scanResult.LIVE_FAST_LANE_DETECTION_LATENCY_P50 = null;
         scanResult.LIVE_FAST_LANE_DETECTION_LATENCY_P95 = null;
         scanResult.LIVE_BULK_DETECTION_LATENCY_P50 = null;
         scanResult.LIVE_BULK_DETECTION_LATENCY_P95 = null;
+        scanResult.liveValidationStatus = 'NO_LIVE_FORMAL_CANDIDATE';
+        scanResult.liveSampleValidationStatus =
+          'LIVE_VALIDATION_INSUFFICIENT_SAMPLE';
+        scanResult.liveValidationStates = [
+          'NO_LIVE_FORMAL_CANDIDATE',
+          'LIVE_VALIDATION_INSUFFICIENT_SAMPLE',
+        ];
+        scanResult.liveValidationMessage =
+          '尚無真實 Live 候選，無法評估實盤捕捉延遲';
+        scanResult.isLiveValidated = false;
         scanResult.candidateDetectedCount = demoCandCount;
         scanResult.eligiblePaperSignalCount = 0;
         scanResult.currentCyclePaperEligibleCount = 0;
@@ -861,6 +1073,104 @@ export async function createApp(options: CreateAppOptions = {}) {
           ],
         };
       }
+
+      // Attach informational BTC K-line overlap summary using preloaded cached/demo K-lines — zero extra HTTP calls
+      for (const candidateItem of scanResult.candidates) {
+        const symKlines = cachedKlinesMap.get(candidateItem.symbol);
+        const hasCached =
+          Boolean(symKlines?.['15m']?.length || symKlines?.['1h']?.length) &&
+          Boolean(btcK15.length || btcK1h.length);
+        candidateItem.btcCorrelation = computeBtcCorrelationSummary({
+          symbol: candidateItem.symbol,
+          symbolKlines15m: symKlines?.['15m'],
+          symbolKlines1h: symKlines?.['1h'],
+          btcKlines15m: btcK15,
+          btcKlines1h: btcK1h,
+          hasCachedData: hasCached,
+        });
+      }
+
+      const { marketBreadth, sectorRotation } = computeMarketBreadthAndSectors(
+        scanResult.candidates
+      );
+      scanResult.marketBreadth = marketBreadth;
+      scanResult.sectorRotation = sectorRotation;
+
+      if (resolvedMode === 'live' && !scanResult.isDemo) {
+        latestLiveCandidates = scanResult.candidates;
+        void externalNotificationService
+          .dispatchCandidates({
+            candidates: scanResult.candidates,
+            mode: 'live',
+            isDemo: false,
+          })
+          .catch(() => {
+            // isolated external notification dispatch error
+          });
+      }
+
+      const isCompact =
+        req.query.compact === '1' || req.query.compact === 'true';
+      if (isCompact) {
+        const compactCandidates = scanResult.candidates.map((c) => ({
+          symbol: c.symbol,
+          baseAsset: c.baseAsset,
+          quoteAsset: c.quoteAsset,
+          lastPrice: c.lastPrice,
+          priceChangePercent24h: c.priceChangePercent24h,
+          quoteVolume24h: c.quoteVolume24h,
+          fundingRate: c.fundingRate,
+          relativeBtcStrength: c.relativeBtcStrength,
+          score: c.score,
+          scoreCapApplied: c.scoreCapApplied,
+          marketRadarCategory: c.marketRadarCategory,
+          category: c.category,
+          finalTradeSignal: c.finalTradeSignal,
+          smcEvaluationStatus: c.smcEvaluationStatus,
+          smcActionState: c.smcActionState,
+          smcStatusReason: c.smcStatusReason,
+          nearMissStatus: c.nearMissStatus,
+          isLowLiquidity: c.isLowLiquidity,
+          extremeFunding: c.extremeFunding,
+          isFastLane: c.isFastLane,
+          intendedDirection: c.intendedDirection,
+          blockedReason: c.blockedReason,
+          provenance: c.provenance,
+          sector: c.sector,
+          historicalVolume: c.historicalVolume,
+          btcCorrelation: c.btcCorrelation,
+          earlyIgnition: c.earlyIgnition,
+          entryZoneSummary: c.entryZoneSummary,
+          tradeHorizon: c.tradeHorizon,
+          missingGates: c.missingGates,
+        }));
+        const compactSmcStatus = scanResult.smcScanStatus
+          ? {
+              ...scanResult.smcScanStatus,
+              pendingSymbols: [],
+              stuckJobs: [],
+              recentJobs: [],
+              slowestSymbolsTop20: [],
+              smcGateDiagnostics: undefined,
+              scopedGateStatistics: undefined,
+              observationShadowComparison: undefined,
+              candidateFunnel: undefined,
+              currentCycleFunnel: undefined,
+              latestSnapshotFunnel: undefined,
+              monitoringWindowFunnel: undefined,
+              cumulativeFunnel: undefined,
+              excludedSymbols: [],
+            }
+          : undefined;
+        res.json({
+          ...scanResult,
+          symbolFunnelDiagnostics: undefined,
+          candidates: compactCandidates,
+          smcScanStatus: compactSmcStatus,
+        });
+        return;
+      }
+
       res.json(scanResult);
     } catch (err) {
       const isUnavailable = err instanceof ExchangeApiUnavailableError;
@@ -1417,9 +1727,12 @@ export async function createApp(options: CreateAppOptions = {}) {
         return;
       }
 
-      const getCachedOrFetchTf = async (tf: Timeframe) => {
+      const getCachedOrFetchSymbolTf = async (
+        targetSymbol: string,
+        tf: Timeframe
+      ) => {
         if (resolvedMode === 'live' && req.query.refresh !== 'true') {
-          const cached = db.getSmcCandlesCache(exchangeId, symbol, tf);
+          const cached = db.getSmcCandlesCache(exchangeId, targetSymbol, tf);
           if (
             cached &&
             !cached.isExpired &&
@@ -1440,8 +1753,10 @@ export async function createApp(options: CreateAppOptions = {}) {
             };
           }
         }
-        return adapter.fetchKlines(symbol, tf, 90);
+        return adapter.fetchKlines(targetSymbol, tf, 90);
       };
+      const getCachedOrFetchTf = (tf: Timeframe) =>
+        getCachedOrFetchSymbolTf(symbol, tf);
       const getCachedOrFetchOi = async () => {
         if (resolvedMode === 'live' && req.query.refresh !== 'true') {
           const cached15m = db.getSmcCandlesCache(exchangeId, symbol, '15m');
@@ -1475,13 +1790,62 @@ export async function createApp(options: CreateAppOptions = {}) {
         return adapter.fetchOpenInterest(symbol, ticker.lastPrice);
       };
 
-      // Fetch Open Interest and 5m, 15m, 1h, 4h Klines in parallel (using fresh SQLite cache when available)
-      const [oiResult, k5m, k15m, k1h, k4h] = await Promise.all([
+      const shouldFetchBtcOverlay =
+        symbol !== BTC_BENCHMARK_SYMBOL &&
+        snapshot.tickers.some((t) => t.symbol === BTC_BENCHMARK_SYMBOL);
+
+      // Fetch Open Interest, 5m/15m/1h/4h Klines, Historical OI/Funding, Spot Ticker, Orderbook Depth, and BTCUSDT overlay in parallel
+      const [
+        oiResult,
+        k5m,
+        k15m,
+        k1h,
+        k4h,
+        oiHistResult,
+        fundingHistResult,
+        spotTickerResult,
+        orderbookResult,
+        btcK15m,
+        btcK1h,
+        btcKPrimaryExtra,
+      ] = await Promise.all([
         getCachedOrFetchOi(),
         getCachedOrFetchTf('5m'),
         getCachedOrFetchTf('15m'),
         getCachedOrFetchTf('1h'),
         getCachedOrFetchTf('4h'),
+        adapter.fetchHistoricalOpenInterest
+          ? adapter
+              .fetchHistoricalOpenInterest(symbol, primaryTimeframe, 48)
+              .catch(() => null)
+          : Promise.resolve(null),
+        adapter.fetchHistoricalFundingRates
+          ? adapter.fetchHistoricalFundingRates(symbol, 32).catch(() => null)
+          : Promise.resolve(null),
+        adapter.fetchSpotTicker
+          ? adapter.fetchSpotTicker(symbol).catch(() => null)
+          : Promise.resolve(null),
+        adapter.fetchOrderBookDepth
+          ? adapter.fetchOrderBookDepth(symbol, 50).catch(() => null)
+          : Promise.resolve(null),
+        shouldFetchBtcOverlay
+          ? getCachedOrFetchSymbolTf(BTC_BENCHMARK_SYMBOL, '15m').catch(
+              () => null
+            )
+          : Promise.resolve(null),
+        shouldFetchBtcOverlay
+          ? getCachedOrFetchSymbolTf(BTC_BENCHMARK_SYMBOL, '1h').catch(
+              () => null
+            )
+          : Promise.resolve(null),
+        shouldFetchBtcOverlay &&
+        primaryTimeframe !== '15m' &&
+        primaryTimeframe !== '1h'
+          ? getCachedOrFetchSymbolTf(
+              BTC_BENCHMARK_SYMBOL,
+              primaryTimeframe
+            ).catch(() => null)
+          : Promise.resolve(null),
       ]);
 
       // Persist confirmed 15m kline volumes into historical_volume_samples collector (strictly volumeTimeframe='15m')
@@ -1574,6 +1938,19 @@ export async function createApp(options: CreateAppOptions = {}) {
         dataFetchedAt: detailProvenance.fetchedAt,
       });
 
+      const btcDetailTicker = snapshot.tickers.find(
+        (t) => t.symbol === BTC_BENCHMARK_SYMBOL
+      );
+      const symbolBtcK15 =
+        symbol === BTC_BENCHMARK_SYMBOL ? k15m.klines : (btcK15m?.klines ?? []);
+      const symbolBtcK1h =
+        symbol === BTC_BENCHMARK_SYMBOL ? k1h.klines : (btcK1h?.klines ?? []);
+      const btcMarketRegime = evaluateBtcMarketRegime({
+        btcChange24h: btcDetailTicker?.priceChangePercent24h ?? null,
+        btcKlines15m: symbolBtcK15,
+        btcKlines1h: symbolBtcK1h,
+      });
+
       const finalScan = runMarketScan(snapshot.tickers, snapshot.provenance, {
         minQuoteVolume24h: 0,
         mode: resolvedMode,
@@ -1581,6 +1958,7 @@ export async function createApp(options: CreateAppOptions = {}) {
         volumeTimeframe: '15m',
         historicalVolumeMap: baseHistMap,
         smcMap,
+        btcMarketRegime,
       });
 
       const candidate = finalScan.candidates.find((c) => c.symbol === symbol)!;
@@ -1620,6 +1998,180 @@ export async function createApp(options: CreateAppOptions = {}) {
           candidate.provenance.missingData.push('openInterest');
         }
       }
+
+      const btcKlinesByTimeframe: Partial<Record<Timeframe, Kline[]>> =
+        symbol === BTC_BENCHMARK_SYMBOL
+          ? {
+              '5m': k5m.klines,
+              '15m': k15m.klines,
+              '1h': k1h.klines,
+              '4h': k4h.klines,
+            }
+          : {
+              '15m': btcK15m?.klines ?? [],
+              '1h': btcK1h?.klines ?? [],
+              ...(primaryTimeframe !== '15m' &&
+              primaryTimeframe !== '1h' &&
+              btcKPrimaryExtra?.klines
+                ? { [primaryTimeframe]: btcKPrimaryExtra.klines }
+                : {}),
+              ...(resolvedMode === 'live'
+                ? (() => {
+                    const extraCached: Partial<Record<Timeframe, Kline[]>> = {};
+                    if (primaryTimeframe !== '5m') {
+                      const c5 = db.getSmcCandlesCache(
+                        exchangeId,
+                        BTC_BENCHMARK_SYMBOL,
+                        '5m'
+                      );
+                      if (c5 && !c5.stale && !c5.fallback) {
+                        extraCached['5m'] = c5.klines;
+                      }
+                    }
+                    if (primaryTimeframe !== '4h') {
+                      const c4 = db.getSmcCandlesCache(
+                        exchangeId,
+                        BTC_BENCHMARK_SYMBOL,
+                        '4h'
+                      );
+                      if (c4 && !c4.stale && !c4.fallback) {
+                        extraCached['4h'] = c4.klines;
+                      }
+                    }
+                    return extraCached;
+                  })()
+                : {}),
+            };
+
+      const btcCorrelation = computeBtcCorrelationAnalysis({
+        symbol,
+        primaryTimeframe,
+        symbolKlinesByTimeframe: {
+          '5m': k5m.klines,
+          '15m': k15m.klines,
+          '1h': k1h.klines,
+          '4h': k4h.klines,
+        },
+        btcKlinesByTimeframe,
+        evaluatedAt,
+      });
+
+      candidate.btcCorrelation = {
+        isBenchmark: btcCorrelation.isBenchmark,
+        status: btcCorrelation.status,
+        tier: btcCorrelation.tier,
+        tierLabelZh: btcCorrelation.tierLabelZh,
+        primaryTimeframe: btcCorrelation.primaryTimeframe,
+        pearson15m: btcCorrelation.pearson15m,
+        directionalOverlap15m: btcCorrelation.directionalOverlap15m,
+        downsideOverlap15m: btcCorrelation.downsideOverlap15m,
+        beta15m: btcCorrelation.beta15m,
+        alignedBars15m: btcCorrelation.alignedBars15m,
+        pearson1h: btcCorrelation.pearson1h,
+        directionalOverlap1h: btcCorrelation.directionalOverlap1h,
+        downsideOverlap1h: btcCorrelation.downsideOverlap1h,
+        beta1h: btcCorrelation.beta1h,
+        alignedBars1h: btcCorrelation.alignedBars1h,
+      };
+
+      candidate.sector = classifySymbolSector(
+        candidate.baseAsset,
+        candidate.symbol
+      );
+
+      const primaryKlines =
+        primaryTimeframe === '5m'
+          ? k5m.klines
+          : primaryTimeframe === '1h'
+            ? k1h.klines
+            : primaryTimeframe === '4h'
+              ? k4h.klines
+              : k15m.klines;
+
+      const derivativesStructure = computeDerivativesStructure({
+        symbol,
+        timeframe: primaryTimeframe,
+        lastPrice: candidate.lastPrice,
+        atr14: smcAnalysis.atr14,
+        klines: primaryKlines,
+        oiSeries: oiHistResult?.series ?? [],
+        fundingSeries: fundingHistResult?.series ?? [],
+        currentOiValue: oiResult.openInterestValue,
+        currentFundingRate: candidate.fundingRate,
+        evaluatedAt,
+      });
+
+      const microstructure = computeMarketMicrostructure({
+        symbol,
+        perpPrice: candidate.lastPrice,
+        perpQuoteVolume24h: candidate.quoteVolume24h,
+        spotTicker: spotTickerResult,
+        orderbook: orderbookResult,
+        evaluatedAt,
+      });
+
+      const keyLevelsSession = computeKeyLevelsAndSession({
+        symbol,
+        primaryTimeframe,
+        lastPrice: candidate.lastPrice,
+        primaryKlines,
+        klines1h: k1h.klines,
+        klines4h: k4h.klines,
+        nextFundingTime: ticker.nextFundingTime,
+        evaluatedAt,
+      });
+
+      const entryZoneDir: 'LONG' | 'SHORT' | 'NEUTRAL' =
+        candidate.intendedDirection && candidate.intendedDirection !== 'NEUTRAL'
+          ? candidate.intendedDirection
+          : smcAnalysis.intendedDirection &&
+              smcAnalysis.intendedDirection !== 'NEUTRAL'
+            ? smcAnalysis.intendedDirection
+            : smcAnalysis.earlyInflection?.direction ?? 'NEUTRAL';
+
+      const entryZoneAnalysis = computeEntryZoneAnalysis({
+        direction: entryZoneDir,
+        currentPrice: candidate.lastPrice,
+        atr14: smcAnalysis.atr14,
+        fvg: smcAnalysis.fvg,
+        orderBlock: smcAnalysis.orderBlock,
+        liquiditySweep: smcAnalysis.liquiditySweep,
+        intradayVwap: keyLevelsSession.vwap,
+        pdh: keyLevelsSession.pdh,
+        pdl: keyLevelsSession.pdl,
+      });
+
+      const tradeHorizon = classifyTradeHorizon({
+        smcActionState: smcAnalysis.actionState,
+        intendedDirection: entryZoneDir,
+        mtfAlignment: smcAnalysis.mtfAlignment,
+        atrPercent: smcAnalysis.atrPercent,
+        priceChangePercent24h: candidate.priceChangePercent24h,
+        quoteVolume24h: candidate.quoteVolume24h,
+        fundingRate: candidate.fundingRate,
+        entryZoneAnalysis,
+        earlyIgnition: candidate.earlyIgnition ?? null,
+        bosOrMssDetected: smcAnalysis.bosOrMss.detected,
+        displacementDetected: smcAnalysis.displacement.detected,
+        rvol:
+          candidate.historicalVolume.status === 'READY'
+            ? candidate.historicalVolume.rvol
+            : null,
+      });
+
+      smcAnalysis.entryZoneAnalysis = entryZoneAnalysis;
+      smcAnalysis.tradeHorizon = tradeHorizon;
+      candidate.entryZoneSummary = entryZoneAnalysis;
+      candidate.tradeHorizon = tradeHorizon;
+
+      const trimmedBtcKlinesByTimeframe: Partial<Record<Timeframe, Kline[]>> =
+        {};
+      (['5m', '15m', '1h', '4h'] as Timeframe[]).forEach((tfKey) => {
+        const arr = btcKlinesByTimeframe[tfKey];
+        if (arr && arr.length > 0) {
+          trimmedBtcKlinesByTimeframe[tfKey] = arr.slice(-60);
+        }
+      });
 
       const responsePayload: SymbolDetailResponse = {
         safety: TRADING_SAFETY_FLAGS,
@@ -1663,6 +2215,14 @@ export async function createApp(options: CreateAppOptions = {}) {
           },
         },
         smcAnalysis,
+        entryZoneAnalysis,
+        tradeHorizon,
+        btcCorrelation,
+        derivativesStructure,
+        microstructure,
+        keyLevelsSession,
+        btcKlinesByTimeframe: trimmedBtcKlinesByTimeframe,
+        btcMarketRegime,
         provenance: detailProvenance,
       };
 
@@ -1937,6 +2497,383 @@ export async function createApp(options: CreateAppOptions = {}) {
     });
   });
 
+  // 5B. External Notification Channels (Telegram Bot & Discord Webhook, Strictly PAPER ONLY)
+  app.get('/api/notify/external/status', (_req: Request, res: Response) => {
+    res.json(externalNotificationService.getStatus(40));
+  });
+
+  app.post('/api/notify/external/config', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: {
+      telegramEnabled?: boolean;
+      discordEnabled?: boolean;
+      notifyFormalSmc?: boolean;
+      notifyEarlyIgnition?: boolean;
+    } = {};
+    if (typeof body.telegramEnabled === 'boolean') {
+      patch.telegramEnabled = body.telegramEnabled;
+    }
+    if (typeof body.discordEnabled === 'boolean') {
+      patch.discordEnabled = body.discordEnabled;
+    }
+    if (typeof body.notifyFormalSmc === 'boolean') {
+      patch.notifyFormalSmc = body.notifyFormalSmc;
+    }
+    if (typeof body.notifyEarlyIgnition === 'boolean') {
+      patch.notifyEarlyIgnition = body.notifyEarlyIgnition;
+    }
+    res.json(externalNotificationService.updateConfig(patch));
+  });
+
+  app.post(
+    '/api/notify/external/test',
+    async (req: Request, res: Response) => {
+      const body = (req.body ?? {}) as {
+        channel?: string;
+        symbol?: string;
+      };
+      const rawChannel = String(body.channel || '').toUpperCase();
+      if (rawChannel !== 'TELEGRAM' && rawChannel !== 'DISCORD') {
+        res.status(400).json({
+          error: '不支援的外部通知通道，請選擇 TELEGRAM 或 DISCORD',
+        });
+        return;
+      }
+      const channel = rawChannel as ExternalNotificationChannel;
+      const result = await externalNotificationService.sendTestNotification(
+        channel,
+        typeof body.symbol === 'string' ? body.symbol : 'BTCUSDT'
+      );
+      res.json(result);
+    }
+  );
+
+  // 5C. Auto-Backtest Scheduler Endpoints
+  app.get('/api/auto-backtest/status', (_req: Request, res: Response) => {
+    res.json(autoBacktestScheduler.getStatus());
+  });
+
+  app.post('/api/auto-backtest/config', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    if (typeof body.enabled === 'boolean') {
+      patch.enabled = body.enabled;
+    }
+    if (
+      typeof body.intervalMs === 'number' &&
+      Number.isFinite(body.intervalMs)
+    ) {
+      patch.intervalMs = body.intervalMs;
+    }
+    if (
+      typeof body.timeframe === 'string' &&
+      ['5m', '15m', '1h', '4h'].includes(body.timeframe)
+    ) {
+      patch.timeframe = body.timeframe;
+    }
+    if (
+      typeof body.maxSymbolsPerRun === 'number' &&
+      Number.isFinite(body.maxSymbolsPerRun)
+    ) {
+      patch.maxSymbolsPerRun = body.maxSymbolsPerRun;
+    }
+    if (typeof body.includeWatchlist === 'boolean') {
+      patch.includeWatchlist = body.includeWatchlist;
+    }
+    if (Array.isArray(body.watchlistSymbols)) {
+      patch.watchlistSymbols = body.watchlistSymbols.map((s) => String(s));
+    }
+    if (
+      typeof body.exchange === 'string' &&
+      body.exchange in adapters &&
+      body.exchange !== 'demo_synthetic'
+    ) {
+      patch.exchange = body.exchange;
+    }
+    res.json(autoBacktestScheduler.updateConfig(patch));
+  });
+
+  app.post(
+    '/api/auto-backtest/run-now',
+    async (req: Request, res: Response) => {
+      const body = (req.body ?? {}) as {
+        mode?: 'live' | 'demo';
+        exchange?: ExchangeId;
+        symbols?: string[];
+      };
+      const batch = await autoBacktestScheduler.runBatchOnce({
+        force: true,
+        mode: body.mode === 'demo' ? 'demo' : 'live',
+        exchange: body.exchange,
+        overrideSymbols: Array.isArray(body.symbols)
+          ? body.symbols.map((s) => String(s))
+          : undefined,
+      });
+      res.json({
+        safety: TRADING_SAFETY_FLAGS,
+        batch,
+        status: autoBacktestScheduler.getStatus(),
+      });
+    }
+  );
+
+  // 5d. Position Sentinel: Active Trade Live Trend & Reversal Guardian Endpoints
+  app.get('/api/position-sentinel/status', (_req: Request, res: Response) => {
+    res.json(positionSentinel.getStatus());
+  });
+
+  app.get('/api/position-sentinel/stream', (req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const sendSnapshot = (status: unknown) => {
+      try {
+        res.write(`data: ${JSON.stringify(status)}\n\n`);
+      } catch {
+        // ignore closed stream write
+      }
+    };
+
+    sendSnapshot(positionSentinel.getStatus());
+    const unsub = positionSentinel.subscribe(sendSnapshot);
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': keepalive\n\n');
+      } catch {
+        // ignore
+      }
+    }, 20_000);
+    heartbeat.unref?.();
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unsub();
+    });
+  });
+
+  app.post(
+    '/api/position-sentinel/positions',
+    async (req: Request, res: Response) => {
+      const body = (req.body ?? {}) as {
+        symbol?: string;
+        exchange?: string;
+        side?: string;
+        timeframe?: string;
+        entryPrice?: number;
+        invalidationPrice?: number;
+        targetPrice?: number | null;
+        leverage?: number;
+        notes?: string;
+        evaluateNow?: boolean;
+      };
+      const rawSymbol = String(body.symbol ?? '').trim().toUpperCase();
+      if (!/^[A-Z0-9]{2,24}$/.test(rawSymbol)) {
+        res.status(400).json({
+          safety: TRADING_SAFETY_FLAGS,
+          error: '標的代號格式無效 (例：BTCUSDT)',
+        });
+        return;
+      }
+      const rawEx = String(body.exchange ?? 'binance_usdm');
+      if (!(rawEx in adapters)) {
+        res.status(400).json({
+          safety: TRADING_SAFETY_FLAGS,
+          error: '不支援的交易所參數',
+        });
+        return;
+      }
+      const entryPrice = Number(body.entryPrice);
+      const invalidationPrice = Number(body.invalidationPrice);
+      if (
+        !Number.isFinite(entryPrice) ||
+        entryPrice <= 0 ||
+        !Number.isFinite(invalidationPrice) ||
+        invalidationPrice <= 0
+      ) {
+        res.status(400).json({
+          safety: TRADING_SAFETY_FLAGS,
+          error: '進場價與失效防線價 (SL) 必須為大於 0 的有效數值',
+        });
+        return;
+      }
+      const side = body.side === 'SHORT' ? 'SHORT' : 'LONG';
+      const tf =
+        typeof body.timeframe === 'string' &&
+        ['5m', '15m', '1h', '4h'].includes(body.timeframe)
+          ? (body.timeframe as '5m' | '15m' | '1h' | '4h')
+          : '15m';
+      const targetPrice =
+        body.targetPrice !== null &&
+        body.targetPrice !== undefined &&
+        Number.isFinite(Number(body.targetPrice)) &&
+        Number(body.targetPrice) > 0
+          ? Number(body.targetPrice)
+          : null;
+      const leverage =
+        body.leverage !== undefined && Number.isFinite(Number(body.leverage))
+          ? Math.max(1, Math.min(125, Number(body.leverage)))
+          : 1;
+
+      const created = positionSentinel.addPosition({
+        symbol: rawSymbol,
+        exchange: rawEx as ExchangeId,
+        side,
+        timeframe: tf,
+        entryPrice,
+        invalidationPrice,
+        targetPrice,
+        leverage,
+        notes: typeof body.notes === 'string' ? body.notes : '',
+      });
+      if (body.evaluateNow !== false) {
+        await positionSentinel.runEvaluationCycle();
+      }
+      res.json({
+        safety: TRADING_SAFETY_FLAGS,
+        position: created,
+        status: positionSentinel.getStatus(),
+      });
+    }
+  );
+
+  app.patch(
+    '/api/position-sentinel/positions/:id',
+    async (req: Request, res: Response) => {
+      const id = String(req.params.id || '').trim();
+      const body = (req.body ?? {}) as {
+        invalidationPrice?: number;
+        targetPrice?: number | null;
+        leverage?: number;
+        paused?: boolean;
+        active?: boolean;
+        notes?: string;
+        syncPaperLedger?: boolean;
+      };
+      const updated = positionSentinel.updatePosition(id, {
+        invalidationPrice:
+          body.invalidationPrice !== undefined
+            ? Number(body.invalidationPrice)
+            : undefined,
+        targetPrice:
+          body.targetPrice === null
+            ? null
+            : body.targetPrice !== undefined
+              ? Number(body.targetPrice)
+              : undefined,
+        leverage:
+          body.leverage !== undefined ? Number(body.leverage) : undefined,
+        paused: typeof body.paused === 'boolean' ? body.paused : undefined,
+        active: typeof body.active === 'boolean' ? body.active : undefined,
+        notes: typeof body.notes === 'string' ? body.notes : undefined,
+      });
+      if (!updated) {
+        res.status(404).json({
+          safety: TRADING_SAFETY_FLAGS,
+          error: `找不到追蹤持倉 ${id}`,
+        });
+        return;
+      }
+      if (
+        body.syncPaperLedger &&
+        updated.sourceType === 'PAPER_LEDGER' &&
+        updated.paperLedgerId !== null &&
+        body.invalidationPrice !== undefined &&
+        Number.isFinite(Number(body.invalidationPrice)) &&
+        Number(body.invalidationPrice) > 0
+      ) {
+        db.updatePaperLedgerInvalidation(
+          updated.paperLedgerId,
+          Number(body.invalidationPrice)
+        );
+      }
+      await positionSentinel.runEvaluationCycle();
+      res.json({
+        safety: TRADING_SAFETY_FLAGS,
+        position: updated,
+        status: positionSentinel.getStatus(),
+      });
+    }
+  );
+
+  app.delete(
+    '/api/position-sentinel/positions/:id',
+    (req: Request, res: Response) => {
+      const id = String(req.params.id || '').trim();
+      const deleted = positionSentinel.deletePosition(id);
+      if (!deleted) {
+        res.status(404).json({
+          safety: TRADING_SAFETY_FLAGS,
+          error: `找不到追蹤持倉 ${id}`,
+        });
+        return;
+      }
+      res.json({
+        safety: TRADING_SAFETY_FLAGS,
+        deleted: true,
+        status: positionSentinel.getStatus(),
+      });
+    }
+  );
+
+  app.post(
+    '/api/position-sentinel/import-paper',
+    async (_req: Request, res: Response) => {
+      const syncRes = positionSentinel.syncPaperLedgerNow();
+      await positionSentinel.runEvaluationCycle();
+      res.json({
+        safety: TRADING_SAFETY_FLAGS,
+        ...syncRes,
+        status: positionSentinel.getStatus(),
+      });
+    }
+  );
+
+  app.post(
+    '/api/position-sentinel/check-now',
+    async (_req: Request, res: Response) => {
+      const status = await positionSentinel.runEvaluationCycle();
+      res.json(status);
+    }
+  );
+
+  app.post('/api/position-sentinel/config', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const key of [
+      'enabled',
+      'autoSyncPaperLedger',
+      'wsStreamEnabled',
+      'notifyDiscord',
+      'notifyTelegram',
+    ]) {
+      if (typeof body[key] === 'boolean') {
+        patch[key] = body[key];
+      }
+    }
+    for (const key of [
+      'pollIntervalMs',
+      'atrShockMultiplier',
+      'rvolSpikeThreshold',
+      'stopProximityPct',
+      'alertCooldownMs',
+    ]) {
+      if (typeof body[key] === 'number' && Number.isFinite(body[key])) {
+        patch[key] = body[key];
+      }
+    }
+    if (body.notifyMinSeverity === 'CRITICAL' || body.notifyMinSeverity === 'WARNING') {
+      patch.notifyMinSeverity = body.notifyMinSeverity;
+    }
+    const config = positionSentinel.updateConfig(patch);
+    res.json({
+      safety: TRADING_SAFETY_FLAGS,
+      config,
+      status: positionSentinel.getStatus(),
+    });
+  });
+
   // 6. Lookahead-Free Deterministic & Walk-Forward Backtest Endpoints + SQLite Persistence
   app.get('/api/backtest/reports', (_req: Request, res: Response) => {
     res.json({
@@ -1972,7 +2909,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       barLimit = 120,
       includeWalkForward = true,
       writeToPaperLedger = false,
+      costConfig,
       ruleVersion,
+      smcRuleProfile,
       omitHistoricalOiAndFunding = false,
     } = (req.body ?? {}) as {
       symbol?: string;
@@ -1982,7 +2921,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       barLimit?: number;
       includeWalkForward?: boolean;
       writeToPaperLedger?: boolean;
+      costConfig?: Partial<TradingCostConfig>;
       ruleVersion?: string;
+      smcRuleProfile?: SmcRuleProfile;
       omitHistoricalOiAndFunding?: boolean;
     };
 
@@ -1995,7 +2936,9 @@ export async function createApp(options: CreateAppOptions = {}) {
         barLimit,
         includeWalkForward,
         writeToPaperLedger: Boolean(writeToPaperLedger),
+        costConfig,
         ruleVersion,
+        smcRuleProfile: normalizeSmcRuleProfile(smcRuleProfile),
         omitHistoricalOiAndFunding: Boolean(omitHistoricalOiAndFunding),
       });
 
@@ -2022,7 +2965,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       exchange,
       barLimit = 120,
       writeToPaperLedger = false,
+      costConfig,
       ruleVersion,
+      smcRuleProfile,
       omitHistoricalOiAndFunding = false,
     } = (req.body ?? {}) as {
       symbol?: string;
@@ -2031,7 +2976,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       exchange?: string;
       barLimit?: number;
       writeToPaperLedger?: boolean;
+      costConfig?: Partial<TradingCostConfig>;
       ruleVersion?: string;
+      smcRuleProfile?: SmcRuleProfile;
       omitHistoricalOiAndFunding?: boolean;
     };
 
@@ -2045,7 +2992,9 @@ export async function createApp(options: CreateAppOptions = {}) {
           barLimit,
           includeWalkForward: true,
           writeToPaperLedger: Boolean(writeToPaperLedger),
+          costConfig,
           ruleVersion,
+          smcRuleProfile: normalizeSmcRuleProfile(smcRuleProfile),
           omitHistoricalOiAndFunding: Boolean(omitHistoricalOiAndFunding),
         });
 
@@ -2069,11 +3018,106 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
   });
 
+  app.post('/api/backtest/portfolio', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as {
+      symbols?: unknown;
+      timeframe?: Timeframe;
+      mode?: string;
+      exchange?: string;
+      barLimit?: number;
+      smcRuleProfile?: SmcRuleProfile;
+      costConfig?: Partial<TradingCostConfig>;
+      riskConfig?: Partial<PortfolioRiskConfig>;
+    };
+
+    const rawSymbols = Array.isArray(body.symbols) ? body.symbols : [];
+    const symbols = rawSymbols
+      .map((s) => String(s ?? '').trim().toUpperCase())
+      .filter((s) => /^[A-Z0-9]{4,20}$/.test(s))
+      .slice(0, 15);
+
+    try {
+      const resolvedProfile = normalizeSmcRuleProfile(body.smcRuleProfile);
+      const result = await backtestService.runPortfolioBenchmarkBacktest({
+        symbols: symbols.length > 0 ? symbols : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+        timeframe: body.timeframe,
+        mode: body.mode,
+        exchange: body.exchange,
+        barLimit: body.barLimit,
+        smcRuleProfile: resolvedProfile,
+        costConfig: body.costConfig,
+        riskConfig: body.riskConfig,
+      });
+      if (!result.isDemo && resolvedProfile === 'STRICT_PRODUCTION') {
+        latestPortfolioBacktestResult = result;
+      }
+      res.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '組合回測執行失敗';
+      res.status(503).json({
+        mode: 'live',
+        isDemo: false,
+        fallback: false,
+        error: '即時資料不可用',
+        apiError: '即時資料不可用',
+        apiErrorDetail: msg,
+        safety: TRADING_SAFETY_FLAGS,
+      });
+    }
+  });
+
+  app.post('/api/backtest/ab-compare', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as {
+      symbols?: unknown;
+      timeframe?: Timeframe;
+      mode?: string;
+      exchange?: string;
+      barLimit?: number;
+      costConfig?: Partial<TradingCostConfig>;
+      riskConfig?: Partial<PortfolioRiskConfig>;
+    };
+
+    const rawSymbols = Array.isArray(body.symbols) ? body.symbols : [];
+    const symbols = rawSymbols
+      .map((s) => String(s ?? '').trim().toUpperCase())
+      .filter((s) => /^[A-Z0-9]{4,20}$/.test(s))
+      .slice(0, 15);
+
+    try {
+      const comparison = await backtestService.runSmcAbComparison({
+        symbols:
+          symbols.length > 0
+            ? symbols
+            : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'],
+        timeframe: body.timeframe,
+        mode: body.mode,
+        exchange: body.exchange,
+        barLimit: body.barLimit,
+        costConfig: body.costConfig,
+        riskConfig: body.riskConfig,
+      });
+      res.json(comparison);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'A/B 規則對比回測執行失敗';
+      res.status(503).json({
+        mode: 'live',
+        isDemo: false,
+        fallback: false,
+        error: '即時資料不可用',
+        apiError: '即時資料不可用',
+        apiErrorDetail: msg,
+        safety: TRADING_SAFETY_FLAGS,
+      });
+    }
+  });
+
   // 7. Paper Trading Ledger Endpoints (Strictly PAPER ONLY / LIVE ORDERS DISABLED)
   app.get('/api/paper-ledger', (_req: Request, res: Response) => {
     res.json({
       safety: TRADING_SAFETY_FLAGS,
       entries: db.listPaperLedgerEntries(100),
+      trackComparisonLive: db.getPaperTrackComparisonStats(false),
+      trackComparisonAll: db.getPaperTrackComparisonStats(true),
     });
   });
 
@@ -2085,6 +3129,10 @@ export async function createApp(options: CreateAppOptions = {}) {
       side?: 'LONG' | 'SHORT';
       category?: ScanCategory;
       actionState?: SmcActionState;
+      strategyTrack?: PaperStrategyTrack;
+      fillStatus?: PaperFillStatus;
+      entryAnchorLabel?: string | null;
+      ttlMinutes?: number | null;
       entryPrice?: number;
       invalidationPrice?: number;
       targetPrice?: number;
@@ -2092,6 +3140,8 @@ export async function createApp(options: CreateAppOptions = {}) {
       evidences?: string[];
       notes?: string;
       provenance?: SymbolDetailResponse['provenance'];
+      entryZoneStatus?: string;
+      allowOverextendedMarketEntry?: boolean;
     };
 
     if (
@@ -2108,6 +3158,42 @@ export async function createApp(options: CreateAppOptions = {}) {
       return;
     }
 
+    const allowedTracks: PaperStrategyTrack[] = [
+      'EARLY_IGNITION',
+      'FORMAL_SMC_MARKET',
+      'SMC_PULLBACK_LIMIT',
+      'MANUAL_OBSERVATION',
+    ];
+    const safeTrack =
+      body.strategyTrack && allowedTracks.includes(body.strategyTrack)
+        ? body.strategyTrack
+        : undefined;
+    const safeFillStatus: PaperFillStatus | undefined =
+      body.fillStatus === 'WAITING_LIMIT' || body.fillStatus === 'FILLED'
+        ? body.fillStatus
+        : undefined;
+
+    if (
+      body.entryZoneStatus === 'OVEREXTENDED' &&
+      safeFillStatus !== 'WAITING_LIMIT' &&
+      !body.allowOverextendedMarketEntry
+    ) {
+      res.status(400).json({
+        error:
+          '反追價保護攔截：目前價格已過度延伸 (OVEREXTENDED)，請改用 FVG/OB 回踩限價掛單 (WAITING_LIMIT)，或明確確認承受追高風險。',
+        code: 'OVEREXTENDED_MARKET_ENTRY_BLOCKED',
+        safety: TRADING_SAFETY_FLAGS,
+      });
+      return;
+    }
+
+    const safeTtlMinutes =
+      typeof body.ttlMinutes === 'number' &&
+      Number.isFinite(body.ttlMinutes) &&
+      body.ttlMinutes > 0
+        ? Math.min(10080, Math.max(15, Math.round(body.ttlMinutes)))
+        : undefined;
+
     const entry = db.addPaperLedgerEntry({
       symbol: body.symbol.toUpperCase(),
       exchange: body.exchange ?? 'binance_usdm',
@@ -2115,6 +3201,13 @@ export async function createApp(options: CreateAppOptions = {}) {
       side: body.side ?? 'LONG',
       category: body.category ?? '多頭候選',
       actionState: body.actionState ?? 'LONG CANDIDATE',
+      strategyTrack: safeTrack,
+      fillStatus: safeFillStatus,
+      entryAnchorLabel:
+        typeof body.entryAnchorLabel === 'string'
+          ? body.entryAnchorLabel.slice(0, 120)
+          : null,
+      ttlMinutes: safeTtlMinutes,
       entryPrice: Number(body.entryPrice),
       invalidationPrice: Number(body.invalidationPrice),
       targetPrice: Number(body.targetPrice),
@@ -2124,10 +3217,39 @@ export async function createApp(options: CreateAppOptions = {}) {
       provenance: body.provenance,
     });
 
+    if (db.getPositionSentinelConfig().autoSyncPaperLedger) {
+      positionSentinel.syncPaperLedgerNow();
+    }
+
     res.json({
       safety: TRADING_SAFETY_FLAGS,
       entry,
       entries: db.listPaperLedgerEntries(100),
+      trackComparisonLive: db.getPaperTrackComparisonStats(false),
+      trackComparisonAll: db.getPaperTrackComparisonStats(true),
+    });
+  });
+
+  app.post('/api/paper-ledger/:id/extend-ttl', (req: Request, res: Response) => {
+    const id = Number(req.params.id);
+    const { extraMinutes } = (req.body || {}) as { extraMinutes?: number };
+    const safeExtra =
+      typeof extraMinutes === 'number' &&
+      Number.isFinite(extraMinutes) &&
+      extraMinutes > 0
+        ? Math.min(1440, Math.max(15, Math.round(extraMinutes)))
+        : 120;
+    const updated = db.extendPaperLimitTtl(id, safeExtra);
+    if (!updated) {
+      res.status(404).json({ error: `找不到紙上紀錄 #${id}` });
+      return;
+    }
+    res.json({
+      safety: TRADING_SAFETY_FLAGS,
+      entry: updated,
+      entries: db.listPaperLedgerEntries(100),
+      trackComparisonLive: db.getPaperTrackComparisonStats(false),
+      trackComparisonAll: db.getPaperTrackComparisonStats(true),
     });
   });
 
@@ -2142,10 +3264,15 @@ export async function createApp(options: CreateAppOptions = {}) {
       res.status(404).json({ error: `找不到紙上紀錄 #${id}` });
       return;
     }
+    if (db.getPositionSentinelConfig().autoSyncPaperLedger) {
+      positionSentinel.syncPaperLedgerNow();
+    }
     res.json({
       safety: TRADING_SAFETY_FLAGS,
       entry: updated,
       entries: db.listPaperLedgerEntries(100),
+      trackComparisonLive: db.getPaperTrackComparisonStats(false),
+      trackComparisonAll: db.getPaperTrackComparisonStats(true),
     });
   });
 
@@ -2195,7 +3322,38 @@ export async function createApp(options: CreateAppOptions = {}) {
       modeParam,
       exchangeParam
     );
-    res.json(smcBatchScanner.getStatus(exchangeId, resolvedMode));
+    const status = smcBatchScanner.getStatus(exchangeId, resolvedMode);
+    if (
+      resolvedMode === 'live' &&
+      !options.skipViteMiddleware &&
+      process.env.NODE_ENV !== 'test' &&
+      status.workerState !== 'PAUSED' &&
+      ((status.expiredCacheCount ?? 0) > 0 ||
+        (status.staleCacheCount ?? 0) > 0 ||
+        (status.prewarmRequiredCount ?? 0) > 0)
+    ) {
+      void smcBatchScanner
+        .refreshExpiredCachesIfNeeded(exchangeId, { maxSymbolsPerRun: 40 })
+        .catch(() => {});
+    }
+    const isCompactStatus =
+      req.query.compact === '1' || req.query.compact === 'true';
+    if (isCompactStatus) {
+      res.json({
+        ...status,
+        pendingSymbols: [],
+        stuckJobs: [],
+        recentJobs: [],
+        slowestSymbolsTop20: [],
+        excludedSymbols: [],
+        snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT' as const,
+      });
+      return;
+    }
+    res.json({
+      ...status,
+      snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT' as const,
+    });
   });
 
   app.post('/api/smc-scan/start', async (req: Request, res: Response) => {
@@ -2324,14 +3482,19 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
   });
 
-  app.post('/api/smc-scan/pause', (req: Request, res: Response) => {
+  app.post('/api/smc-scan/pause', async (req: Request, res: Response) => {
     const rawMode = req.body?.mode ?? req.query.mode;
     const rawExchange = req.body?.exchange ?? req.query.exchange;
     const { resolvedMode, exchangeId } = resolveAdapter(
       typeof rawMode === 'string' ? rawMode : 'live',
       typeof rawExchange === 'string' ? rawExchange : undefined
     );
-    res.json(smcBatchScanner.pauseScan(exchangeId, resolvedMode));
+    smcBatchScanner.pauseScan(exchangeId, resolvedMode);
+    await Promise.all([
+      smcBatchScanner.waitForIdleTick(5000, exchangeId),
+      paperShadowMonitor.waitForIdleCycle(5000),
+    ]);
+    res.json(smcBatchScanner.getStatus(exchangeId, resolvedMode));
   });
 
   app.post('/api/smc-scan/resume', async (req: Request, res: Response) => {
@@ -2511,7 +3674,14 @@ export async function createApp(options: CreateAppOptions = {}) {
       modeParam,
       exchangeParam
     );
-    res.json(smcBatchScanner.getProgressAndHealth(exchangeId, resolvedMode));
+    const prog = smcBatchScanner.getProgressAndHealth(exchangeId, resolvedMode);
+    res.json({
+      ...prog,
+      cycleId: prog.scanCycleId,
+      statsConsistency: prog.statsConsistency ?? ('VALID' as const),
+      consistencyErrors: prog.consistencyErrors ?? ([] as string[]),
+      snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT' as const,
+    });
   });
 
   app.get('/api/smc-scan/health', (req: Request, res: Response) => {
@@ -2523,7 +3693,17 @@ export async function createApp(options: CreateAppOptions = {}) {
       modeParam,
       exchangeParam
     );
-    res.json(smcBatchScanner.getProgressAndHealth(exchangeId, resolvedMode));
+    const health = smcBatchScanner.getProgressAndHealth(
+      exchangeId,
+      resolvedMode
+    );
+    res.json({
+      ...health,
+      cycleId: health.scanCycleId,
+      statsConsistency: health.statsConsistency ?? ('VALID' as const),
+      consistencyErrors: health.consistencyErrors ?? ([] as string[]),
+      snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT' as const,
+    });
   });
 
   app.get('/api/smc-scan/pending-reasons', (req: Request, res: Response) => {
@@ -2604,6 +3784,294 @@ export async function createApp(options: CreateAppOptions = {}) {
         simulateBusyRetries,
       })
     );
+  });
+
+  app.get('/api/system/watchdog/status', (_req: Request, res: Response) => {
+    res.json(systemWatchdog.getStatus());
+  });
+
+  app.post('/api/system/watchdog/config', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Partial<Omit<WatchdogConfig, 'updatedAt'>> = {};
+    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+    if (typeof body.heartbeatIntervalMs === 'number') {
+      patch.heartbeatIntervalMs = body.heartbeatIntervalMs;
+    }
+    if (typeof body.autoBackupIntervalMs === 'number') {
+      patch.autoBackupIntervalMs = body.autoBackupIntervalMs;
+    }
+    if (typeof body.alertOnStall === 'boolean') {
+      patch.alertOnStall = body.alertOnStall;
+    }
+    if (typeof body.alertOnDbRecovery === 'boolean') {
+      patch.alertOnDbRecovery = body.alertOnDbRecovery;
+    }
+    if (typeof body.alertOnApiErrorSpike === 'boolean') {
+      patch.alertOnApiErrorSpike = body.alertOnApiErrorSpike;
+    }
+    if (typeof body.apiErrorSpikeThreshold === 'number') {
+      patch.apiErrorSpikeThreshold = body.apiErrorSpikeThreshold;
+    }
+    res.json(systemWatchdog.updateConfig(patch));
+  });
+
+  app.post('/api/system/watchdog/run-check', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const result = await systemWatchdog.runWatchdogTick({
+      forceHeartbeat: body.forceHeartbeat === true,
+      forceBackup: body.forceBackup === true,
+    });
+    res.json(result);
+  });
+
+  app.get('/api/validation/readiness', (req: Request, res: Response) => {
+    const exchangeParam =
+      typeof req.query.exchange === 'string' ? req.query.exchange : 'binance_usdm';
+    const exchangeId: ExchangeId =
+      exchangeParam === 'bybit_linear' || exchangeParam === 'bingx_swap'
+        ? exchangeParam
+        : 'binance_usdm';
+
+    const allReports = backtestDb.listBacktestRuns(60);
+    const realReports = allReports.filter(
+      (r) =>
+        !r.provenance?.isDemo &&
+        r.dataClassification === 'REAL' &&
+        r.status === 'COMPLETED' &&
+        (r.totalTrades ?? 0) > 0
+    );
+    const latestRealTotalTrades = realReports.reduce(
+      (acc, r) => acc + (r.totalTrades ?? 0),
+      0
+    );
+    const weightedRealNetR = realReports.reduce(
+      (acc, r) =>
+        acc +
+        (r.netExpectancyR ?? r.expectancyR ?? 0) * (r.totalTrades ?? 0),
+      0
+    );
+    const latestRealNetExp =
+      latestRealTotalTrades > 0
+        ? Number((weightedRealNetR / latestRealTotalTrades).toFixed(2))
+        : null;
+    const weightedRealPf = realReports.reduce(
+      (acc, r) =>
+        acc + (r.netProfitFactor ?? r.profitFactor ?? 0) * (r.totalTrades ?? 0),
+      0
+    );
+    const latestRealNetPf =
+      latestRealTotalTrades > 0
+        ? Number((weightedRealPf / latestRealTotalTrades).toFixed(2))
+        : null;
+
+    const liveTrackStats = db.getPaperTrackComparisonStats(false);
+    const liveLedgerEntries = db
+      .listPaperLedgerEntries(500)
+      .filter((e) => !e.isDemo);
+    const waitingLimitCount = liveLedgerEntries.filter(
+      (e) => e.status === 'OPEN' && e.fillStatus === 'WAITING_LIMIT'
+    ).length;
+    const settledLedger = liveLedgerEntries.filter(
+      (e) =>
+        (e.fillStatus ?? 'FILLED') === 'FILLED' && e.status !== 'OPEN'
+    );
+    const settledPaperTradesCount = settledLedger.length;
+    const liveTotalNetR = settledLedger.reduce(
+      (acc, e) => acc + (e.netPnlR ?? e.pnlR),
+      0
+    );
+    const liveNetExp =
+      settledPaperTradesCount > 0
+        ? Number((liveTotalNetR / settledPaperTradesCount).toFixed(2))
+        : null;
+    const liveNetWinSum = settledLedger
+      .filter((e) => (e.netPnlR ?? e.pnlR) > 0)
+      .reduce((acc, e) => acc + (e.netPnlR ?? e.pnlR), 0);
+    const liveNetLossSum = Math.abs(
+      settledLedger
+        .filter((e) => (e.netPnlR ?? e.pnlR) <= 0)
+        .reduce((acc, e) => acc + (e.netPnlR ?? e.pnlR), 0)
+    );
+    const liveNetPf =
+      settledPaperTradesCount > 0
+        ? liveNetLossSum > 0
+          ? Number((liveNetWinSum / liveNetLossSum).toFixed(2))
+          : liveNetWinSum > 0
+            ? 99.9
+            : 0
+        : null;
+
+    const trackedLiveSignals = paperMonitorDb.listTrackedSignals({
+      exchange: exchangeId,
+      includeBlocked: false,
+      limit: 500,
+    });
+    const totalTrackedSignals = trackedLiveSignals.length;
+    const missedWindowCount = trackedLiveSignals.filter(
+      (s) => s.status === 'ENTRY_WINDOW_MISSED'
+    ).length;
+    const captureRatePercent =
+      totalTrackedSignals > 0
+        ? Number(
+            (
+              ((totalTrackedSignals - missedWindowCount) /
+                totalTrackedSignals) *
+              100
+            ).toFixed(1)
+          )
+        : null;
+
+    const dbHealth = smcBatchScanner.getDatabaseHealth(exchangeId, 'live');
+    const watchdogStatus = systemWatchdog.getStatus();
+
+    const effectiveNetExp = liveNetExp ?? latestRealNetExp;
+    const effectiveNetPf = liveNetPf ?? latestRealNetPf;
+
+    const crit1: ValidationReadinessCriterion = {
+      id: 'NET_EXPECTANCY_POSITIVE',
+      titleZh: '1. 扣成本淨期望值 > 0 且淨 Profit Factor >= 1.2',
+      status:
+        effectiveNetExp === null || effectiveNetPf === null
+          ? 'PENDING'
+          : effectiveNetExp > 0 && effectiveNetPf >= 1.2
+            ? 'PASSED'
+            : effectiveNetExp > 0 || effectiveNetPf >= 1.0
+              ? 'PARTIAL'
+              : 'FAILED',
+      currentValueLabel:
+        effectiveNetExp !== null && effectiveNetPf !== null
+          ? `淨期望值 ${effectiveNetExp > 0 ? '+' : ''}${effectiveNetExp}R · 淨PF ${effectiveNetPf}`
+          : '尚無已結算淨報酬資料',
+      targetThresholdLabel: 'Net Expectancy > 0R 且 Net PF >= 1.2',
+      detailZh:
+        liveNetExp !== null
+          ? `優先依據 Live Paper 實盤淨報酬統計（並結合實盤回測加權驗證）。`
+          : `目前依據真實歷史回測 (REAL) 扣除手續費、滑點與資金費率之淨績效計算。`,
+    };
+
+    const totalCombinedSamples =
+      settledPaperTradesCount + latestRealTotalTrades;
+    const crit2: ValidationReadinessCriterion = {
+      id: 'STATISTICAL_SAMPLE_SIZE',
+      titleZh: '2. 實盤與歷史樣本數達統計可信規模',
+      status:
+        settledPaperTradesCount >= 30 || totalCombinedSamples >= 100
+          ? 'PASSED'
+          : totalCombinedSamples >= 30 || settledPaperTradesCount >= 10
+            ? 'PARTIAL'
+            : 'PENDING',
+      currentValueLabel: `Live已平倉 ${settledPaperTradesCount} 筆 · 真實回測 ${latestRealTotalTrades} 筆`,
+      targetThresholdLabel: 'Live >= 30 筆 或 真實樣本合計 >= 100 筆',
+      detailZh:
+        '樣本過少易受短期行情變異誤導，需累積足夠交易筆數跨越不同盤整與趨勢週期。',
+    };
+
+    const crit3: ValidationReadinessCriterion = {
+      id: 'LIVE_EXECUTION_CAPTURE',
+      titleZh: '3. 實盤訊號進場捕捉率 >= 85%（消除窗口錯過瓶頸）',
+      status:
+        totalTrackedSignals === 0 && waitingLimitCount === 0
+          ? 'PENDING'
+          : captureRatePercent !== null && captureRatePercent >= 85
+            ? 'PASSED'
+            : captureRatePercent !== null && captureRatePercent >= 60
+              ? 'PARTIAL'
+              : 'FAILED',
+      currentValueLabel:
+        captureRatePercent !== null
+          ? `捕捉率 ${captureRatePercent}% (錯過 ${missedWindowCount}/${totalTrackedSignals} · 待回踩掛單 ${waitingLimitCount})`
+          : `待回踩自動掛單 ${waitingLimitCount} 筆`,
+      targetThresholdLabel: '進場捕捉率 >= 85%',
+      detailZh:
+        '已啟用 3 秒 15m 收線邊界偵測、未來未開盤 Bar 延後進場及 FVG/OB 自動回踩限價掛單。',
+    };
+
+    const pfNetExp = latestPortfolioBacktestResult?.netExpectancyR ?? null;
+    const pfTrades = latestPortfolioBacktestResult?.acceptedTradesCount ?? 0;
+    const crit4: ValidationReadinessCriterion = {
+      id: 'PORTFOLIO_RISK_DISCIPLINE',
+      titleZh: '4. 多幣種組合風控回測 (並發/同向/日回撤熔斷)',
+      status: !latestPortfolioBacktestResult
+        ? 'PENDING'
+        : pfTrades > 0 &&
+            (pfNetExp ?? 0) > 0 &&
+            (latestPortfolioBacktestResult.netMaxDrawdownR ?? 99) <= 6
+          ? 'PASSED'
+          : pfTrades > 0
+            ? 'PARTIAL'
+            : 'PENDING',
+      currentValueLabel: latestPortfolioBacktestResult
+        ? `接受 ${pfTrades} 筆 / 攔截 ${latestPortfolioBacktestResult.blockedByRiskCapCount} 筆 · Net MDD ${latestPortfolioBacktestResult.netMaxDrawdownR ?? '-'}R`
+        : '尚未執行多幣種組合回測',
+      targetThresholdLabel: '組合 Net Expectancy > 0R 且 Net MDD <= 6R',
+      detailZh: latestPortfolioBacktestResult
+        ? `最近組合涵蓋 ${latestPortfolioBacktestResult.symbolsRequested.length} 幣種 (${latestPortfolioBacktestResult.mtfHistoricalAlignedCount} 檔通過 1h/4h 歷史對齊)。`
+        : '請至回測驗證分頁執行「多幣種組合回測」以驗證跨幣種同方向與日回撤熔斷表現。',
+    };
+
+    const crit5: ValidationReadinessCriterion = {
+      id: 'OPERATIONAL_STABILITY',
+      titleZh: '5. 7×24 資料庫完整性、自動備份與 Watchdog 巡檢',
+      status:
+        dbHealth.integrityCheck === 'ok' &&
+        !dbHealth.stalledSuspected &&
+        watchdogStatus.config.enabled &&
+        watchdogStatus.lastAutoBackupAt !== null
+          ? 'PASSED'
+          : dbHealth.integrityCheck === 'ok' && !dbHealth.stalledSuspected
+            ? 'PARTIAL'
+            : 'FAILED',
+      currentValueLabel: `DB ${dbHealth.integrityCheck.toUpperCase()} · 恢復 ${dbHealth.lifetimeDatabaseRecoveryCount} 次 · 備份 ${watchdogStatus.autoBackupsCount} 次`,
+      targetThresholdLabel: 'integrity=ok · 無卡死 · Watchdog 與自動備份啟用',
+      detailZh:
+        watchdogStatus.lastAutoBackupAt !== null
+          ? `Watchdog 運作中，最近熱備份時間 ${watchdogStatus.lastAutoBackupAt}。`
+          : 'Watchdog 已啟用，建議於系統健康分頁執行一次「Watchdog 檢查與備份」完成首次備份確認。',
+    };
+
+    const criteria = [crit1, crit2, crit3, crit4, crit5];
+    const passedCount = criteria.filter((c) => c.status === 'PASSED').length;
+    const scorePoints = criteria.reduce(
+      (acc, c) => acc + (c.status === 'PASSED' ? 1 : c.status === 'PARTIAL' ? 0.5 : 0),
+      0
+    );
+    const readinessScorePercent = Math.round((scorePoints / criteria.length) * 100);
+    const overallStatus: ValidationReadinessResponse['overallStatus'] =
+      passedCount === criteria.length
+        ? 'VALIDATED'
+        : passedCount >= 2 || scorePoints >= 2.0
+          ? 'IN_PROGRESS'
+          : 'NOT_READY';
+
+    const payload: ValidationReadinessResponse = {
+      safety: TRADING_SAFETY_FLAGS,
+      evaluatedAt: new Date().toISOString(),
+      overallStatus,
+      passedCount,
+      totalCount: criteria.length,
+      readinessScorePercent,
+      livePaperStats: {
+        totalTrackedSignals,
+        missedWindowCount,
+        captureRatePercent,
+        settledPaperTradesCount,
+        waitingLimitCount,
+        netExpectancyR: liveTrackStats.tracks
+          .filter((t) => t.track !== 'MANUAL_OBSERVATION' && t.closedCount > 0)
+          .length > 0
+          ? liveNetExp
+          : null,
+        netProfitFactor: liveNetPf,
+      },
+      backtestStats: {
+        latestRealBacktestCount: realReports.length,
+        latestRealNetExpectancyR: latestRealNetExp,
+        latestRealNetProfitFactor: latestRealNetPf,
+        latestRealTradeCount: latestRealTotalTrades,
+      },
+      criteria,
+    };
+    res.json(payload);
   });
 
   app.get('/api/system/monitoring-windows', (req: Request, res: Response) => {
@@ -2737,7 +4205,13 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   // 10. Phase 5 & Phase 6: Paper Shadow Monitor, Signal Outcome Tracker & Notification Sandbox Endpoints
   app.get('/api/paper-monitor/status', (_req: Request, res: Response) => {
-    res.json(paperShadowMonitor.getStatus());
+    const st = paperShadowMonitor.getStatus();
+    res.json({
+      ...st,
+      consistencyErrors:
+        (st as { consistencyErrors?: string[] }).consistencyErrors ?? [],
+      snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT' as const,
+    });
   });
 
   app.get('/api/paper-monitor/diagnostics', (_req: Request, res: Response) => {
@@ -3117,12 +4591,16 @@ export async function createApp(options: CreateAppOptions = {}) {
       Number.isFinite(rawThreshold) && rawThreshold > 0
         ? rawThreshold
         : undefined;
-    res.json(
-      paperShadowMonitor.getPaperQualityGateDrift(ex, Date.now(), {
-        reportAnchorAt: anchor.reportAnchorAt,
-        driftThresholdPercent,
-      })
-    );
+    const gd = paperShadowMonitor.getPaperQualityGateDrift(ex, Date.now(), {
+      reportAnchorAt: anchor.reportAnchorAt,
+      driftThresholdPercent,
+    });
+    res.json({
+      ...gd,
+      consistencyErrors:
+        (gd as { consistencyErrors?: string[] }).consistencyErrors ?? [],
+      snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT' as const,
+    });
   });
 
   app.get(
@@ -3199,6 +4677,52 @@ export async function createApp(options: CreateAppOptions = {}) {
     );
   });
 
+  // Phase 18.4 & Phase 18.5: Real Live Candidate Observation, Capture SLA Verification & Signal Quality Decision Endpoints
+  app.get('/api/paper-quality/live-capture', (req: Request, res: Response) => {
+    const ex = resolveLiveQualityExchange(req, res);
+    if (!ex) return;
+    res.json(
+      paperShadowMonitor.getLiveCaptureObservation(ex, {
+        snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT',
+      })
+    );
+  });
+
+  app.get(
+    '/api/paper-quality/live-capture/events',
+    (req: Request, res: Response) => {
+      const ex = resolveLiveQualityExchange(req, res);
+      if (!ex) return;
+      res.json(
+        paperShadowMonitor.getLiveCaptureEvents(ex, {
+          snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT',
+        })
+      );
+    }
+  );
+
+  app.get(
+    '/api/paper-quality/live-capture/summary',
+    (req: Request, res: Response) => {
+      const ex = resolveLiveQualityExchange(req, res);
+      if (!ex) return;
+      res.json(
+        paperShadowMonitor.getLiveCaptureSummary(ex, {
+          snapshotConsistency: 'INDEPENDENT_ENDPOINT_SNAPSHOT',
+        })
+      );
+    }
+  );
+
+  app.get(
+    '/api/paper-quality/live-capture/atomic',
+    (req: Request, res: Response) => {
+      const ex = resolveLiveQualityExchange(req, res);
+      if (!ex) return;
+      res.json(paperShadowMonitor.getSharedAtomicLiveCaptureBundle(ex));
+    }
+  );
+
   app.get('/api/notification-sandbox/outbox', (req: Request, res: Response) => {
     const statusEnv = paperShadowMonitor.getStatus();
     const limitRaw = Number(req.query.limit ?? 100);
@@ -3274,6 +4798,35 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
   );
 
+  app.use(
+    (
+      err: unknown,
+      _req: Request,
+      res: Response,
+      _next: express.NextFunction
+    ) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (RadarDatabase.isSqliteCorruptionError(err)) {
+        const activeEx = smcBatchScanner.getActiveForegroundExchange();
+        db.recoverFromRuntimeSqliteError(err, activeEx);
+        if (!res.headersSent) {
+          res.status(503).json({
+            error: '資料庫執行期異常並已觸發自動修復，請重試一次請求。',
+            recovering: true,
+            safety: TRADING_SAFETY_FLAGS,
+          });
+        }
+        return;
+      }
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: msg || 'Internal server error',
+          safety: TRADING_SAFETY_FLAGS,
+        });
+      }
+    }
+  );
+
   if (!options.skipViteMiddleware) {
     if (process.env.NODE_ENV !== 'production') {
       process.env.DISABLE_HMR = 'true';
@@ -3281,6 +4834,7 @@ export async function createApp(options: CreateAppOptions = {}) {
         server: {
           middlewareMode: true,
           hmr: false,
+          ws: false,
           watch: null,
         },
         plugins: [
@@ -3316,14 +4870,21 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   app.locals.paperShadowMonitor = paperShadowMonitor;
   app.locals.smcBatchScanner = smcBatchScanner;
+  app.locals.autoBacktestScheduler = autoBacktestScheduler;
+  app.locals.externalNotificationService = externalNotificationService;
+  app.locals.positionSentinel = positionSentinel;
+  app.locals.systemWatchdog = systemWatchdog;
+  app.locals.backtestService = backtestService;
   app.locals.radarDb = db;
   return app;
 }
 
 const PORT =
-  process.env.PORT && process.env.PORT !== '8080'
-    ? Number(process.env.PORT)
-    : 3000;
+  process.env.NODE_ENV === 'production'
+    ? Number(process.env.PORT || 3000)
+    : process.env.PORT && process.env.PORT !== '8080'
+      ? Number(process.env.PORT)
+      : 3000;
 
 if (
   process.env.NODE_ENV !== 'test' &&
@@ -3331,6 +4892,12 @@ if (
   path.resolve(process.argv[1]) === __filename
 ) {
   createApp().then((app) => {
+    const startupScanner = app.locals.smcBatchScanner as
+      | SmcBatchScanService
+      | undefined;
+    if (startupScanner) {
+      startupScanner.resume('binance_usdm', 'live', true);
+    }
     const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(
         `[CryptoMarketRadar Phase 2] Server listening on http://0.0.0.0:${PORT} (${TRADING_SAFETY_FLAGS.mode} / ${TRADING_SAFETY_FLAGS.liveOrders})`
@@ -3340,13 +4907,15 @@ if (
           | SmcBatchScanService
           | undefined;
         if (scanner) {
-          scanner.resume();
           scanner.runDatabaseCheck({
             exchange: 'binance_usdm',
             mode: 'live',
             createBackup: false,
           });
           scanner.startProgressSamplingLoop('binance_usdm', 60_000);
+          void scanner
+            .refreshExpiredCachesIfNeeded('binance_usdm')
+            .catch(() => {});
         }
         const monitor = app.locals.paperShadowMonitor as
           | PaperShadowMonitor
@@ -3355,29 +4924,105 @@ if (
           void monitor
             .start({
               exchange: 'binance_usdm',
-              runImmediateCycle: false,
+              runImmediateCycle: true,
               maxSymbolsPerCycle: 6,
             })
             .catch((err) => {
               console.error('[PaperShadowMonitor] Auto-start warning:', err);
             });
         }
+        const autoBt = app.locals.autoBacktestScheduler as
+          | AutoBacktestScheduler
+          | undefined;
+        if (autoBt) {
+          if (
+            process.env.AUTO_BACKTEST_ENABLED === 'true' &&
+            !autoBt.getStatus().config.enabled
+          ) {
+            autoBt.updateConfig({ enabled: true });
+          } else {
+            autoBt.initFromPersistedConfig();
+          }
+        }
+        const sentinel = app.locals.positionSentinel as
+          | PositionSentinelService
+          | undefined;
+        if (sentinel) {
+          sentinel.start();
+        }
+        const watchdog = app.locals.systemWatchdog as
+          | SystemWatchdogService
+          | undefined;
+        if (watchdog) {
+          watchdog.start();
+        }
       }, 1000);
     });
 
+    let shuttingDown = false;
     const handleGracefulProcessShutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      const watchdog = app.locals.systemWatchdog as
+        | SystemWatchdogService
+        | undefined;
+      if (watchdog) {
+        watchdog.stop();
+      }
+      const sentinel = app.locals.positionSentinel as
+        | PositionSentinelService
+        | undefined;
+      if (sentinel) {
+        sentinel.stop();
+      }
+      const autoBt = app.locals.autoBacktestScheduler as
+        | AutoBacktestScheduler
+        | undefined;
+      if (autoBt) {
+        autoBt.stop();
+      }
+      const monitor = app.locals.paperShadowMonitor as
+        | PaperShadowMonitor
+        | undefined;
+      if (monitor) {
+        monitor.stop();
+      }
       const scanner = app.locals.smcBatchScanner as
         | SmcBatchScanService
         | undefined;
       if (scanner) {
         scanner.gracefulShutdown('binance_usdm', `process_${signal}`);
       }
-      server.close(() => {
+      const closeDbAndExit = () => {
+        const radarDb = app.locals.radarDb as RadarDatabase | undefined;
+        if (radarDb) {
+          try {
+            radarDb.close();
+          } catch {
+            // ignore shutdown close error
+          }
+        }
         process.exit(0);
+      };
+      const forceTimer = setTimeout(() => {
+        server.closeAllConnections?.();
+        closeDbAndExit();
+      }, 2500);
+      forceTimer.unref?.();
+      server.closeIdleConnections?.();
+      server.close(() => {
+        clearTimeout(forceTimer);
+        closeDbAndExit();
       });
     };
 
     process.once('SIGTERM', () => handleGracefulProcessShutdown('SIGTERM'));
     process.once('SIGINT', () => handleGracefulProcessShutdown('SIGINT'));
+    process.on('unhandledRejection', (reason) => {
+      console.error('[CryptoMarketRadar Phase 2] Unhandled Rejection:', reason);
+    });
+    process.on('uncaughtException', (err) => {
+      console.error('[CryptoMarketRadar Phase 2] Uncaught Exception:', err);
+    });
   });
 }

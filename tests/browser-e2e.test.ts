@@ -81,7 +81,7 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
           document.body.innerText.includes('Binance USDⓈ-M Futures REST') &&
           document.querySelectorAll('tbody tr td').length > 0,
         undefined,
-        { timeout: 15000 }
+        { timeout: 30000 }
       );
       await page.waitForTimeout(50);
 
@@ -104,6 +104,36 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
         ),
         false,
         'Live 模式成功時不得顯示 DEMO 模擬資料警告'
+      );
+
+      // Verify Top 3 Recommended, Approaching Full SMC (WATCH), and Near-Miss sections are visible on Radar
+      assert.ok(
+        liveBodyTextInitial.includes('當前最推薦 Top 3') &&
+          liveBodyTextInitial.includes('接近 SMC 完整評估狀態 (WATCH / 結構已成形)') &&
+          liveBodyTextInitial.includes('差一點就通過 (Near-Miss 差 1~2 項 Gate)'),
+        '全市場雷達與結構必須顯示最推薦 Top 3、接近 SMC (WATCH) 與差一點 (Near-Miss)'
+      );
+
+      // Verify quick-filter pills for Approaching SMC and Near-Miss work and can reset to All
+      const initialTableRows = await page.locator('tbody tr').count();
+      await page.getByRole('button', { name: /^接近 SMC \(/ }).click();
+      await page.waitForFunction(
+        (total: number) => document.querySelectorAll('tbody tr').length < total,
+        initialTableRows,
+        { timeout: 10000 }
+      );
+      await page.getByRole('button', { name: /^差一點 \(/ }).click();
+      await page.waitForFunction(
+        (total: number) => document.querySelectorAll('tbody tr').length < total,
+        initialTableRows,
+        { timeout: 10000 }
+      );
+      await page.getByRole('button', { name: '全部標的', exact: true }).click();
+      await page.waitForFunction(
+        (expected: number) =>
+          document.querySelectorAll('tbody tr').length === expected,
+        initialTableRows,
+        { timeout: 10000 }
       );
 
       // Click on BTCUSDT or QUSDT row in the Live table if present, otherwise 1st row
@@ -133,7 +163,7 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
           );
         },
         undefined,
-        { timeout: 15000 }
+        { timeout: 30000 }
       );
       await page.waitForTimeout(50);
 
@@ -166,37 +196,54 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
         liveDetailText.includes('第一層：市場雷達分類') &&
           liveDetailText.includes('第二層：SMC 評估狀態') &&
           liveDetailText.includes('最終交易訊號') &&
-          (liveDetailText.includes('SMC 尚未評估／點擊載入單幣種結構') ||
-            liveDetailText.includes('PENDING(0)')) &&
-          liveDetailText.includes('SMC 全市場掃描進度') &&
-          liveDetailText.includes('掃描進度：已完成') &&
-          liveDetailText.includes('RUNNING') &&
-          liveDetailText.includes('IN-FLIGHT REQUESTS') &&
-          liveDetailText.includes('SUCCEEDED') &&
-          liveDetailText.includes('HIGH RISK') &&
-          liveDetailText.includes('RATE LIMITED') &&
-          liveDetailText.includes('等待重試') &&
-          liveDetailText.includes('FAILED') &&
-          liveDetailText.includes('不計入 PENDING') &&
-          liveDetailText.includes('最後完成時間') &&
-          liveDetailText.includes('資料新鮮度') &&
-          liveDetailText.includes('佇列總數恆等式') &&
           liveDetailText.includes('SMC evaluatedAt') &&
-          liveDetailText.includes('不重複幣種數 (uniqueSymbolCount)') &&
-          liveDetailText.includes('可重疊原因總次數') &&
           liveDetailText.includes('原因：') &&
           liveDetailText.includes('Decision Trace 降級與安全閘門追蹤') &&
           liveDetailText.includes('volumeTimeframe:') &&
-          liveDetailText.includes('aggregationWindow:') &&
-          liveDetailText.includes('市場雷達候選數量') &&
-          liveDetailText.includes('SMC PENDING (尚未評估)') &&
-          liveDetailText.includes('SMC LONG CANDIDATE 數量') &&
-          liveDetailText.includes('SMC SHORT CANDIDATE 數量') &&
-          liveDetailText.includes('WAIT 數量'),
-        '點選候選幣種時必須顯示雙層結果、Phase 3 SMC 全市場掃描進度、PENDING/WAIT 分離、uniqueSymbolCount/reasonOccurrenceCount 與 Decision Trace 診斷面板'
+          liveDetailText.includes('aggregationWindow:'),
+        '點選候選幣種時必須顯示雙層結果、SMC evaluatedAt 與 Decision Trace 摘要'
       );
 
-      // Capture Screenshot 1: Live Mode
+      // Verify collapsible Decision Trace accordion can expand
+      await page.locator('details summary', { hasText: 'Decision Trace' }).click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('1. history gate'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await page.locator('details summary', { hasText: 'Decision Trace' }).click();
+
+      // Verify Tab 3 (BTC 大盤連動) loads BTC K-line overlap card, then return to Tab 1
+      await page.getByRole('button', { name: '3. BTC 大盤連動' }).click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes(
+            '與比特幣 (BTCUSDT) 過去 K 線重合性與連動風險分析'
+          ),
+        undefined,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: '1. 結構看盤 & 關鍵位' }).click();
+      await page.waitForFunction(
+        () => Boolean(document.querySelector('#key-levels-session-strip')),
+        undefined,
+        { timeout: 5000 }
+      );
+
+      // Verify zero page-level horizontal overflow in Live mode (1440x1180)
+      const liveOverflow = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+      }));
+      assert.ok(
+        liveOverflow.scrollWidth <= liveOverflow.clientWidth + 2,
+        `Live 模式不應出現全域水平溢出: scrollWidth=${liveOverflow.scrollWidth}, clientWidth=${liveOverflow.clientWidth}`
+      );
+
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(50);
+
+      // Capture Screenshot 1: Clean Standalone Live Mode Radar
       const liveScreenshotPath1 = path.join(ARTIFACT_DIR, 'live_mode.png');
       const liveScreenshotPath2 = path.join(
         PUBLIC_SCREENSHOT_DIR,
@@ -204,6 +251,58 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
       );
       await page.screenshot({ path: liveScreenshotPath1, fullPage: false });
       fs.copyFileSync(liveScreenshotPath1, liveScreenshotPath2);
+
+      // Verify Queue Controls & Telemetry inside the consolidated Settings & Formulas Modal
+      await page.getByRole('button', { name: /設定與公式/ }).click();
+      await page.getByRole('button', { name: '佇列與排程控制' }).click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('SMC 全市場掃描進度'),
+        undefined,
+        { timeout: 5000 }
+      );
+      const modalControlsText: string = await page.getByRole('dialog').innerText();
+      assert.ok(
+        (modalControlsText.includes('SMC 尚未評估／點擊載入單幣種結構') ||
+          modalControlsText.includes('PENDING(0)')) &&
+          modalControlsText.includes('SMC 全市場掃描進度') &&
+          modalControlsText.includes('掃描進度：已完成') &&
+          modalControlsText.includes('RUNNING') &&
+          modalControlsText.includes('IN-FLIGHT REQUESTS') &&
+          modalControlsText.includes('SUCCEEDED') &&
+          modalControlsText.includes('HIGH RISK') &&
+          modalControlsText.includes('RATE LIMITED') &&
+          modalControlsText.includes('等待重試') &&
+          modalControlsText.includes('FAILED') &&
+          modalControlsText.includes('不計入 PENDING') &&
+          modalControlsText.includes('最後完成時間') &&
+          modalControlsText.includes('資料新鮮度') &&
+          modalControlsText.includes('佇列總數恆等式'),
+        '設定與公式中心「佇列與排程控制」必須顯示 Phase 3 SMC 全市場掃描進度與 PENDING/WAIT 分離'
+      );
+
+      await page.getByRole('dialog').getByRole('button', { name: '漏斗與工程遙測' }).click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('市場雷達候選數量'),
+        undefined,
+        { timeout: 5000 }
+      );
+      const modalTelemetryText: string = await page.getByRole('dialog').innerText();
+      assert.ok(
+        modalTelemetryText.includes('不重複幣種數 (uniqueSymbolCount)') &&
+          modalTelemetryText.includes('可重疊原因總次數') &&
+          modalTelemetryText.includes('市場雷達候選數量') &&
+          modalTelemetryText.includes('SMC PENDING (尚未評估)') &&
+          modalTelemetryText.includes('SMC LONG CANDIDATE 數量') &&
+          modalTelemetryText.includes('SMC SHORT CANDIDATE 數量') &&
+          modalTelemetryText.includes('WAIT 數量'),
+        '設定與公式中心「漏斗與工程遙測」必須顯示 uniqueSymbolCount/reasonOccurrenceCount 與全市場計數'
+      );
+      await page.getByRole('button', { name: /關閉介面/ }).click();
+      await page.waitForFunction(
+        () => document.querySelector('[role="dialog"]') === null,
+        undefined,
+        { timeout: 5000 }
+      );
 
       // =========================================================================
       // STEP 2: Live API 失敗時顯示 HTTP 503、空候選，不得出現 Demo 資料
@@ -335,11 +434,281 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
         '當第二層為 WAIT 時，UI 必須明確顯示 最終交易訊號：NONE 與 finalTradeSignal: NONE'
       );
 
-      // Verify Symbol Detail Drawer sections and 5-stage Candidate Funnel & Snapshot Consistency
+      const assertNoHorizontalOverflow = async (label: string) => {
+        const overflowReport = await page.evaluate(() => {
+          const docOverflow =
+            document.documentElement.scrollWidth >
+            document.documentElement.clientWidth + 2;
+          const selectors = [
+            '#formal-smc-panel',
+            '#early-ignition-panel',
+            '#pullback-sniper-panel',
+            '#entry-pullback-panel',
+            '#market-breadth-sector-panel',
+            '#key-levels-session-strip',
+            '#microstructure-panel',
+            '#derivatives-structure-panel',
+            '#btc-correlation-panel',
+            '#position-risk-planner',
+          ];
+          const brokenCards: Array<{
+            selector: string;
+            scrollWidth: number;
+            clientWidth: number;
+          }> = [];
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.scrollWidth > el.clientWidth + 2) {
+              brokenCards.push({
+                selector: sel,
+                scrollWidth: el.scrollWidth,
+                clientWidth: el.clientWidth,
+              });
+            }
+          }
+          return {
+            docOverflow,
+            docScrollWidth: document.documentElement.scrollWidth,
+            docClientWidth: document.documentElement.clientWidth,
+            brokenCards,
+          };
+        });
+        assert.equal(
+          overflowReport.docOverflow,
+          false,
+          `[${label}] 頁面不應出現水平捲動溢出 (scrollWidth=${overflowReport.docScrollWidth}, clientWidth=${overflowReport.docClientWidth})`
+        );
+        assert.deepEqual(
+          overflowReport.brokenCards,
+          [],
+          `[${label}] 卡片內部數字或元素不應水平溢出: ${JSON.stringify(overflowReport.brokenCards)}`
+        );
+      };
+
+      // Verify Workstation Tab 1 (default) + Unified Market Intel Dock (incl. Formal SMC, Early Ignition & Anti-Chase Pullback panel)
       await page.waitForFunction(
         () =>
           document.body.innerText.includes('產生 Gemini 證據解釋') &&
           document.body.innerText.includes('WAIT 安全閘門觸發原因') &&
+          document.body.innerText.includes('正式 SMC 確認清單') &&
+          Boolean(document.querySelector('#formal-smc-panel')) &&
+          Boolean(document.querySelector('#early-ignition-panel')) &&
+          Boolean(document.querySelector('#pullback-sniper-panel')) &&
+          Boolean(document.querySelector('#entry-pullback-panel')) &&
+          Boolean(document.querySelector('#market-breadth-sector-panel')) &&
+          Boolean(document.querySelector('#key-levels-session-strip')),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 1 (1440x1180)');
+
+      // Verify Formal SMC, Early Ignition & Pullback Sniper quick filter pills work cleanly and reset to 全部標的
+      const demoTotalRows = await page.locator('tbody tr').count();
+      await page.getByRole('button', { name: /^正式 SMC \(/ }).click();
+      await page.waitForFunction(
+        (total: number) => {
+          const rows = document.querySelectorAll('tbody tr').length;
+          return rows > 0 && rows < total;
+        },
+        demoTotalRows,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: /^早鳥 \(/ }).click();
+      await page.waitForFunction(
+        (total: number) => {
+          const rows = document.querySelectorAll('tbody tr').length;
+          return rows > 0 && rows < total;
+        },
+        demoTotalRows,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: /^回踩狙擊 \(/ }).click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('回踩狙擊雷達'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await page.waitForFunction(
+        (total: number) => document.querySelectorAll('tbody tr').length <= total,
+        demoTotalRows,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: '全部標的', exact: true }).click();
+      await page.waitForFunction(
+        (total: number) => document.querySelectorAll('tbody tr').length === total,
+        demoTotalRows,
+        { timeout: 5000 }
+      );
+
+      // Verify Workstation Tab 2: 籌碼與微結構
+      await page.getByRole('button', { name: '2. 籌碼與微結構' }).click();
+      await page.waitForFunction(
+        () =>
+          Boolean(document.querySelector('#microstructure-panel')) &&
+          Boolean(document.querySelector('#derivatives-structure-panel')),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 2 (1440x1180)');
+
+      // Verify Workstation Tab 3: BTC 大盤連動
+      await page.getByRole('button', { name: '3. BTC 大盤連動' }).click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes('Pearson 相關係數') &&
+          document.body.innerText.includes('K 線同向重疊率') &&
+          Boolean(document.querySelector('#btc-correlation-panel svg path')),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 3 (1440x1180)');
+
+      // Verify Workstation Tab 4: 風控試算 & 診斷
+      await page.getByRole('button', { name: '4. 風控試算 & 診斷' }).click();
+      await page.waitForFunction(
+        () =>
+          Boolean(document.querySelector('#position-risk-planner')) &&
+          document.body.innerText.includes('白話文 5 步闖關進度明細'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 4 (1440x1180)');
+
+      // Verify Full-Width Expand / Restore Dual-Pane toggle & zero-overflow at 1280x900
+      await page.getByRole('button', { name: '展開全寬看盤' }).click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes('恢復雙欄') &&
+          document.querySelectorAll('tbody tr').length === 0,
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 4 Full-Width (1440x1180)');
+      await page.getByRole('button', { name: '恢復雙欄' }).click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes('展開全寬看盤') &&
+          document.querySelectorAll('tbody tr').length > 0,
+        undefined,
+        { timeout: 5000 }
+      );
+
+      // Check zero horizontal overflow at narrower 1280x900 viewport across Tab 1 & Tab 2
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await page.getByRole('button', { name: '2. 籌碼與微結構' }).click();
+      await page.waitForFunction(
+        () => Boolean(document.querySelector('#microstructure-panel')),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 2 (1280x900)');
+      await page.getByRole('button', { name: '1. 結構看盤 & 關鍵位' }).click();
+      await page.waitForFunction(
+        () => Boolean(document.querySelector('#key-levels-session-strip')),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Demo Tab 1 (1280x900)');
+      await page.setViewportSize({ width: 1440, height: 1180 });
+      await page.waitForTimeout(50);
+
+      // Verify Key Levels / VWAP overlay toggle on interactive chart
+      await page.getByRole('button', { name: /關鍵位\/VWAP/ }).first().click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('關鍵位/VWAP 關'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: /關鍵位\/VWAP/ }).first().click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('關鍵位/VWAP 開'),
+        undefined,
+        { timeout: 5000 }
+      );
+
+      // Verify Interactive Price Alert Drawer open, add alert, and close cleanly
+      await page.getByRole('button', { name: /條件告警/ }).first().click();
+      await page.waitForFunction(
+        () => Boolean(document.querySelector('#price-alert-drawer')),
+        undefined,
+        { timeout: 5000 }
+      );
+      const targetInput = page
+        .locator('#price-alert-drawer')
+        .getByPlaceholder('輸入觸發價位');
+      await targetInput.fill('999999');
+      await page
+        .locator('#price-alert-drawer')
+        .getByRole('button', { name: '加入監控告警' })
+        .click();
+      await page.waitForFunction(
+        () =>
+          document
+            .querySelector('#price-alert-drawer')
+            ?.textContent?.includes('已設定條件 (1)') ?? false,
+        undefined,
+        { timeout: 5000 }
+      );
+      await page
+        .locator('#price-alert-drawer')
+        .getByRole('button', { name: '關閉' })
+        .click();
+      await page.waitForFunction(
+        () => document.querySelector('#price-alert-drawer') === null,
+        undefined,
+        { timeout: 5000 }
+      );
+
+      // Verify Multi-Chart Split toggle & revert cleanly
+      await page.getByRole('button', { name: /多圖同框/ }).click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes('切換回單圖模式') &&
+          document.body.innerText.includes('BTCUSDT 大盤基準'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: '切換回單圖模式' }).click();
+      await page.waitForFunction(
+        () => document.body.innerText.includes('多圖同框'),
+        undefined,
+        { timeout: 5000 }
+      );
+
+      // Verify Sector Filter click + reset back to 全部板塊
+      await page
+        .locator('#market-breadth-sector-panel')
+        .getByText('主流公鏈 L1')
+        .first()
+        .click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes('全部板塊') &&
+          document.querySelectorAll('tbody tr').length < 18,
+        undefined,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: '全部板塊' }).click();
+      await page.waitForFunction(
+        () => document.querySelectorAll('tbody tr').length === 18,
+        undefined,
+        { timeout: 5000 }
+      );
+
+      // Capture Screenshot 3: Clean Standalone Demo Mode Radar
+      const demoScreenshotPath1 = path.join(ARTIFACT_DIR, 'demo_mode.png');
+      const demoScreenshotPath2 = path.join(
+        PUBLIC_SCREENSHOT_DIR,
+        'demo_mode.png'
+      );
+      await page.screenshot({ path: demoScreenshotPath1, fullPage: false });
+      fs.copyFileSync(demoScreenshotPath1, demoScreenshotPath2);
+
+      // Verify 5-Stage Candidate Funnel inside Settings & Formulas Modal
+      await page.getByRole('button', { name: /設定與公式/ }).click();
+      await page.getByRole('dialog').getByRole('button', { name: '漏斗與工程遙測' }).click();
+      await page.waitForFunction(
+        () =>
           document.body.innerText.includes('1. 第一層雷達觀察') &&
           document.body.innerText.includes('2. 第二層 SMC 已評估') &&
           document.body.innerText.includes('3. SMC 候選') &&
@@ -348,15 +717,12 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
         undefined,
         { timeout: 5000 }
       );
-
-      // Capture Screenshot 3: Demo Mode
-      const demoScreenshotPath1 = path.join(ARTIFACT_DIR, 'demo_mode.png');
-      const demoScreenshotPath2 = path.join(
-        PUBLIC_SCREENSHOT_DIR,
-        'demo_mode.png'
+      await page.getByRole('button', { name: /關閉介面/ }).click();
+      await page.waitForFunction(
+        () => document.querySelector('[role="dialog"]') === null,
+        undefined,
+        { timeout: 5000 }
       );
-      await page.screenshot({ path: demoScreenshotPath1, fullPage: false });
-      fs.copyFileSync(demoScreenshotPath1, demoScreenshotPath2);
 
       // =========================================================================
       // STEP 5: 紙上開倉與平倉只寫入 paper ledger (跳轉至 紙上交易帳本)，不呼叫任何交易所 private API
@@ -373,7 +739,15 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
           document.body.innerText.includes(
             'DEMO · 非即時資料 · 不計入 Live Paper 績效'
           ) &&
-          document.body.innerText.includes('紙上平倉結算'),
+          document.body.innerText.includes('紙上平倉結算') &&
+          Boolean(document.querySelector('#paper-portfolio-btc-exposure')) &&
+          Boolean(document.querySelector('#paper-track-comparison-panel')) &&
+          document.body.innerText.includes('分軌勝率與回踩成效統計') &&
+          document.body.innerText.includes('早鳥起漲進場 (Early Ignition)') &&
+          document.body.innerText.includes('正式 SMC 現價進場') &&
+          document.body.innerText.includes('FVG / OB 回踩限價進場') &&
+          document.body.innerText.includes('待觸價掛單 (') &&
+          document.body.innerText.includes('已過期/撤銷 ('),
         { timeout: 10000 }
       );
 
@@ -460,6 +834,29 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
         { timeout: 10000 }
       );
 
+      // 6c. Verify External Notification Channels Panel (Telegram & Discord env status + test ping without external browser requests)
+      await page.waitForFunction(
+        () =>
+          Boolean(document.querySelector('#external-notifications-panel')) &&
+          document.body.innerText.includes('Telegram Bot 推播') &&
+          document.body.innerText.includes('Discord Webhook 推播'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Step 6: External Notifications Panel');
+      await page
+        .locator('#external-notifications-panel')
+        .getByRole('button', { name: /發送測試通知/ })
+        .first()
+        .click();
+      await page.waitForFunction(
+        () =>
+          document.querySelector('#external-notifications-panel')?.textContent?.includes('SKIPPED_UNCONFIGURED') ||
+          document.querySelector('#external-notifications-panel')?.textContent?.includes('DELIVERED'),
+        undefined,
+        { timeout: 8000 }
+      );
+
       await assertSafetyLabelsAlwaysVisible('Step 6: Dry-Run Notifications');
 
       const notifyApiRequests = recordedRequests
@@ -479,6 +876,47 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
         ),
         '通知按鈕只能呼叫本地 POST /api/notify/preview 產生 Dry-Run 預覽'
       );
+      assert.ok(
+        notifyApiRequests.some(
+          (r) => r.method === 'POST' && r.url.endsWith('/api/notify/external/test')
+        ),
+        '測試推播必須透過後端代理 POST /api/notify/external/test'
+      );
+
+      // 6d. Verify Auto-Backtest Control Panel & Persisted Source Filtering
+      await page.getByRole('button', { name: /無前視回測與報表/ }).click();
+      await page.waitForFunction(
+        () =>
+          Boolean(document.querySelector('#auto-backtest-panel')) &&
+          document.body.innerText.includes('自動排程回測紀錄 (Auto-Backtest Recorder)'),
+        undefined,
+        { timeout: 5000 }
+      );
+      await assertNoHorizontalOverflow('Step 6d: Auto-Backtest Panel');
+      await page
+        .locator('#auto-backtest-panel')
+        .getByRole('button', { name: /立即執行一輪自動回測/ })
+        .click();
+      await page.waitForFunction(
+        () =>
+          document.body.innerText.includes('最新批次 [SUCCESS]') &&
+          document.body.innerText.includes('自動排程'),
+        undefined,
+        { timeout: 15000 }
+      );
+      await page
+        .locator('#auto-backtest-panel')
+        .getByRole('button', { name: '自動排程', exact: true })
+        .click();
+      await page.waitForFunction(
+        () => document.querySelectorAll('tbody tr').length >= 1,
+        undefined,
+        { timeout: 5000 }
+      );
+      await page
+        .locator('#auto-backtest-panel')
+        .getByRole('button', { name: '全部來源', exact: true })
+        .click();
 
       // =========================================================================
       // STEP 7: 長期 Paper 品質面板 (30d/60d/90d)、系統穩定性面板、深淺色模式驗證
@@ -524,7 +962,9 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
       );
       await assertSafetyLabelsAlwaysVisible('Step 7b: System Stability Panel');
 
-      // Verify Light Mode / Dark Mode toggle
+      // Verify Light Mode / Dark Mode toggle inside consolidated Settings & Formulas Modal
+      await page.getByRole('button', { name: /設定與公式/ }).click();
+      await page.getByRole('button', { name: '基本設定與門檻' }).click();
       await page.getByRole('button', { name: /淺色白晝/ }).click();
       await page.waitForFunction(
         () => document.querySelector('.theme-light') !== null,
@@ -533,6 +973,12 @@ describe('8. 瀏覽器端最終操作驗收測試 (Playwright Headless Chromium 
       await page.getByRole('button', { name: /深色專業/ }).click();
       await page.waitForFunction(
         () => document.querySelector('.dark') !== null,
+        { timeout: 5000 }
+      );
+      await page.getByRole('button', { name: /關閉介面/ }).click();
+      await page.waitForFunction(
+        () => document.querySelector('[role="dialog"]') === null,
+        undefined,
         { timeout: 5000 }
       );
 

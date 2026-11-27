@@ -1,33 +1,59 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Bell,
   BookOpen,
   Bookmark,
-  CheckCircle2,
+  ChevronDown,
   Clock,
   FileSpreadsheet,
   GitCompare,
-  Moon,
+  Maximize2,
+  Minimize2,
   Play,
   RefreshCw,
   Search,
   Send,
   ShieldAlert,
+  SlidersHorizontal,
   Sparkles,
   Square,
-  Sun,
 } from 'lucide-react';
+import { AutoBacktestControlPanel } from './components/AutoBacktestControlPanel.tsx';
+import { BtcCorrelationCard } from './components/BtcCorrelationCard.tsx';
+import { DerivativesStructureCard } from './components/DerivativesStructureCard.tsx';
+import { ExternalNotificationPanel } from './components/ExternalNotificationPanel.tsx';
+import { KeyLevelsSessionStrip } from './components/KeyLevelsSessionStrip.tsx';
 import { KlineSmcChart } from './components/KlineSmcChart.tsx';
+import { MarketBreadthSectorPanel } from './components/MarketBreadthSectorPanel.tsx';
+import { MicrostructureCard } from './components/MicrostructureCard.tsx';
+import { PositionRiskPlannerCard } from './components/PositionRiskPlannerCard.tsx';
+import {
+  AddPositionSentinelInput,
+  PositionSentinelPanel,
+  UpdatePositionSentinelPatch,
+} from './components/PositionSentinelPanel.tsx';
+import { PriceAlertDrawer } from './components/PriceAlertDrawer.tsx';
 import { ProvenanceLine } from './components/ProvenanceLine.tsx';
 import {
+  SettingsFormulasModal,
+  SettingsHubTab,
+} from './components/SettingsFormulasModal.tsx';
+import { SystemStabilityPanel } from './components/SystemStabilityPanel.tsx';
+import {
+  AutoBacktestStatusResponse,
   BackgroundSchedulerStatus,
   BacktestResult,
+  BacktestTriggerSource,
   CrossExchangeDivergenceResponse,
   DecisionTraceApiResponse,
   ExchangeId,
+  ExternalNotificationChannel,
+  ExternalNotificationStatusResponse,
   GeminiExplainResponse,
   MarketRadarCategory,
   MarketScanResponse,
+  MarketSectorKey,
   NotificationDispatchRecord,
   NotificationOutboxRecord,
   PaperLedgerEntry,
@@ -37,20 +63,35 @@ import {
   PaperQualityGateDriftResponse,
   PaperQualityMarketRegimesResponse,
   PaperQualityStatusResponse,
+  PaperStrategyTrack,
+  PaperTrackComparisonStats,
   PaperTrackedSignalRecord,
   Phase7MonitoringWindowReport,
+  PortfolioBacktestResult,
+  PortfolioRiskConfig,
+  PositionSentinelConfig,
+  PositionSentinelStatusResponse,
+  PriceAlertRule,
   ScanCategory,
+  SmcAbComparisonResponse,
   SmcActionState,
   SmcQualityCycleHistoryResponse,
   SmcQualityGateStatsResponse,
   SmcQualityReasonStatsResponse,
   SmcQualitySignalLatencyResponse,
   SmcQualityWindowReportResponse,
+  SmcRuleProfile,
   SmcScanStatusResponse,
   SymbolDetailResponse,
   SystemDatabaseHealthResponse,
+  SystemWatchdogStatusResponse,
   Timeframe,
+  TradeHorizonProfile,
   TRADING_SAFETY_FLAGS,
+  TradingCostConfig,
+  TriggeredAlertEvent,
+  ValidationReadinessResponse,
+  WatchdogConfig,
 } from './types/market.ts';
 
 type ActiveSection =
@@ -58,11 +99,59 @@ type ActiveSection =
   | 'divergence'
   | 'backtest'
   | 'paper_ledger'
+  | 'position_sentinel'
   | 'notifications'
   | 'paper_quality';
 
+type DetailWorkstationTab =
+  | 'chart_smc'
+  | 'micro_deriv'
+  | 'btc_corr'
+  | 'planner_diag';
+
 const WATCHLIST_STORAGE_KEY = 'crypto_radar_watchlist_v1';
 const THEME_STORAGE_KEY = 'crypto_radar_theme_v1';
+const ALERTS_STORAGE_KEY = 'crypto_radar_price_alerts_v1';
+const ALERT_EVENTS_STORAGE_KEY = 'crypto_radar_alert_events_v1';
+
+function getTradeHorizonToneClass(
+  category?: TradeHorizonProfile['category']
+): string {
+  switch (category) {
+    case 'SWING_EXTENDED':
+      return 'text-violet-300';
+    case 'INTRADAY_TREND':
+      return 'text-sky-300';
+    case 'SCALP_FAST':
+      return 'text-amber-300';
+    default:
+      return 'text-slate-400';
+  }
+}
+
+function playAlertChime(): void {
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(784, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1046.5, ctx.currentTime + 0.14);
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.32);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.34);
+  } catch {
+    // ignore audio autoplay restrictions
+  }
+}
 
 export default function App() {
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>(() => {
@@ -79,10 +168,28 @@ export default function App() {
   const [minQuoteVolume24h, setMinQuoteVolume24h] = useState<number>(0);
   const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>('15m');
   const [categoryFilter, setCategoryFilter] = useState<
-    'ALL' | 'WATCHLIST' | ScanCategory | MarketRadarCategory
+    | 'ALL'
+    | 'WATCHLIST'
+    | 'SMC_CONFIRMED'
+    | 'EARLY_IGNITION'
+    | 'PULLBACK_READY'
+    | 'SMC_WATCH'
+    | 'NEAR_MISS'
+    | ScanCategory
+    | MarketRadarCategory
   >('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [activeSection, setActiveSection] = useState<ActiveSection>('radar');
+  const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
+  const [settingsHubTab, setSettingsHubTab] =
+    useState<SettingsHubTab>('settings');
+  const [showMarketWeather, setShowMarketWeather] = useState<boolean>(true);
+  const [sectorFilter, setSectorFilter] = useState<'ALL' | MarketSectorKey>(
+    'ALL'
+  );
+  const [multiChartSplit, setMultiChartSplit] = useState<boolean>(false);
+  const [detailTab, setDetailTab] = useState<DetailWorkstationTab>('chart_smc');
+  const [detailExpanded, setDetailExpanded] = useState<boolean>(false);
 
   useEffect(() => {
     try {
@@ -94,6 +201,17 @@ export default function App() {
       document.body.classList.toggle('theme-light', themeMode === 'light');
     }
   }, [themeMode]);
+
+  useEffect(() => {
+    if (!settingsModalOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setSettingsModalOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [settingsModalOpen]);
 
   // Market Scan State
   const [scanData, setScanData] = useState<MarketScanResponse | null>(null);
@@ -132,10 +250,83 @@ export default function App() {
   const [backtestReports, setBacktestReports] = useState<BacktestResult[]>([]);
   const [backtestLoading, setBacktestLoading] = useState<boolean>(false);
   const [backtestError, setBacktestError] = useState<string | null>(null);
+  const [backtestBarLimit, setBacktestBarLimit] = useState<
+    120 | 240 | 500 | 1000
+  >(240);
+  const [costConfigState, setCostConfigState] = useState<TradingCostConfig>({
+    makerFeeBps: 2,
+    takerFeeBps: 5,
+    slippageBps: 3,
+    defaultFundingRatePer8h: 0.0001,
+    entryOrderType: 'MARKET',
+  });
+  const [portfolioSymbolsInput, setPortfolioSymbolsInput] = useState<string>(
+    'BTCUSDT,ETHUSDT,SOLUSDT,SUIUSDT,BNBUSDT'
+  );
+  const [portfolioRiskConfig, setPortfolioRiskConfig] =
+    useState<PortfolioRiskConfig>({
+      maxOpenPositions: 3,
+      maxSameDirectionPositions: 2,
+      dailyMaxDrawdownR: 3,
+      consecutiveLossCooldownLimit: 3,
+      cooldownBars: 8,
+    });
+  const [portfolioBacktestResult, setPortfolioBacktestResult] =
+    useState<PortfolioBacktestResult | null>(null);
+  const [portfolioLoading, setPortfolioLoading] = useState<boolean>(false);
+  const [portfolioError, setPortfolioError] = useState<string | null>(null);
+  const [smcRuleProfile, setSmcRuleProfile] =
+    useState<SmcRuleProfile>('STRICT_PRODUCTION');
+  const [abCompareResult, setAbCompareResult] =
+    useState<SmcAbComparisonResponse | null>(null);
+  const [abCompareLoading, setAbCompareLoading] = useState<boolean>(false);
+  const [abCompareError, setAbCompareError] = useState<string | null>(null);
+  const [validationReadiness, setValidationReadiness] =
+    useState<ValidationReadinessResponse | null>(null);
 
   // Paper Trading Ledger State (SQLite Persisted, Strictly PAPER ONLY)
   const [paperLedger, setPaperLedger] = useState<PaperLedgerEntry[]>([]);
+  const [trackComparisonLive, setTrackComparisonLive] =
+    useState<PaperTrackComparisonStats | null>(null);
+  const [trackComparisonAll, setTrackComparisonAll] =
+    useState<PaperTrackComparisonStats | null>(null);
+  const [paperTrackScope, setPaperTrackScope] = useState<
+    'LIVE_ONLY' | 'ALL_INCLUDING_DEMO'
+  >('LIVE_ONLY');
+  const [paperTrackFilter, setPaperTrackFilter] = useState<
+    'ALL' | PaperStrategyTrack | 'WAITING_LIMIT' | 'EXPIRED_LIMIT'
+  >('ALL');
+  const [pullbackTtlMinutes, setPullbackTtlMinutes] = useState<number>(240);
+  const [pendingPaperConflict, setPendingPaperConflict] = useState<{
+    kind: 'OBSERVATION' | 'EARLY_IGNITION' | 'PULLBACK_LIMIT';
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    strategyTrack: PaperStrategyTrack;
+    conflictingEntries: PaperLedgerEntry[];
+    highBtcSameSideCount: number;
+    pullbackParams?: {
+      side: 'LONG' | 'SHORT';
+      entryPrice: number;
+      invalidationPrice: number;
+      targetPrice: number;
+      anchorLabel: string;
+      ttlMinutes?: number;
+    };
+  } | null>(null);
+  const [overextendedChaseWarning, setOverextendedChaseWarning] = useState<{
+    symbol: string;
+    conflictMode?: 'FORCE' | 'REPLACE';
+    errorMessage?: string;
+  } | null>(null);
   const [ledgerLoading, setLedgerLoading] = useState<boolean>(false);
+  const prevPaperLedgerRef = useRef<Map<number, PaperLedgerEntry>>(new Map());
+  const fetchPaperLedgerRef = useRef<(() => Promise<void>) | null>(null);
+  const activeExchangeRef = useRef<ExchangeId>(selectedExchange);
+  activeExchangeRef.current = selectedExchange;
+  const marketScanSeqRef = useRef<number>(0);
+  const marketScanAbortRef = useRef<AbortController | null>(null);
+  const symbolDetailSeqRef = useRef<number>(0);
+  const symbolDetailAbortRef = useRef<AbortController | null>(null);
 
   // Notification & Background Scheduler State
   const [notificationHistory, setNotificationHistory] = useState<
@@ -146,6 +337,33 @@ export default function App() {
     useState<BackgroundSchedulerStatus | null>(null);
   const [schedulerLoading, setSchedulerLoading] = useState<boolean>(false);
 
+  // Auto-Backtest Scheduler & External Notification Channels State
+  const [autoBacktestStatus, setAutoBacktestStatus] =
+    useState<AutoBacktestStatusResponse | null>(null);
+  const [autoBacktestLoading, setAutoBacktestLoading] =
+    useState<boolean>(false);
+  const [backtestSourceFilter, setBacktestSourceFilter] = useState<
+    'ALL' | BacktestTriggerSource
+  >('ALL');
+  const [backtestSearchQuery, setBacktestSearchQuery] = useState<string>('');
+  const [externalNotifyStatus, setExternalNotifyStatus] =
+    useState<ExternalNotificationStatusResponse | null>(null);
+  const [externalNotifyLoading, setExternalNotifyLoading] =
+    useState<boolean>(false);
+  const [externalTestingChannel, setExternalTestingChannel] =
+    useState<ExternalNotificationChannel | null>(null);
+  const [externalTestFeedback, setExternalTestFeedback] = useState<{
+    channel: ExternalNotificationChannel;
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  // Position Sentinel: Active Trade Trend & Reversal Guardian
+  const [positionSentinelStatus, setPositionSentinelStatus] =
+    useState<PositionSentinelStatusResponse | null>(null);
+  const [positionSentinelLoading, setPositionSentinelLoading] =
+    useState<boolean>(false);
+
   // Phase 3: Full-Market SMC Background Queue Status
   const [smcScanStatus, setSmcScanStatus] =
     useState<SmcScanStatusResponse | null>(null);
@@ -153,6 +371,10 @@ export default function App() {
   const [systemDbHealth, setSystemDbHealth] =
     useState<SystemDatabaseHealthResponse | null>(null);
   const [dbCheckLoading, setDbCheckLoading] = useState<boolean>(false);
+  const lastDbHealthFetchAtRef = useRef<number>(0);
+  const [watchdogStatus, setWatchdogStatus] =
+    useState<SystemWatchdogStatusResponse | null>(null);
+  const [watchdogLoading, setWatchdogLoading] = useState<boolean>(false);
 
   // Phase 5: Paper Shadow Monitor, Signal Quality Report & Notification Sandbox State
   const [paperMonitorStatus, setPaperMonitorStatus] =
@@ -223,11 +445,283 @@ export default function App() {
     });
   }, []);
 
+  // Interactive Price / Structure Alert Engine State (Local Browser Only)
+  const [alertDrawerOpen, setAlertDrawerOpen] = useState<boolean>(false);
+  const [alertSoundEnabled, setAlertSoundEnabled] = useState<boolean>(true);
+  const [browserNotifyEnabled, setBrowserNotifyEnabled] =
+    useState<boolean>(false);
+  const [latestAlertToast, setLatestAlertToast] =
+    useState<TriggeredAlertEvent | null>(null);
+  const [priceAlerts, setPriceAlerts] = useState<PriceAlertRule[]>(() => {
+    try {
+      const raw = localStorage.getItem(ALERTS_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as PriceAlertRule[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [alertEvents, setAlertEvents] = useState<TriggeredAlertEvent[]>(() => {
+    try {
+      const raw = localStorage.getItem(ALERT_EVENTS_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as TriggeredAlertEvent[]) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ALERTS_STORAGE_KEY, JSON.stringify(priceAlerts));
+    } catch {
+      // ignore storage errors
+    }
+  }, [priceAlerts]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        ALERT_EVENTS_STORAGE_KEY,
+        JSON.stringify(alertEvents.slice(0, 50))
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [alertEvents]);
+
+  const addPriceAlertRule = useCallback(
+    (
+      draft: Omit<
+        PriceAlertRule,
+        'id' | 'createdAt' | 'triggered' | 'triggeredAt' | 'triggeredPrice'
+      >
+    ) => {
+      const rule: PriceAlertRule = {
+        ...draft,
+        id: `alert_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        triggered: false,
+        triggeredAt: null,
+        triggeredPrice: null,
+        createdAt: new Date().toISOString(),
+      };
+      setPriceAlerts((prev) => [rule, ...prev]);
+    },
+    []
+  );
+
+  const createPullbackAlertRule = useCallback(
+    (price: number, direction: 'LONG' | 'SHORT', note: string) => {
+      if (!symbolDetail) return;
+      addPriceAlertRule({
+        symbol: symbolDetail.symbol,
+        conditionType: direction === 'LONG' ? 'PRICE_BELOW' : 'PRICE_ABOVE',
+        targetPrice: price,
+        zoneLow: symbolDetail.entryZoneAnalysis?.zoneLow ?? null,
+        zoneHigh: symbolDetail.entryZoneAnalysis?.zoneHigh ?? null,
+        thresholdPct: null,
+        note,
+        enabled: true,
+      });
+      setAlertDrawerOpen(true);
+    },
+    [symbolDetail, addPriceAlertRule]
+  );
+
+  const deletePriceAlertRule = useCallback((id: string) => {
+    setPriceAlerts((prev) => prev.filter((r) => r.id !== id));
+  }, []);
+
+  const togglePriceAlertRule = useCallback((id: string) => {
+    setPriceAlerts((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, enabled: !r.enabled } : r))
+    );
+  }, []);
+
+  const rearmPriceAlertRule = useCallback((id: string) => {
+    setPriceAlerts((prev) =>
+      prev.map((r) =>
+        r.id === id
+          ? {
+              ...r,
+              enabled: true,
+              triggered: false,
+              triggeredAt: null,
+              triggeredPrice: null,
+            }
+          : r
+      )
+    );
+  }, []);
+
+  const handleToggleBrowserNotify = useCallback(async () => {
+    if (browserNotifyEnabled) {
+      setBrowserNotifyEnabled(false);
+      return;
+    }
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      if (Notification.permission === 'granted') {
+        setBrowserNotifyEnabled(true);
+      } else if (Notification.permission !== 'denied') {
+        const perm = await Notification.requestPermission();
+        setBrowserNotifyEnabled(perm === 'granted');
+      }
+    }
+  }, [browserNotifyEnabled]);
+
+  // Evaluate local alert rules on every scanData / symbolDetail refresh
+  useEffect(() => {
+    const candidates = scanData?.candidates ?? [];
+    if (candidates.length === 0 && !symbolDetail) return;
+
+    const priceMap = new Map<
+      string,
+      { lastPrice: number; fundingRate: number | null; change24h: number }
+    >();
+    for (const c of candidates) {
+      priceMap.set(c.symbol, {
+        lastPrice: c.lastPrice,
+        fundingRate: c.fundingRate,
+        change24h: c.priceChangePercent24h,
+      });
+    }
+    if (symbolDetail?.candidate) {
+      priceMap.set(symbolDetail.symbol, {
+        lastPrice: symbolDetail.candidate.lastPrice,
+        fundingRate: symbolDetail.candidate.fundingRate,
+        change24h: symbolDetail.candidate.priceChangePercent24h,
+      });
+    }
+
+    const newlyTriggered: TriggeredAlertEvent[] = [];
+    const triggeredMap = new Map<
+      string,
+      { triggeredAt: string; triggerPrice: number | null }
+    >();
+
+    for (const rule of priceAlerts) {
+      if (!rule.enabled || rule.triggered) continue;
+      const snap = priceMap.get(rule.symbol);
+      if (!snap) continue;
+
+      let hit = false;
+      let msg = '';
+      if (
+        rule.conditionType === 'PRICE_ABOVE' &&
+        rule.targetPrice !== null &&
+        snap.lastPrice >= rule.targetPrice
+      ) {
+        hit = true;
+        msg = `${rule.symbol} 現價 ${snap.lastPrice} 突破目標價 ${rule.targetPrice}（${rule.note}）`;
+      } else if (
+        rule.conditionType === 'PRICE_BELOW' &&
+        rule.targetPrice !== null &&
+        snap.lastPrice <= rule.targetPrice
+      ) {
+        hit = true;
+        msg = `${rule.symbol} 現價 ${snap.lastPrice} 跌破目標價 ${rule.targetPrice}（${rule.note}）`;
+      } else if (
+        (rule.conditionType === 'TOUCH_OB' ||
+          rule.conditionType === 'TOUCH_FVG') &&
+        rule.zoneLow !== null &&
+        rule.zoneHigh !== null &&
+        snap.lastPrice >= rule.zoneLow &&
+        snap.lastPrice <= rule.zoneHigh
+      ) {
+        hit = true;
+        msg = `${rule.symbol} 現價 ${snap.lastPrice} 進入 ${
+          rule.conditionType === 'TOUCH_OB' ? 'OB' : 'FVG'
+        } 區間 [${rule.zoneLow}–${rule.zoneHigh}]（${rule.note}）`;
+      } else if (
+        rule.conditionType === 'FUNDING_EXTREME' &&
+        rule.thresholdPct !== null &&
+        snap.fundingRate !== null &&
+        Math.abs(snap.fundingRate * 100) >= rule.thresholdPct
+      ) {
+        hit = true;
+        msg = `${rule.symbol} 資金費率達 ${(snap.fundingRate * 100).toFixed(4)}%，超過門檻 ±${rule.thresholdPct}%`;
+      } else if (
+        rule.conditionType === 'BTC_MOVE_SHOCK' &&
+        rule.thresholdPct !== null &&
+        Math.abs(snap.change24h) >= rule.thresholdPct
+      ) {
+        hit = true;
+        msg = `BTCUSDT 24h 波動達 ${snap.change24h >= 0 ? '+' : ''}${snap.change24h.toFixed(2)}%，觸發急變預警`;
+      }
+
+      if (hit) {
+        const nowIso = new Date().toISOString();
+        triggeredMap.set(rule.id, {
+          triggeredAt: nowIso,
+          triggerPrice: snap.lastPrice,
+        });
+        newlyTriggered.push({
+          id: `ev_${Date.now()}_${rule.id}`,
+          ruleId: rule.id,
+          symbol: rule.symbol,
+          conditionType: rule.conditionType,
+          messageZh: msg,
+          triggerPrice: snap.lastPrice,
+          triggeredAt: nowIso,
+        });
+      }
+    }
+
+    if (newlyTriggered.length > 0) {
+      setPriceAlerts((prev) =>
+        prev.map((r) => {
+          const hitInfo = triggeredMap.get(r.id);
+          return hitInfo
+            ? {
+                ...r,
+                triggered: true,
+                triggeredAt: hitInfo.triggeredAt,
+                triggeredPrice: hitInfo.triggerPrice,
+              }
+            : r;
+        })
+      );
+      setAlertEvents((prev) => [...newlyTriggered, ...prev].slice(0, 50));
+      setLatestAlertToast(newlyTriggered[0]);
+      if (alertSoundEnabled) {
+        playAlertChime();
+      }
+      if (
+        browserNotifyEnabled &&
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        Notification.permission === 'granted'
+      ) {
+        try {
+          new Notification(`條件告警觸發 · ${newlyTriggered[0].symbol}`, {
+            body: newlyTriggered[0].messageZh,
+          });
+        } catch {
+          // ignore notification error in iframe
+        }
+      }
+    }
+  }, [
+    scanData,
+    symbolDetail,
+    priceAlerts,
+    alertSoundEnabled,
+    browserNotifyEnabled,
+  ]);
+
   // 1. Execute Full Market Scan
   const executeMarketScan = useCallback(
     async (overrideMode?: 'live' | 'demo', overrideExchange?: ExchangeId) => {
       const targetMode = overrideMode ?? dataMode;
       const targetExchange = overrideExchange ?? selectedExchange;
+      const reqSeq = ++marketScanSeqRef.current;
+
+      marketScanAbortRef.current?.abort('SUPERSEDED');
+      const controller = new AbortController();
+      marketScanAbortRef.current = controller;
+      let timedOut = false;
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort(new DOMException('REQUEST_TIMEOUT', 'AbortError'));
+      }, 45000);
 
       setScanLoading(true);
       setScanError(null);
@@ -237,25 +731,20 @@ export default function App() {
           mode: targetMode,
           exchange: targetExchange,
           minQuoteVolume24h: String(minQuoteVolume24h),
+          compact: '1',
         });
-        const res = await fetch(`/api/scan?${params.toString()}`);
+        const res = await fetch(`/api/scan?${params.toString()}`, {
+          signal: controller.signal,
+        });
+        if (reqSeq !== marketScanSeqRef.current) return;
         setLastHttpStatus(res.status);
         const data = (await res.json()) as MarketScanResponse;
+        if (reqSeq !== marketScanSeqRef.current) return;
 
         setScanData(data);
         if (data.smcScanStatus) {
           setSmcScanStatus(data.smcScanStatus);
         }
-        fetch(
-          `/api/system/database-health?mode=${targetMode}&exchange=${targetExchange}`
-        )
-          .then((dbRes) => (dbRes.ok ? dbRes.json() : null))
-          .then((dbData) => {
-            if (dbData) {
-              setSystemDbHealth(dbData as SystemDatabaseHealthResponse);
-            }
-          })
-          .catch(() => {});
         if (!res.ok || data.apiError) {
           setSymbolDetail(null);
           setScanError(
@@ -263,10 +752,24 @@ export default function App() {
               ? `${data.apiError || '即時資料不可用'} (${data.apiErrorDetail})`
               : data.apiError || '即時資料不可用'
           );
+        } else {
+          void fetchPaperLedgerRef.current?.();
         }
       } catch (err) {
-        const msg =
-          err instanceof Error ? err.message : '網路連線失敗，無法取得行情';
+        if (reqSeq !== marketScanSeqRef.current) {
+          return;
+        }
+        const isAbortErr =
+          controller.signal.aborted ||
+          (err instanceof Error && err.name === 'AbortError');
+        if (isAbortErr && !timedOut) {
+          return;
+        }
+        const msg = timedOut
+          ? '即時掃描請求逾時 (超過 45 秒)，系統仍在背景處理中，請點擊「重試即時 API」'
+          : err instanceof Error
+            ? err.message
+            : '網路連線失敗，無法取得行情';
         const fetchedAt = new Date().toISOString();
         const emptyStats = {
           totalContractsScanned: 0,
@@ -385,7 +888,10 @@ export default function App() {
         });
         setScanError(`即時資料不可用 (${msg})`);
       } finally {
-        setScanLoading(false);
+        clearTimeout(timeoutId);
+        if (reqSeq === marketScanSeqRef.current) {
+          setScanLoading(false);
+        }
       }
     },
     [dataMode, selectedExchange, minQuoteVolume24h]
@@ -401,6 +907,11 @@ export default function App() {
     ) => {
       const targetMode = overrideMode ?? dataMode;
       const targetExchange = overrideExchange ?? selectedExchange;
+      const reqSeq = ++symbolDetailSeqRef.current;
+
+      symbolDetailAbortRef.current?.abort('SUPERSEDED');
+      const controller = new AbortController();
+      symbolDetailAbortRef.current = controller;
 
       setSelectedSymbol(symbol);
       setDetailLoading(true);
@@ -415,12 +926,17 @@ export default function App() {
           timeframe,
         });
         const [res, traceRes] = await Promise.all([
-          fetch(`/api/symbol/${encodeURIComponent(symbol)}?${params.toString()}`),
+          fetch(`/api/symbol/${encodeURIComponent(symbol)}?${params.toString()}`, {
+            signal: controller.signal,
+          }),
           fetch(
-            `/api/symbol/${encodeURIComponent(symbol)}/decision-trace?${params.toString()}`
+            `/api/symbol/${encodeURIComponent(symbol)}/decision-trace?${params.toString()}`,
+            { signal: controller.signal }
           ),
         ]);
+        if (reqSeq !== symbolDetailSeqRef.current) return;
         const data = await res.json();
+        if (reqSeq !== symbolDetailSeqRef.current) return;
 
         if (!res.ok) {
           setDetailError(
@@ -435,7 +951,9 @@ export default function App() {
         setSymbolDetail(detail);
         if (traceRes.ok) {
           const traceJson = (await traceRes.json()) as DecisionTraceApiResponse;
-          setDecisionTraceData(traceJson);
+          if (reqSeq === symbolDetailSeqRef.current) {
+            setDecisionTraceData(traceJson);
+          }
         } else if (detail.decisionTrace) {
           setDecisionTraceData(detail.decisionTrace as DecisionTraceApiResponse);
         } else {
@@ -449,13 +967,22 @@ export default function App() {
           },
         }));
       } catch (err) {
+        if (reqSeq !== symbolDetailSeqRef.current) return;
+        if (
+          controller.signal.aborted ||
+          (err instanceof Error && err.name === 'AbortError')
+        ) {
+          return;
+        }
         const msg =
           err instanceof Error ? err.message : '載入單一幣種 K 線與 OI 失敗';
         setDetailError(`即時資料不可用：${msg}`);
         setSymbolDetail(null);
         setDecisionTraceData(null);
       } finally {
-        setDetailLoading(false);
+        if (reqSeq === symbolDetailSeqRef.current) {
+          setDetailLoading(false);
+        }
       }
     },
     [dataMode, selectedExchange, selectedTimeframe]
@@ -532,6 +1059,24 @@ export default function App() {
     }
   }, []);
 
+  const fetchValidationReadiness = useCallback(
+    async (overrideExchange?: ExchangeId) => {
+      const targetEx = overrideExchange ?? selectedExchange;
+      const ex = targetEx === 'demo_synthetic' ? 'binance_usdm' : targetEx;
+      try {
+        const res = await fetch(`/api/validation/readiness?exchange=${ex}`);
+        if (res.ok) {
+          setValidationReadiness(
+            (await res.json()) as ValidationReadinessResponse
+          );
+        }
+      } catch {
+        // ignore background readiness error
+      }
+    },
+    [selectedExchange]
+  );
+
   const executeBacktest = useCallback(
     async (
       symbol: string,
@@ -550,8 +1095,11 @@ export default function App() {
             timeframe,
             mode: dataMode,
             exchange: selectedExchange,
+            barLimit: backtestBarLimit,
             includeWalkForward: true,
             writeToPaperLedger,
+            smcRuleProfile,
+            costConfig: costConfigState,
           }),
         });
         const data = await res.json();
@@ -565,6 +1113,7 @@ export default function App() {
         if (writeToPaperLedger) {
           await fetchPaperLedger();
         }
+        void fetchValidationReadiness();
       } catch (err) {
         setBacktestError(
           err instanceof Error ? err.message : '呼叫 /api/backtest 失敗'
@@ -573,75 +1122,673 @@ export default function App() {
         setBacktestLoading(false);
       }
     },
-    [dataMode, selectedExchange, fetchBacktestReports]
+    [
+      dataMode,
+      selectedExchange,
+      backtestBarLimit,
+      smcRuleProfile,
+      costConfigState,
+      fetchBacktestReports,
+      fetchValidationReadiness,
+    ]
   );
 
+  const executePortfolioBacktest = useCallback(async () => {
+    setPortfolioLoading(true);
+    setPortfolioError(null);
+    const parsedSymbols = portfolioSymbolsInput
+      .split(/[\s,]+/)
+      .map((s) => s.trim().toUpperCase())
+      .filter((s) => /^[A-Z0-9]{4,20}$/.test(s))
+      .slice(0, 15);
+    try {
+      const res = await fetch('/api/backtest/portfolio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbols:
+            parsedSymbols.length > 0
+              ? parsedSymbols
+              : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+          timeframe: selectedTimeframe,
+          mode: dataMode,
+          exchange: selectedExchange,
+          barLimit: backtestBarLimit,
+          smcRuleProfile,
+          costConfig: costConfigState,
+          riskConfig: portfolioRiskConfig,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPortfolioError(data.error || '多幣種組合回測執行失敗');
+        return;
+      }
+      setPortfolioBacktestResult(data as PortfolioBacktestResult);
+      void fetchValidationReadiness();
+    } catch (err) {
+      setPortfolioError(
+        err instanceof Error ? err.message : '呼叫 /api/backtest/portfolio 失敗'
+      );
+    } finally {
+      setPortfolioLoading(false);
+    }
+  }, [
+    portfolioSymbolsInput,
+    selectedTimeframe,
+    dataMode,
+    selectedExchange,
+    backtestBarLimit,
+    smcRuleProfile,
+    costConfigState,
+    portfolioRiskConfig,
+    fetchValidationReadiness,
+  ]);
+
+  const executeSmcAbComparison = useCallback(async () => {
+    setAbCompareLoading(true);
+    setAbCompareError(null);
+    const parsedSymbols = portfolioSymbolsInput
+      .split(/[\s,]+/)
+      .map((s) => s.trim().toUpperCase())
+      .filter((s) => /^[A-Z0-9]{4,20}$/.test(s))
+      .slice(0, 15);
+    try {
+      const res = await fetch('/api/backtest/ab-compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbols:
+            parsedSymbols.length > 0
+              ? parsedSymbols
+              : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'],
+          timeframe: selectedTimeframe,
+          mode: dataMode,
+          exchange: selectedExchange,
+          barLimit: backtestBarLimit,
+          costConfig: costConfigState,
+          riskConfig: portfolioRiskConfig,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAbCompareError(data.error || 'A/B 規則對比回測執行失敗');
+        return;
+      }
+      setAbCompareResult(data as SmcAbComparisonResponse);
+    } catch (err) {
+      setAbCompareError(
+        err instanceof Error ? err.message : '呼叫 /api/backtest/ab-compare 失敗'
+      );
+    } finally {
+      setAbCompareLoading(false);
+    }
+  }, [
+    portfolioSymbolsInput,
+    selectedTimeframe,
+    dataMode,
+    selectedExchange,
+    backtestBarLimit,
+    costConfigState,
+    portfolioRiskConfig,
+  ]);
+
   // 6. Paper Trading Ledger Actions (Strictly PAPER ONLY)
+  const applyPaperLedgerUpdate = useCallback(
+    (entries: PaperLedgerEntry[]) => {
+      const prevMap = prevPaperLedgerRef.current;
+      const eventsToAdd: TriggeredAlertEvent[] = [];
+      if (prevMap.size > 0) {
+        for (const entry of entries) {
+          const prev = prevMap.get(entry.id);
+          if (!prev) continue;
+          if (
+            prev.fillStatus === 'WAITING_LIMIT' &&
+            entry.fillStatus === 'FILLED'
+          ) {
+            eventsToAdd.push({
+              id: `paper_fill_${entry.id}_${Date.now()}`,
+              ruleId: `paper_limit_${entry.id}`,
+              symbol: entry.symbol,
+              conditionType:
+                entry.side === 'LONG' ? 'PRICE_BELOW' : 'PRICE_ABOVE',
+              messageZh: `[PAPER] ${entry.symbol} 回踩限價單 #${entry.id} 已觸價成交 ($${entry.entryPrice})`,
+              triggerPrice: entry.currentPrice,
+              triggeredAt: entry.filledAt ?? new Date().toISOString(),
+            });
+          } else if (
+            prev.status === 'OPEN' &&
+            prev.fillStatus === 'WAITING_LIMIT' &&
+            entry.status === 'CLOSED_EXPIRED'
+          ) {
+            const reasonZh =
+              entry.expiredReason === 'TARGET_MISSED'
+                ? '價格未回踩即先行達標，自動作廢'
+                : entry.expiredReason === 'INVALIDATED_BEFORE_FILL'
+                  ? '未觸價前跌破/突破結構失效位，自動作廢'
+                  : '超過等待時限 (TTL)，自動過期作廢';
+            eventsToAdd.push({
+              id: `paper_exp_${entry.id}_${Date.now()}`,
+              ruleId: `paper_limit_${entry.id}`,
+              symbol: entry.symbol,
+              conditionType:
+                entry.side === 'LONG' ? 'PRICE_BELOW' : 'PRICE_ABOVE',
+              messageZh: `[PAPER] ${entry.symbol} 回踩限價單 #${entry.id} ${reasonZh} (0R)`,
+              triggerPrice: entry.currentPrice,
+              triggeredAt: entry.closedAt ?? new Date().toISOString(),
+            });
+          }
+        }
+      }
+      prevPaperLedgerRef.current = new Map(entries.map((e) => [e.id, e]));
+      setPaperLedger(entries);
+
+      if (eventsToAdd.length > 0) {
+        setAlertEvents((prev) => [...eventsToAdd, ...prev].slice(0, 50));
+        setLatestAlertToast(eventsToAdd[0]);
+        if (alertSoundEnabled) {
+          playAlertChime();
+        }
+      }
+    },
+    [alertSoundEnabled]
+  );
+
   const fetchPaperLedger = useCallback(async () => {
     setLedgerLoading(true);
     try {
       const res = await fetch('/api/paper-ledger');
       if (res.ok) {
         const data = await res.json();
-        setPaperLedger(data.entries || []);
+        applyPaperLedgerUpdate(data.entries || []);
+        if (data.trackComparisonLive) {
+          setTrackComparisonLive(data.trackComparisonLive);
+        }
+        if (data.trackComparisonAll) {
+          setTrackComparisonAll(data.trackComparisonAll);
+        }
       }
     } finally {
       setLedgerLoading(false);
     }
-  }, []);
+  }, [applyPaperLedgerUpdate]);
 
-  const recordPaperObservation = useCallback(async () => {
-    if (!symbolDetail) return;
-    const { candidate, smcAnalysis } = symbolDetail;
-    const atr = smcAnalysis.atr14 ?? candidate.lastPrice * 0.015;
-    const side: 'LONG' | 'SHORT' =
-      smcAnalysis.actionState === 'SHORT CANDIDATE' ||
-      candidate.category === '空頭候選'
-        ? 'SHORT'
-        : 'LONG';
+  fetchPaperLedgerRef.current = fetchPaperLedger;
 
-    const entryPrice = candidate.lastPrice;
-    const invalidationPrice =
-      side === 'LONG'
-        ? Number((entryPrice - atr * 1.5).toPrecision(6))
-        : Number((entryPrice + atr * 1.5).toPrecision(6));
-    const targetPrice =
-      side === 'LONG'
-        ? Number((entryPrice + atr * 2.5).toPrecision(6))
-        : Number((entryPrice - atr * 2.5).toPrecision(6));
-
-    const res = await fetch('/api/paper-ledger', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        symbol: candidate.symbol,
-        exchange: selectedExchange,
-        timeframe: symbolDetail.primaryTimeframe,
-        side,
-        category: candidate.category,
-        actionState: smcAnalysis.actionState,
-        entryPrice,
-        invalidationPrice,
-        targetPrice,
-        ruleVersion: smcAnalysis.ruleVersion,
-        evidences: [
-          ...candidate.evidences
-            .filter((e) => e.passed)
-            .map((e) => `${e.label}: ${e.value}`),
-          ...smcAnalysis.evidences
-            .filter((e) => e.passed)
-            .map((e) => `${e.label}: ${e.value}`),
-        ],
-        notes: `[PAPER ONLY] 紙上結構觀察紀錄 (${selectedExchange})`,
-        provenance: symbolDetail.provenance,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setPaperLedger(data.entries || []);
-      setActiveSection('paper_ledger');
+  const portfolioHighBtcStats = useMemo(() => {
+    const corrBySymbol = new Map(
+      (scanData?.candidates ?? []).map((c) => [c.symbol, c.btcCorrelation])
+    );
+    let longCount = 0;
+    let shortCount = 0;
+    for (const e of paperLedger) {
+      if (e.status !== 'OPEN' || (e.fillStatus ?? 'FILLED') !== 'FILLED') {
+        continue;
+      }
+      const corr =
+        corrBySymbol.get(e.symbol) ??
+        (symbolDetail?.symbol === e.symbol ? symbolDetail.btcCorrelation : null);
+      const isHigh =
+        e.symbol === 'BTCUSDT' ||
+        (corr !== undefined &&
+          corr !== null &&
+          corr.status === 'READY' &&
+          !corr.isBenchmark &&
+          (corr.tier === 'HIGH_COUPLED' || (corr.pearson15m ?? 0) >= 0.7));
+      if (!isHigh) continue;
+      if (e.side === 'LONG') longCount++;
+      else shortCount++;
     }
-  }, [symbolDetail, selectedExchange]);
+    return { longCount, shortCount };
+  }, [paperLedger, scanData, symbolDetail]);
+
+  const activeSymbolOpenOrders = useMemo(() => {
+    if (!symbolDetail) return [];
+    return paperLedger.filter(
+      (e) => e.status === 'OPEN' && e.symbol === symbolDetail.symbol
+    );
+  }, [paperLedger, symbolDetail]);
+
+  useEffect(() => {
+    setPendingPaperConflict(null);
+    setOverextendedChaseWarning(null);
+  }, [symbolDetail?.symbol]);
+
+  const submitPaperObservation = useCallback(
+    async (
+      conflictMode?: 'FORCE' | 'REPLACE',
+      allowOverextendedMarketEntry = false
+    ) => {
+      if (!symbolDetail) return;
+      const { candidate, smcAnalysis } = symbolDetail;
+      const isOverextended =
+        symbolDetail.entryZoneAnalysis?.status === 'OVEREXTENDED';
+      if (isOverextended && !allowOverextendedMarketEntry) {
+        setOverextendedChaseWarning({
+          symbol: candidate.symbol,
+          conflictMode,
+        });
+        return;
+      }
+
+      const atr = smcAnalysis.atr14 ?? candidate.lastPrice * 0.015;
+      const side: 'LONG' | 'SHORT' =
+        smcAnalysis.actionState === 'SHORT CANDIDATE' ||
+        candidate.category === '空頭候選'
+          ? 'SHORT'
+          : 'LONG';
+      const isFormalSmc =
+        smcAnalysis.actionState === 'LONG CANDIDATE' ||
+        smcAnalysis.actionState === 'SHORT CANDIDATE';
+      const strategyTrack: PaperStrategyTrack = isFormalSmc
+        ? 'FORMAL_SMC_MARKET'
+        : candidate.earlyIgnition && candidate.earlyIgnition.status !== 'NONE'
+          ? 'EARLY_IGNITION'
+          : 'MANUAL_OBSERVATION';
+
+      const conflicts = paperLedger.filter(
+        (e) =>
+          e.status === 'OPEN' &&
+          e.symbol === candidate.symbol &&
+          e.side === side &&
+          (e.strategyTrack ?? 'MANUAL_OBSERVATION') === strategyTrack
+      );
+      if (conflicts.length > 0 && !conflictMode) {
+        const highBtcSameSideCount =
+          side === 'LONG'
+            ? portfolioHighBtcStats.longCount
+            : portfolioHighBtcStats.shortCount;
+        setPendingPaperConflict({
+          kind: 'OBSERVATION',
+          symbol: candidate.symbol,
+          side,
+          strategyTrack,
+          conflictingEntries: conflicts,
+          highBtcSameSideCount,
+        });
+        return;
+      }
+
+      if (conflictMode === 'REPLACE' && conflicts.length > 0) {
+        for (const c of conflicts) {
+          await fetch(`/api/paper-ledger/${c.id}/close`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              exitPrice: candidate.lastPrice,
+              notes: '[PAPER ONLY] 由新單覆蓋結算/撤銷',
+            }),
+          });
+        }
+      }
+
+      const entryPrice = candidate.lastPrice;
+      const riskDist = Math.max(atr * 1.8, entryPrice * 0.006);
+      const rewardDist = riskDist * 1.67;
+      const invalidationPrice =
+        side === 'LONG'
+          ? Number((entryPrice - riskDist).toPrecision(6))
+          : Number((entryPrice + riskDist).toPrecision(6));
+      const targetPrice =
+        side === 'LONG'
+          ? Number((entryPrice + rewardDist).toPrecision(6))
+          : Number((entryPrice - rewardDist).toPrecision(6));
+
+      const res = await fetch('/api/paper-ledger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: candidate.symbol,
+          exchange: selectedExchange,
+          timeframe: symbolDetail.primaryTimeframe,
+          side,
+          category: candidate.category,
+          actionState: smcAnalysis.actionState,
+          strategyTrack,
+          fillStatus: 'FILLED',
+          entryAnchorLabel: isFormalSmc ? '正式 SMC 現價進場' : '即時觀察基準價',
+          entryPrice,
+          invalidationPrice,
+          targetPrice,
+          ruleVersion: smcAnalysis.ruleVersion,
+          entryZoneStatus: symbolDetail.entryZoneAnalysis?.status,
+          allowOverextendedMarketEntry,
+          evidences: [
+            ...candidate.evidences
+              .filter((e) => e.passed)
+              .map((e) => `${e.label}: ${e.value}`),
+            ...smcAnalysis.evidences
+              .filter((e) => e.passed)
+              .map((e) => `${e.label}: ${e.value}`),
+          ],
+          notes: `[PAPER ONLY] 紙上結構觀察紀錄 (${selectedExchange})`,
+          provenance: symbolDetail.provenance,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPendingPaperConflict(null);
+        setOverextendedChaseWarning(null);
+        applyPaperLedgerUpdate(data.entries || []);
+        if (data.trackComparisonLive) {
+          setTrackComparisonLive(data.trackComparisonLive);
+        }
+        if (data.trackComparisonAll) {
+          setTrackComparisonAll(data.trackComparisonAll);
+        }
+        if (dataMode === 'demo') {
+          setPaperTrackScope('ALL_INCLUDING_DEMO');
+        }
+        setActiveSection('paper_ledger');
+      } else {
+        const errBody = await res.json().catch(() => ({} as { error?: string }));
+        setOverextendedChaseWarning({
+          symbol: candidate.symbol,
+          conflictMode,
+          errorMessage:
+            errBody?.error ||
+            '反追價保護攔截：請改掛回踩限價單或確認風險後重試。',
+        });
+      }
+    },
+    [
+      symbolDetail,
+      selectedExchange,
+      dataMode,
+      applyPaperLedgerUpdate,
+      paperLedger,
+      portfolioHighBtcStats,
+    ]
+  );
+
+  const recordPaperObservation = useCallback(
+    () => submitPaperObservation(),
+    [submitPaperObservation]
+  );
+
+  const submitEarlyIgnitionPaper = useCallback(
+    async (conflictMode?: 'FORCE' | 'REPLACE') => {
+      if (!symbolDetail) return;
+      const { candidate, smcAnalysis } = symbolDetail;
+      const ign = candidate.earlyIgnition;
+      if (!ign || ign.status === 'NONE' || ign.direction === 'NEUTRAL') return;
+
+      const side: 'LONG' | 'SHORT' = ign.direction === 'LONG' ? 'LONG' : 'SHORT';
+      const conflicts = paperLedger.filter(
+        (e) =>
+          e.status === 'OPEN' &&
+          e.symbol === candidate.symbol &&
+          e.side === side &&
+          e.strategyTrack === 'EARLY_IGNITION'
+      );
+      if (conflicts.length > 0 && !conflictMode) {
+        const highBtcSameSideCount =
+          side === 'LONG'
+            ? portfolioHighBtcStats.longCount
+            : portfolioHighBtcStats.shortCount;
+        setPendingPaperConflict({
+          kind: 'EARLY_IGNITION',
+          symbol: candidate.symbol,
+          side,
+          strategyTrack: 'EARLY_IGNITION',
+          conflictingEntries: conflicts,
+          highBtcSameSideCount,
+        });
+        return;
+      }
+
+      if (conflictMode === 'REPLACE' && conflicts.length > 0) {
+        for (const c of conflicts) {
+          await fetch(`/api/paper-ledger/${c.id}/close`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              exitPrice: candidate.lastPrice,
+              notes: '[PAPER ONLY] 由新早鳥紙上單覆蓋結算',
+            }),
+          });
+        }
+      }
+
+      const entryPrice = candidate.lastPrice;
+      const atr = smcAnalysis.atr14 ?? entryPrice * 0.012;
+      const invalidationPrice =
+        ign.invalidationPrice !== null &&
+        ((side === 'LONG' && ign.invalidationPrice < entryPrice) ||
+          (side === 'SHORT' && ign.invalidationPrice > entryPrice))
+          ? ign.invalidationPrice
+          : side === 'LONG'
+            ? Number((entryPrice - atr * 1.1).toPrecision(6))
+            : Number((entryPrice + atr * 1.1).toPrecision(6));
+      const riskDist = Math.max(
+        Math.abs(entryPrice - invalidationPrice),
+        entryPrice * 0.003
+      );
+      const targetPrice =
+        side === 'LONG'
+          ? Number((entryPrice + riskDist * 2.2).toPrecision(6))
+          : Number((entryPrice - riskDist * 2.2).toPrecision(6));
+
+      const res = await fetch('/api/paper-ledger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: candidate.symbol,
+          exchange: selectedExchange,
+          timeframe: ign.triggerTimeframe ?? symbolDetail.primaryTimeframe,
+          side,
+          category: candidate.category,
+          actionState: smcAnalysis.actionState,
+          strategyTrack: 'EARLY_IGNITION',
+          fillStatus: 'FILLED',
+          entryAnchorLabel: ign.headlineZh,
+          entryPrice,
+          invalidationPrice,
+          targetPrice,
+          ruleVersion: smcAnalysis.ruleVersion,
+          evidences: [`Early Ignition (${ign.ignitionScore}分): ${ign.headlineZh}`],
+          notes: `[PAPER ONLY] 早鳥起漲軌道觀察 (${ign.tier})`,
+          provenance: symbolDetail.provenance,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPendingPaperConflict(null);
+        applyPaperLedgerUpdate(data.entries || []);
+        if (data.trackComparisonLive) {
+          setTrackComparisonLive(data.trackComparisonLive);
+        }
+        if (data.trackComparisonAll) {
+          setTrackComparisonAll(data.trackComparisonAll);
+        }
+        if (dataMode === 'demo') {
+          setPaperTrackScope('ALL_INCLUDING_DEMO');
+        }
+        setActiveSection('paper_ledger');
+      }
+    },
+    [
+      symbolDetail,
+      selectedExchange,
+      dataMode,
+      applyPaperLedgerUpdate,
+      paperLedger,
+      portfolioHighBtcStats,
+    ]
+  );
+
+  const recordEarlyIgnitionPaper = useCallback(
+    () => submitEarlyIgnitionPaper(),
+    [submitEarlyIgnitionPaper]
+  );
+
+  const submitPullbackLimitPaper = useCallback(
+    async (
+      params: {
+        side: 'LONG' | 'SHORT';
+        entryPrice: number;
+        invalidationPrice: number;
+        targetPrice: number;
+        anchorLabel: string;
+        ttlMinutes?: number;
+      },
+      conflictMode?: 'FORCE' | 'REPLACE'
+    ) => {
+      if (!symbolDetail) return;
+      const { candidate, smcAnalysis } = symbolDetail;
+      const conflicts = paperLedger.filter(
+        (e) =>
+          e.status === 'OPEN' &&
+          e.symbol === candidate.symbol &&
+          e.side === params.side &&
+          e.strategyTrack === 'SMC_PULLBACK_LIMIT'
+      );
+      if (conflicts.length > 0 && !conflictMode) {
+        const highBtcSameSideCount =
+          params.side === 'LONG'
+            ? portfolioHighBtcStats.longCount
+            : portfolioHighBtcStats.shortCount;
+        setPendingPaperConflict({
+          kind: 'PULLBACK_LIMIT',
+          symbol: candidate.symbol,
+          side: params.side,
+          strategyTrack: 'SMC_PULLBACK_LIMIT',
+          conflictingEntries: conflicts,
+          highBtcSameSideCount,
+          pullbackParams: params,
+        });
+        return;
+      }
+
+      if (conflictMode === 'REPLACE' && conflicts.length > 0) {
+        for (const c of conflicts) {
+          await fetch(`/api/paper-ledger/${c.id}/close`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              exitPrice: candidate.lastPrice,
+              notes: '[PAPER ONLY] 由新回踩限價單覆蓋撤銷/結算',
+            }),
+          });
+        }
+      }
+
+      const alreadyAtOrBeyondEntry =
+        params.side === 'LONG'
+          ? candidate.lastPrice <= params.entryPrice
+          : candidate.lastPrice >= params.entryPrice;
+      const chosenTtl = params.ttlMinutes ?? pullbackTtlMinutes;
+
+      const res = await fetch('/api/paper-ledger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: candidate.symbol,
+          exchange: selectedExchange,
+          timeframe: symbolDetail.primaryTimeframe,
+          side: params.side,
+          category: candidate.category,
+          actionState: smcAnalysis.actionState,
+          strategyTrack: 'SMC_PULLBACK_LIMIT',
+          fillStatus: alreadyAtOrBeyondEntry ? 'FILLED' : 'WAITING_LIMIT',
+          entryAnchorLabel: params.anchorLabel,
+          ttlMinutes: alreadyAtOrBeyondEntry ? undefined : chosenTtl,
+          entryPrice: params.entryPrice,
+          invalidationPrice: params.invalidationPrice,
+          targetPrice: params.targetPrice,
+          ruleVersion: smcAnalysis.ruleVersion,
+          evidences: [`回踩限價錨點: ${params.anchorLabel}`],
+          notes: `[PAPER ONLY] FVG/OB 回踩限價掛單 (${params.anchorLabel})`,
+          provenance: symbolDetail.provenance,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPendingPaperConflict(null);
+        applyPaperLedgerUpdate(data.entries || []);
+        if (data.trackComparisonLive) {
+          setTrackComparisonLive(data.trackComparisonLive);
+        }
+        if (data.trackComparisonAll) {
+          setTrackComparisonAll(data.trackComparisonAll);
+        }
+        if (dataMode === 'demo') {
+          setPaperTrackScope('ALL_INCLUDING_DEMO');
+        }
+        if (!alreadyAtOrBeyondEntry) {
+          const condType: PriceAlertRule['conditionType'] =
+            params.side === 'LONG' ? 'PRICE_BELOW' : 'PRICE_ABOVE';
+          const duplicateExists = priceAlerts.some(
+            (r) =>
+              r.enabled &&
+              !r.triggered &&
+              r.symbol === candidate.symbol &&
+              r.conditionType === condType &&
+              r.targetPrice !== null &&
+              Math.abs(r.targetPrice - params.entryPrice) <=
+                params.entryPrice * 1e-4
+          );
+          if (!duplicateExists) {
+            addPriceAlertRule({
+              symbol: candidate.symbol,
+              conditionType: condType,
+              targetPrice: params.entryPrice,
+              zoneLow: symbolDetail.entryZoneAnalysis?.zoneLow ?? null,
+              zoneHigh: symbolDetail.entryZoneAnalysis?.zoneHigh ?? null,
+              thresholdPct: null,
+              note: `同步回踩限價單觸價提醒 (${params.anchorLabel})`,
+              enabled: true,
+            });
+          }
+        }
+        setActiveSection('paper_ledger');
+      }
+    },
+    [
+      symbolDetail,
+      selectedExchange,
+      dataMode,
+      pullbackTtlMinutes,
+      applyPaperLedgerUpdate,
+      priceAlerts,
+      addPriceAlertRule,
+      paperLedger,
+      portfolioHighBtcStats,
+    ]
+  );
+
+  const recordPullbackLimitPaper = useCallback(
+    (params: {
+      side: 'LONG' | 'SHORT';
+      entryPrice: number;
+      invalidationPrice: number;
+      targetPrice: number;
+      anchorLabel: string;
+      ttlMinutes?: number;
+    }) => submitPullbackLimitPaper(params),
+    [submitPullbackLimitPaper]
+  );
+
+  const extendPaperLimitPosition = useCallback(
+    async (id: number, extraMinutes = 120) => {
+      const res = await fetch(`/api/paper-ledger/${id}/extend-ttl`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ extraMinutes }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        applyPaperLedgerUpdate(data.entries || []);
+        if (data.trackComparisonLive) {
+          setTrackComparisonLive(data.trackComparisonLive);
+        }
+        if (data.trackComparisonAll) {
+          setTrackComparisonAll(data.trackComparisonAll);
+        }
+      }
+    },
+    [applyPaperLedgerUpdate]
+  );
 
   const closePaperPosition = useCallback(
     async (id: number, currentPrice: number) => {
@@ -655,10 +1802,16 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        setPaperLedger(data.entries || []);
+        applyPaperLedgerUpdate(data.entries || []);
+        if (data.trackComparisonLive) {
+          setTrackComparisonLive(data.trackComparisonLive);
+        }
+        if (data.trackComparisonAll) {
+          setTrackComparisonAll(data.trackComparisonAll);
+        }
       }
     },
-    []
+    [applyPaperLedgerUpdate]
   );
 
   // 7. Trigger Notification Dry-Run Preview & Background Scheduler Control
@@ -736,6 +1889,328 @@ export default function App() {
     }
   }, []);
 
+  const fetchAutoBacktestStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/auto-backtest/status');
+      if (res.ok) {
+        setAutoBacktestStatus(
+          (await res.json()) as AutoBacktestStatusResponse
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const updateAutoBacktestConfig = useCallback(
+    async (patch: {
+      enabled?: boolean;
+      intervalMs?: number;
+      timeframe?: Timeframe;
+      maxSymbolsPerRun?: number;
+      includeWatchlist?: boolean;
+      watchlistSymbols?: string[];
+      exchange?: ExchangeId;
+    }) => {
+      setAutoBacktestLoading(true);
+      try {
+        const res = await fetch('/api/auto-backtest/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...patch,
+            watchlistSymbols: patch.watchlistSymbols ?? watchlist,
+          }),
+        });
+        if (res.ok) {
+          setAutoBacktestStatus(
+            (await res.json()) as AutoBacktestStatusResponse
+          );
+        }
+      } finally {
+        setAutoBacktestLoading(false);
+      }
+    },
+    [watchlist]
+  );
+
+  const runAutoBacktestNow = useCallback(async () => {
+    setAutoBacktestLoading(true);
+    try {
+      const res = await fetch('/api/auto-backtest/run-now', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: dataMode,
+          exchange: selectedExchange,
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          status?: AutoBacktestStatusResponse;
+        };
+        if (data.status) {
+          setAutoBacktestStatus(data.status);
+        }
+        await fetchBacktestReports();
+      }
+    } finally {
+      setAutoBacktestLoading(false);
+    }
+  }, [dataMode, selectedExchange, fetchBacktestReports]);
+
+  const fetchExternalNotifyStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/notify/external/status');
+      if (res.ok) {
+        setExternalNotifyStatus(
+          (await res.json()) as ExternalNotificationStatusResponse
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const updateExternalNotifyConfig = useCallback(
+    async (patch: {
+      telegramEnabled?: boolean;
+      discordEnabled?: boolean;
+      notifyFormalSmc?: boolean;
+      notifyEarlyIgnition?: boolean;
+    }) => {
+      setExternalNotifyLoading(true);
+      try {
+        const res = await fetch('/api/notify/external/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (res.ok) {
+          setExternalNotifyStatus(
+            (await res.json()) as ExternalNotificationStatusResponse
+          );
+        }
+      } finally {
+        setExternalNotifyLoading(false);
+      }
+    },
+    []
+  );
+
+  const sendExternalTestNotification = useCallback(
+    async (channel: ExternalNotificationChannel) => {
+      setExternalTestingChannel(channel);
+      setExternalTestFeedback(null);
+      try {
+        const res = await fetch('/api/notify/external/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            channel,
+            symbol: selectedSymbol,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          record?: { reason?: string };
+          status?: ExternalNotificationStatusResponse;
+          error?: string;
+        };
+        if (data.status) {
+          setExternalNotifyStatus(data.status);
+        }
+        setExternalTestFeedback({
+          channel,
+          ok: Boolean(data.ok),
+          message:
+            data.record?.reason ??
+            data.error ??
+            (data.ok ? '測試通知已成功送出' : '測試通知發送失敗'),
+        });
+      } catch (err) {
+        setExternalTestFeedback({
+          channel,
+          ok: false,
+          message:
+            err instanceof Error ? err.message : '測試通知網路連線失敗',
+        });
+      } finally {
+        setExternalTestingChannel(null);
+      }
+    },
+    [selectedSymbol]
+  );
+
+  const fetchPositionSentinelStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/position-sentinel/status');
+      if (res.ok) {
+        setPositionSentinelStatus(
+          (await res.json()) as PositionSentinelStatusResponse
+        );
+      }
+    } catch {
+      // ignore background status fetch failure
+    }
+  }, []);
+
+  const refreshPositionSentinelCheck = useCallback(async () => {
+    setPositionSentinelLoading(true);
+    try {
+      const res = await fetch('/api/position-sentinel/check-now', {
+        method: 'POST',
+      });
+      if (res.ok) {
+        setPositionSentinelStatus(
+          (await res.json()) as PositionSentinelStatusResponse
+        );
+      }
+    } finally {
+      setPositionSentinelLoading(false);
+    }
+  }, []);
+
+  const importPaperToPositionSentinel = useCallback(async () => {
+    setPositionSentinelLoading(true);
+    try {
+      const res = await fetch('/api/position-sentinel/import-paper', {
+        method: 'POST',
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          status?: PositionSentinelStatusResponse;
+        };
+        if (data.status) setPositionSentinelStatus(data.status);
+      }
+    } finally {
+      setPositionSentinelLoading(false);
+    }
+  }, []);
+
+  const addPositionToSentinel = useCallback(
+    async (input: AddPositionSentinelInput) => {
+      setPositionSentinelLoading(true);
+      try {
+        const res = await fetch('/api/position-sentinel/positions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...input, evaluateNow: true }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            status?: PositionSentinelStatusResponse;
+          };
+          if (data.status) setPositionSentinelStatus(data.status);
+        }
+      } finally {
+        setPositionSentinelLoading(false);
+      }
+    },
+    []
+  );
+
+  const updatePositionInSentinel = useCallback(
+    async (id: string, patch: UpdatePositionSentinelPatch) => {
+      setPositionSentinelLoading(true);
+      try {
+        const res = await fetch(`/api/position-sentinel/positions/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            status?: PositionSentinelStatusResponse;
+          };
+          if (data.status) setPositionSentinelStatus(data.status);
+          if (patch.syncPaperLedger) {
+            await fetchPaperLedgerRef.current?.();
+          }
+        }
+      } finally {
+        setPositionSentinelLoading(false);
+      }
+    },
+    []
+  );
+
+  const deletePositionFromSentinel = useCallback(async (id: string) => {
+    setPositionSentinelLoading(true);
+    try {
+      const res = await fetch(`/api/position-sentinel/positions/${id}`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          status?: PositionSentinelStatusResponse;
+        };
+        if (data.status) setPositionSentinelStatus(data.status);
+      }
+    } finally {
+      setPositionSentinelLoading(false);
+    }
+  }, []);
+
+  const updatePositionSentinelConfig = useCallback(
+    async (patch: Partial<PositionSentinelConfig>) => {
+      setPositionSentinelLoading(true);
+      try {
+        const res = await fetch('/api/position-sentinel/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (res.ok) {
+          setPositionSentinelStatus(
+            (await res.json()) as PositionSentinelStatusResponse
+          );
+        }
+      } finally {
+        setPositionSentinelLoading(false);
+      }
+    },
+    []
+  );
+
+  const quickGuardSymbolDetail = useCallback(async () => {
+    if (!symbolDetail) return;
+    const { candidate, smcAnalysis } = symbolDetail;
+    const atr = smcAnalysis.atr14 ?? candidate.lastPrice * 0.015;
+    const side: 'LONG' | 'SHORT' =
+      smcAnalysis.actionState === 'SHORT CANDIDATE' ||
+      candidate.category === '空頭候選' ||
+      candidate.marketRadarCategory === '雷達空頭觀察'
+        ? 'SHORT'
+        : 'LONG';
+    const entryPrice = candidate.lastPrice;
+    const invalidationPrice =
+      symbolDetail.entryZoneAnalysis?.stopLossPrice ??
+      (side === 'LONG'
+        ? Number((entryPrice - atr * 1.5).toPrecision(6))
+        : Number((entryPrice + atr * 1.5).toPrecision(6)));
+    const targetPrice =
+      symbolDetail.entryZoneAnalysis?.targetPrice ??
+      (side === 'LONG'
+        ? Number((entryPrice + atr * 2.5).toPrecision(6))
+        : Number((entryPrice - atr * 2.5).toPrecision(6)));
+    await addPositionToSentinel({
+      symbol: candidate.symbol,
+      exchange:
+        selectedExchange === 'demo_synthetic'
+          ? 'binance_usdm'
+          : selectedExchange,
+      side,
+      timeframe: symbolDetail.primaryTimeframe,
+      entryPrice,
+      invalidationPrice,
+      targetPrice,
+      leverage: 1,
+      notes: `[快速加入守護] ${candidate.finalTradeSignal}`,
+    });
+    setActiveSection('position_sentinel');
+  }, [symbolDetail, selectedExchange, addPositionToSentinel]);
+
   const fetchSystemDbHealth = useCallback(
     async (overrideMode?: 'live' | 'demo', overrideExchange?: ExchangeId) => {
       const targetMode = overrideMode ?? dataMode;
@@ -744,7 +2219,8 @@ export default function App() {
         const res = await fetch(
           `/api/system/database-health?mode=${targetMode}&exchange=${targetExchange}`
         );
-        if (res.ok) {
+        if (res.ok && activeExchangeRef.current === targetExchange) {
+          lastDbHealthFetchAtRef.current = Date.now();
           setSystemDbHealth((await res.json()) as SystemDatabaseHealthResponse);
         }
       } catch {
@@ -767,6 +2243,7 @@ export default function App() {
         }),
       });
       if (res.ok) {
+        lastDbHealthFetchAtRef.current = Date.now();
         setSystemDbHealth((await res.json()) as SystemDatabaseHealthResponse);
       }
     } finally {
@@ -774,18 +2251,72 @@ export default function App() {
     }
   }, [dataMode, selectedExchange]);
 
+  const fetchWatchdogStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/system/watchdog/status');
+      if (res.ok) {
+        setWatchdogStatus((await res.json()) as SystemWatchdogStatusResponse);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const runWatchdogCheck = useCallback(async () => {
+    setWatchdogLoading(true);
+    try {
+      const res = await fetch('/api/system/watchdog/run-check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceHeartbeat: true, forceBackup: true }),
+      });
+      if (res.ok) {
+        const payload = (await res.json()) as {
+          status: SystemWatchdogStatusResponse;
+        };
+        if (payload?.status) {
+          setWatchdogStatus(payload.status);
+        }
+        void fetchSystemDbHealth();
+      }
+    } finally {
+      setWatchdogLoading(false);
+    }
+  }, [fetchSystemDbHealth]);
+
+  const updateWatchdogConfig = useCallback(
+    async (patch: Partial<Omit<WatchdogConfig, 'updatedAt'>>) => {
+      setWatchdogLoading(true);
+      try {
+        const res = await fetch('/api/system/watchdog/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (res.ok) {
+          setWatchdogStatus((await res.json()) as SystemWatchdogStatusResponse);
+        }
+      } finally {
+        setWatchdogLoading(false);
+      }
+    },
+    []
+  );
+
   const fetchSmcScanStatus = useCallback(
     async (overrideMode?: 'live' | 'demo', overrideExchange?: ExchangeId) => {
       const targetMode = overrideMode ?? dataMode;
       const targetExchange = overrideExchange ?? selectedExchange;
       try {
         const res = await fetch(
-          `/api/smc-scan/status?mode=${targetMode}&exchange=${targetExchange}`
+          `/api/smc-scan/status?mode=${targetMode}&exchange=${targetExchange}&compact=1`
         );
-        if (res.ok) {
+        if (res.ok && activeExchangeRef.current === targetExchange) {
           setSmcScanStatus((await res.json()) as SmcScanStatusResponse);
         }
-        void fetchSystemDbHealth(targetMode, targetExchange);
+        if (Date.now() - lastDbHealthFetchAtRef.current >= 15000) {
+          void fetchSystemDbHealth(targetMode, targetExchange);
+        }
       } catch {
         // ignore
       }
@@ -926,116 +2457,94 @@ export default function App() {
       }
       const ex: ExchangeId =
         rawEx === 'demo_synthetic' ? 'binance_usdm' : rawEx;
-      try {
-        const [
-          statusRes,
-          reportRes,
-          windowReportRes,
-          healthRes,
-          signalsRes,
-          outboxRes,
-          qGateRes,
-          qReasonRes,
-          qHistoryRes,
-          qLatencyRes,
-          qReport7dRes,
-          qReport30dRes,
-          pqStatusRes,
-          pqDriftRes,
-          pqRegimesRes,
-        ] = await Promise.all([
-          fetch(`/api/paper-monitor/status?exchange=${ex}`),
-          fetch(`/api/paper-monitor/report?window=${win}&exchange=${ex}`),
-          fetch(`/api/paper-monitor/window-report?exchange=${ex}`),
-          fetch(`/api/paper-monitor/health?exchange=${ex}`),
-          fetch(`/api/paper-monitor/signals?exchange=${ex}&limit=50`),
-          fetch(`/api/notification-sandbox/outbox?limit=50`),
-          fetch(`/api/smc-quality/gate-stats?exchange=${ex}`),
-          fetch(`/api/smc-quality/reason-stats?exchange=${ex}`),
-          fetch(`/api/smc-quality/cycle-history?exchange=${ex}&limit=20`),
-          fetch(`/api/smc-quality/signal-latency?exchange=${ex}`),
-          fetch(`/api/smc-quality/report?window=7d&exchange=${ex}`),
-          fetch(`/api/smc-quality/report?window=30d&exchange=${ex}`),
-          fetch(`/api/paper-quality/status?exchange=${ex}`),
-          fetch(`/api/paper-quality/gate-drift?exchange=${ex}`),
-          fetch(`/api/paper-quality/market-regimes?window=30d&exchange=${ex}`),
-        ]);
-        if (statusRes.ok) {
-          setPaperMonitorStatus(
-            (await statusRes.json()) as PaperMonitorStatusResponse
-          );
+
+      const fetchAndApply = async <T,>(
+        url: string,
+        apply: (data: T) => void
+      ): Promise<void> => {
+        try {
+          const res = await fetch(url);
+          if (
+            res.ok &&
+            (activeExchangeRef.current === ex || rawEx === 'demo_synthetic')
+          ) {
+            const data = (await res.json()) as T;
+            apply(data);
+          }
+        } catch {
+          // ignore network errors during background refresh
         }
-        if (reportRes.ok) {
-          setPaperMonitorReport(
-            (await reportRes.json()) as PaperMonitorReportResponse
-          );
-        }
-        if (windowReportRes.ok) {
-          setPaperWindowReport(
-            (await windowReportRes.json()) as Phase7MonitoringWindowReport
-          );
-        }
-        if (healthRes.ok) {
-          setPaperMonitorHealth(
-            (await healthRes.json()) as PaperMonitorHealthResponse
-          );
-        }
-        if (signalsRes.ok) {
-          const sData = await signalsRes.json();
-          setPaperTrackedSignals(sData.signals || []);
-        }
-        if (outboxRes.ok) {
-          const oData = await outboxRes.json();
-          setNotificationOutbox(oData.outbox || oData.entries || []);
-        }
-        if (qGateRes.ok) {
-          setSmcQualityGateStats(
-            (await qGateRes.json()) as SmcQualityGateStatsResponse
-          );
-        }
-        if (qReasonRes.ok) {
-          setSmcQualityReasonStats(
-            (await qReasonRes.json()) as SmcQualityReasonStatsResponse
-          );
-        }
-        if (qHistoryRes.ok) {
-          setSmcQualityCycleHistory(
-            (await qHistoryRes.json()) as SmcQualityCycleHistoryResponse
-          );
-        }
-        if (qLatencyRes.ok) {
-          setSmcQualitySignalLatency(
-            (await qLatencyRes.json()) as SmcQualitySignalLatencyResponse
-          );
-        }
-        if (qReport7dRes.ok) {
-          setSmcQualityReport7d(
-            (await qReport7dRes.json()) as SmcQualityWindowReportResponse
-          );
-        }
-        if (qReport30dRes.ok) {
-          setSmcQualityReport30d(
-            (await qReport30dRes.json()) as SmcQualityWindowReportResponse
-          );
-        }
-        if (pqStatusRes.ok) {
-          setPaperQualityStatus(
-            (await pqStatusRes.json()) as PaperQualityStatusResponse
-          );
-        }
-        if (pqDriftRes.ok) {
-          setPaperQualityGateDrift(
-            (await pqDriftRes.json()) as PaperQualityGateDriftResponse
-          );
-        }
-        if (pqRegimesRes.ok) {
-          setPaperQualityRegimes(
-            (await pqRegimesRes.json()) as PaperQualityMarketRegimesResponse
-          );
-        }
-      } catch {
-        // ignore network errors during background refresh
-      }
+      };
+
+      // Wave 1: Primary monitor status, report, signals, outbox, and live gate/reason stats (updates each panel progressively as it resolves)
+      await Promise.allSettled([
+        fetchAndApply<PaperMonitorStatusResponse>(
+          `/api/paper-monitor/status?exchange=${ex}`,
+          setPaperMonitorStatus
+        ),
+        fetchAndApply<PaperMonitorReportResponse>(
+          `/api/paper-monitor/report?window=${win}&exchange=${ex}`,
+          setPaperMonitorReport
+        ),
+        fetchAndApply<Phase7MonitoringWindowReport>(
+          `/api/paper-monitor/window-report?exchange=${ex}`,
+          setPaperWindowReport
+        ),
+        fetchAndApply<PaperMonitorHealthResponse>(
+          `/api/paper-monitor/health?exchange=${ex}`,
+          setPaperMonitorHealth
+        ),
+        fetchAndApply<{ signals?: PaperTrackedSignalRecord[] }>(
+          `/api/paper-monitor/signals?exchange=${ex}&limit=50`,
+          (sData) => setPaperTrackedSignals(sData.signals || [])
+        ),
+        fetchAndApply<{
+          outbox?: NotificationOutboxRecord[];
+          entries?: NotificationOutboxRecord[];
+        }>(`/api/notification-sandbox/outbox?limit=50`, (oData) =>
+          setNotificationOutbox(oData.outbox || oData.entries || [])
+        ),
+        fetchAndApply<SmcQualityGateStatsResponse>(
+          `/api/smc-quality/gate-stats?exchange=${ex}`,
+          setSmcQualityGateStats
+        ),
+        fetchAndApply<SmcQualityReasonStatsResponse>(
+          `/api/smc-quality/reason-stats?exchange=${ex}`,
+          setSmcQualityReasonStats
+        ),
+      ]);
+
+      // Wave 2: Historical & calibration panels (staggered to avoid browser connection/SQLite contention)
+      await Promise.allSettled([
+        fetchAndApply<SmcQualityCycleHistoryResponse>(
+          `/api/smc-quality/cycle-history?exchange=${ex}&limit=20`,
+          setSmcQualityCycleHistory
+        ),
+        fetchAndApply<SmcQualitySignalLatencyResponse>(
+          `/api/smc-quality/signal-latency?exchange=${ex}`,
+          setSmcQualitySignalLatency
+        ),
+        fetchAndApply<SmcQualityWindowReportResponse>(
+          `/api/smc-quality/report?window=7d&exchange=${ex}`,
+          setSmcQualityReport7d
+        ),
+        fetchAndApply<SmcQualityWindowReportResponse>(
+          `/api/smc-quality/report?window=30d&exchange=${ex}`,
+          setSmcQualityReport30d
+        ),
+        fetchAndApply<PaperQualityStatusResponse>(
+          `/api/paper-quality/status?exchange=${ex}`,
+          setPaperQualityStatus
+        ),
+        fetchAndApply<PaperQualityGateDriftResponse>(
+          `/api/paper-quality/gate-drift?exchange=${ex}`,
+          setPaperQualityGateDrift
+        ),
+        fetchAndApply<PaperQualityMarketRegimesResponse>(
+          `/api/paper-quality/market-regimes?window=30d&exchange=${ex}`,
+          setPaperQualityRegimes
+        ),
+      ]);
     },
     [reportWindow, selectedExchange]
   );
@@ -1093,31 +2602,185 @@ export default function App() {
     [reportWindow, selectedExchange, fetchPaperMonitorAll]
   );
 
-  // Initial load: executeMarketScan returns both scanData and smcScanStatus from the same atomic snapshot
+  // Initial load: prioritize critical primary market scan first so the live table renders within ~1-2s,
+  // then yield briefly so React commits the table before starting secondary background analytics without contention.
   useEffect(() => {
-    executeMarketScan();
-    fetchPaperLedger();
-    fetchBacktestReports();
-    fetchSchedulerStatus();
-    fetchPaperMonitorAll();
-    fetchSystemDbHealth();
+    let cancelled = false;
+    const loadInitial = async () => {
+      await executeMarketScan();
+      if (cancelled) return;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (cancelled) return;
+      await Promise.allSettled([
+        fetchPaperLedger(),
+        fetchBacktestReports(),
+        fetchSchedulerStatus(),
+        fetchAutoBacktestStatus(),
+        fetchExternalNotifyStatus(),
+        fetchPositionSentinelStatus(),
+        fetchSystemDbHealth(),
+        fetchWatchdogStatus(),
+        fetchValidationReadiness(),
+      ]);
+      if (cancelled) return;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      if (cancelled) return;
+      void fetchPaperMonitorAll();
+    };
+    void loadInitial();
+    return () => {
+      cancelled = true;
+    };
   }, [
     executeMarketScan,
     fetchPaperLedger,
     fetchBacktestReports,
     fetchSchedulerStatus,
+    fetchAutoBacktestStatus,
+    fetchExternalNotifyStatus,
+    fetchPositionSentinelStatus,
     fetchPaperMonitorAll,
     fetchSystemDbHealth,
+    fetchWatchdogStatus,
+    fetchValidationReadiness,
   ]);
 
-  // Poll SMC background queue status when workerState is RUNNING
+  // Real-time Position Sentinel SSE stream + lightweight fallback poll
   useEffect(() => {
-    if (smcScanStatus?.workerState !== 'RUNNING') return;
+    if (typeof EventSource === 'undefined') {
+      const id = setInterval(() => {
+        void fetchPositionSentinelStatus();
+      }, 15000);
+      return () => clearInterval(id);
+    }
+    const es = new EventSource('/api/position-sentinel/stream');
+    es.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data) as PositionSentinelStatusResponse;
+        if (parsed && Array.isArray(parsed.positions)) {
+          setPositionSentinelStatus(parsed);
+        }
+      } catch {
+        // ignore malformed SSE chunk
+      }
+    };
+    return () => {
+      es.close();
+    };
+  }, [fetchPositionSentinelStatus]);
+
+  useEffect(() => {
+    if (
+      (activeSection === 'paper_quality' || settingsModalOpen) &&
+      Date.now() - lastDbHealthFetchAtRef.current >= 5000
+    ) {
+      void fetchSystemDbHealth();
+      void fetchWatchdogStatus();
+    }
+    if (
+      activeSection === 'backtest' ||
+      activeSection === 'paper_quality' ||
+      activeSection === 'paper_ledger'
+    ) {
+      void fetchValidationReadiness();
+    }
+  }, [
+    activeSection,
+    settingsModalOpen,
+    fetchSystemDbHealth,
+    fetchWatchdogStatus,
+    fetchValidationReadiness,
+  ]);
+
+  // Keep backend auto-backtest watchlist synced whenever user stars/unstars symbols
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void fetch('/api/auto-backtest/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ watchlistSymbols: watchlist }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (d) setAutoBacktestStatus(d as AutoBacktestStatusResponse);
+        })
+        .catch(() => {
+          // ignore background sync error
+        });
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [watchlist]);
+
+  const prevWorkerStateRef = useRef<'RUNNING' | 'PAUSED' | 'IDLE' | undefined>(
+    undefined
+  );
+  const prevCompletedCyclesRef = useRef<number | undefined>(undefined);
+
+  // Poll lightweight SMC queue status & Paper Monitor status only after initial scan commits (5s RUNNING, 10s IDLE)
+  useEffect(() => {
+    if (!scanData) return;
+    const intervalMs = smcScanStatus?.workerState === 'RUNNING' ? 5000 : 10000;
     const id = setInterval(() => {
       void fetchSmcScanStatus();
-    }, 3500);
+      if (dataMode === 'live' && !scanData?.apiError) {
+        const targetEx =
+          selectedExchange === 'demo_synthetic' ? 'binance_usdm' : selectedExchange;
+        void fetch(`/api/paper-monitor/status?exchange=${targetEx}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (d) {
+              setPaperMonitorStatus(d as PaperMonitorStatusResponse);
+            }
+          })
+          .catch(() => {});
+      }
+    }, intervalMs);
     return () => clearInterval(id);
-  }, [smcScanStatus?.workerState, fetchSmcScanStatus]);
+  }, [
+    scanData,
+    smcScanStatus?.workerState,
+    dataMode,
+    selectedExchange,
+    fetchSmcScanStatus,
+  ]);
+
+  // Refresh full scan & Paper Quality reports only when a Live cycle completes or transitions RUNNING -> IDLE
+  useEffect(() => {
+    const currState = smcScanStatus?.workerState;
+    const currCompleted = smcScanStatus?.completedScanCyclesCount;
+    const prevState = prevWorkerStateRef.current;
+    const prevCompleted = prevCompletedCyclesRef.current;
+    prevWorkerStateRef.current = currState;
+    prevCompletedCyclesRef.current = currCompleted;
+
+    const cycleFinished =
+      (prevState === 'RUNNING' && currState === 'IDLE') ||
+      (prevCompleted !== undefined &&
+        currCompleted !== undefined &&
+        currCompleted > prevCompleted);
+
+    if (
+      cycleFinished &&
+      dataMode === 'live' &&
+      !scanData?.apiError &&
+      !scanLoading
+    ) {
+      void fetchPaperMonitorAll();
+      if (!detailLoading) {
+        void executeMarketScan('live', selectedExchange);
+      }
+    }
+  }, [
+    smcScanStatus?.workerState,
+    smcScanStatus?.completedScanCyclesCount,
+    scanData?.apiError,
+    dataMode,
+    scanLoading,
+    detailLoading,
+    selectedExchange,
+    executeMarketScan,
+    fetchPaperMonitorAll,
+  ]);
 
   // When scan finishes and candidates are available, load detail for selectedSymbol
   useEffect(() => {
@@ -1130,13 +2793,203 @@ export default function App() {
     }
   }, [scanData, selectedTimeframe]);
 
+  const nearMissRecords = useMemo(() => {
+    if (!scanData || scanData.apiError) return [];
+    const isDemo = dataMode === 'demo' || Boolean(scanData.provenance?.isDemo);
+    const scanList = scanData.smcGateDiagnostics?.nearMissSymbols ?? [];
+    const liveStatusList =
+      !isDemo ? smcScanStatus?.smcGateDiagnostics?.nearMissSymbols ?? [] : [];
+    const raw =
+      isDemo
+        ? scanList
+        : liveStatusList.length >= scanList.length
+          ? liveStatusList
+          : scanList;
+    const scoreBySymbol = new Map<string, number>(
+      (scanData.candidates ?? []).map((c) => [c.symbol, c.score])
+    );
+    return [...raw].sort((a, b) => {
+      if (a.missingGateCount !== b.missingGateCount) {
+        return a.missingGateCount - b.missingGateCount;
+      }
+      const sa = a.score ?? scoreBySymbol.get(a.symbol) ?? 0;
+      const sb = b.score ?? scoreBySymbol.get(b.symbol) ?? 0;
+      return sb - sa;
+    });
+  }, [dataMode, smcScanStatus, scanData]);
+
+  const nearMissSymbolSet = useMemo(() => {
+    if (!scanData || scanData.apiError) return new Set<string>();
+    const set = new Set<string>(nearMissRecords.map((r) => r.symbol));
+    for (const c of scanData.candidates ?? []) {
+      if (
+        c.nearMissStatus === 'NEAR_MISS_ONE_GATE' ||
+        c.nearMissStatus === 'NEAR_MISS_TWO_GATES'
+      ) {
+        set.add(c.symbol);
+      }
+    }
+    return set;
+  }, [nearMissRecords, scanData]);
+
+  const top3Recommended = useMemo(() => {
+    if (!scanData || scanData.apiError) return [];
+    return [...scanData.candidates]
+      .sort((a, b) => {
+        const aFormal = a.finalTradeSignal !== 'NONE' ? 1 : 0;
+        const bFormal = b.finalTradeSignal !== 'NONE' ? 1 : 0;
+        if (aFormal !== bFormal) return bFormal - aFormal;
+        return b.score - a.score;
+      })
+      .slice(0, 3);
+  }, [scanData]);
+
+  const watchApproachCandidates = useMemo(() => {
+    if (!scanData || scanData.apiError) return [];
+    return [...scanData.candidates]
+      .filter(
+        (c) =>
+          c.smcActionState === 'LONG CANDIDATE' ||
+          c.smcActionState === 'SHORT CANDIDATE' ||
+          c.smcActionState === 'WATCH'
+      )
+      .sort((a, b) => {
+        const aFormal =
+          a.smcActionState === 'LONG CANDIDATE' ||
+          a.smcActionState === 'SHORT CANDIDATE'
+            ? 1
+            : 0;
+        const bFormal =
+          b.smcActionState === 'LONG CANDIDATE' ||
+          b.smcActionState === 'SHORT CANDIDATE'
+            ? 1
+            : 0;
+        if (aFormal !== bFormal) return bFormal - aFormal;
+        return b.score - a.score;
+      });
+  }, [scanData]);
+
+  const confirmedSmcCandidates = useMemo(() => {
+    if (!scanData || scanData.apiError) return [];
+    return [...scanData.candidates]
+      .filter(
+        (c) =>
+          c.smcActionState === 'LONG CANDIDATE' ||
+          c.smcActionState === 'SHORT CANDIDATE'
+      )
+      .sort((a, b) => b.score - a.score);
+  }, [scanData]);
+
+  const confirmedSmcLongCount = useMemo(
+    () =>
+      confirmedSmcCandidates.filter((c) => c.smcActionState === 'LONG CANDIDATE')
+        .length,
+    [confirmedSmcCandidates]
+  );
+
+  const confirmedSmcShortCount = useMemo(
+    () =>
+      confirmedSmcCandidates.filter(
+        (c) => c.smcActionState === 'SHORT CANDIDATE'
+      ).length,
+    [confirmedSmcCandidates]
+  );
+
+  const earlyIgnitionCandidates = useMemo(() => {
+    if (!scanData || scanData.apiError) return [];
+    return [...scanData.candidates]
+      .filter((c) => c.earlyIgnition && c.earlyIgnition.status !== 'NONE')
+      .sort(
+        (a, b) =>
+          (b.earlyIgnition?.ignitionScore ?? 0) -
+          (a.earlyIgnition?.ignitionScore ?? 0)
+      );
+  }, [scanData]);
+
+  const pullbackReadyCandidates = useMemo(() => {
+    if (!scanData || scanData.apiError) return [];
+    return [...scanData.candidates]
+      .filter((c) => {
+        const ez = c.entryZoneSummary;
+        if (!ez || ez.idealPullbackEntry === null) return false;
+        if (ez.direction !== 'LONG' && ez.direction !== 'SHORT') return false;
+        if (
+          c.smcActionState === 'HIGH RISK' ||
+          c.marketRadarCategory === '高風險'
+        ) {
+          return false;
+        }
+        return (
+          ez.status === 'IN_DISCOUNT_ZONE' || ez.status === 'NEAR_PULLBACK_ZONE'
+        );
+      })
+      .sort((a, b) => {
+        const ezA = a.entryZoneSummary!;
+        const ezB = b.entryZoneSummary!;
+        const tierA = ezA.status === 'IN_DISCOUNT_ZONE' ? 0 : 1;
+        const tierB = ezB.status === 'IN_DISCOUNT_ZONE' ? 0 : 1;
+        if (tierA !== tierB) return tierA - tierB;
+        const candA =
+          a.smcActionState === 'LONG CANDIDATE' ||
+          a.smcActionState === 'SHORT CANDIDATE'
+            ? 0
+            : 1;
+        const candB =
+          b.smcActionState === 'LONG CANDIDATE' ||
+          b.smcActionState === 'SHORT CANDIDATE'
+            ? 0
+            : 1;
+        if (candA !== candB) return candA - candB;
+        const distA = Math.abs(ezA.distanceToZonePct ?? 99);
+        const distB = Math.abs(ezB.distanceToZonePct ?? 99);
+        if (Math.abs(distA - distB) > 0.15) return distA - distB;
+        return (ezB.pullbackRR ?? 0) - (ezA.pullbackRR ?? 0);
+      });
+  }, [scanData]);
+
   const filteredCandidates = useMemo(() => {
     if (!scanData || scanData.apiError) return [];
-    return scanData.candidates.filter((c) => {
+    const baseList =
+      categoryFilter === 'PULLBACK_READY'
+        ? pullbackReadyCandidates
+        : scanData.candidates;
+    return baseList.filter((c) => {
       if (categoryFilter === 'WATCHLIST' && !watchlist.includes(c.symbol)) {
         return false;
       }
-      if (categoryFilter === '雷達多頭觀察' || categoryFilter === '多頭候選') {
+      if (categoryFilter === 'PULLBACK_READY') {
+        // already filtered and sniper-sorted via pullbackReadyCandidates
+      } else if (categoryFilter === 'SMC_CONFIRMED') {
+        if (
+          c.smcActionState !== 'LONG CANDIDATE' &&
+          c.smcActionState !== 'SHORT CANDIDATE'
+        ) {
+          return false;
+        }
+      } else if (categoryFilter === 'EARLY_IGNITION') {
+        if (!c.earlyIgnition || c.earlyIgnition.status === 'NONE') {
+          return false;
+        }
+      } else if (categoryFilter === 'SMC_WATCH') {
+        if (
+          c.smcActionState !== 'WATCH' &&
+          c.smcActionState !== 'LONG CANDIDATE' &&
+          c.smcActionState !== 'SHORT CANDIDATE'
+        ) {
+          return false;
+        }
+      } else if (categoryFilter === 'NEAR_MISS') {
+        if (
+          !nearMissSymbolSet.has(c.symbol) &&
+          c.nearMissStatus !== 'NEAR_MISS_ONE_GATE' &&
+          c.nearMissStatus !== 'NEAR_MISS_TWO_GATES'
+        ) {
+          return false;
+        }
+      } else if (
+        categoryFilter === '雷達多頭觀察' ||
+        categoryFilter === '多頭候選'
+      ) {
         if (
           c.marketRadarCategory !== '雷達多頭觀察' &&
           c.category !== '多頭候選'
@@ -1165,6 +3018,9 @@ export default function App() {
           return false;
         }
       }
+      if (sectorFilter !== 'ALL' && c.sector?.key !== sectorFilter) {
+        return false;
+      }
       if (
         searchQuery.trim() !== '' &&
         !c.symbol.toLowerCase().includes(searchQuery.trim().toLowerCase())
@@ -1173,13 +3029,35 @@ export default function App() {
       }
       return true;
     });
-  }, [scanData, categoryFilter, searchQuery, watchlist]);
+  }, [
+    scanData,
+    categoryFilter,
+    pullbackReadyCandidates,
+    sectorFilter,
+    searchQuery,
+    watchlist,
+    nearMissSymbolSet,
+  ]);
 
   const switchToExplicitDemoMode = () => {
     if (dataMode === 'demo' && selectedExchange === 'demo_synthetic') {
       void executeMarketScan('demo', 'demo_synthetic');
       return;
     }
+    marketScanSeqRef.current += 1;
+    symbolDetailSeqRef.current += 1;
+    marketScanAbortRef.current?.abort('SWITCH_DEMO');
+    symbolDetailAbortRef.current?.abort('SWITCH_DEMO');
+    prevWorkerStateRef.current = undefined;
+    prevCompletedCyclesRef.current = undefined;
+    lastDbHealthFetchAtRef.current = 0;
+    setScanError(null);
+    setScanData(null);
+    setSymbolDetail(null);
+    setDecisionTraceData(null);
+    setSmcScanStatus(null);
+    setPaperMonitorStatus(null);
+    setScanLoading(true);
     setDataMode('demo');
     setSelectedExchange('demo_synthetic');
   };
@@ -1189,6 +3067,20 @@ export default function App() {
       void executeMarketScan('live', exId);
       return;
     }
+    marketScanSeqRef.current += 1;
+    symbolDetailSeqRef.current += 1;
+    marketScanAbortRef.current?.abort('SWITCH_LIVE');
+    symbolDetailAbortRef.current?.abort('SWITCH_LIVE');
+    prevWorkerStateRef.current = undefined;
+    prevCompletedCyclesRef.current = undefined;
+    lastDbHealthFetchAtRef.current = 0;
+    setScanError(null);
+    setScanData(null);
+    setSymbolDetail(null);
+    setDecisionTraceData(null);
+    setSmcScanStatus(null);
+    setPaperMonitorStatus(null);
+    setScanLoading(true);
     setDataMode('live');
     setSelectedExchange(exId);
   };
@@ -1206,8 +3098,8 @@ export default function App() {
     >
       {/* Sticky Demo Mode Warning Banner (Required when Demo Mode is active) */}
       {isDemoActive && (
-        <div className="sticky top-0 z-40 border-b border-rose-500/40 bg-rose-950/90 px-6 py-2.5 text-amber-200 backdrop-blur-xl">
-          <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-4 text-xs">
+        <div className="sticky top-0 z-40 border-b border-rose-500/40 bg-rose-950/90 px-4 sm:px-6 py-2.5 text-amber-200 backdrop-blur-xl">
+          <div className="mx-auto flex max-w-[1680px] flex-wrap items-center justify-between gap-4 text-xs">
             <div className="flex items-center gap-2 font-semibold text-amber-300">
               <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
               <span>目前為 DEMO 模擬資料，非即時行情，不可用於交易判斷</span>
@@ -1227,8 +3119,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Apple Frosted-Glass Top Header: Strictly 3 zones separated by gap-8 */}
-      <header className="apple-glass-header sticky top-0 z-30 flex items-center justify-between gap-8 px-6 py-3.5">
+      {/* Apple Frosted-Glass Top Header: Strictly 3 zones with responsive wrap to prevent horizontal clipping */}
+      <header className="apple-glass-header sticky top-0 z-30 flex flex-wrap xl:flex-nowrap items-center justify-between gap-3 xl:gap-6 px-4 sm:px-6 py-3">
         {/* Zone 1: Single text element wordmark */}
         <a
           href="#radar"
@@ -1236,13 +3128,13 @@ export default function App() {
             e.preventDefault();
             setActiveSection('radar');
           }}
-          className="text-[17px] font-semibold tracking-tight text-slate-100 whitespace-nowrap shrink-0"
+          className="text-[17px] font-semibold tracking-tight text-slate-100 whitespace-nowrap shrink-0 order-1"
         >
           加密貨幣全市場行情雷達
         </a>
 
         {/* Zone 2: Apple Segmented Navigation Bar */}
-        <nav className="apple-segmented-track hidden md:flex items-center gap-1 text-xs font-medium text-slate-400">
+        <nav className="apple-segmented-track flex items-center gap-1 text-xs font-medium text-slate-400 order-3 xl:order-2 w-full xl:w-auto max-w-full overflow-x-auto">
           <button
             type="button"
             onClick={() => setActiveSection('radar')}
@@ -1302,6 +3194,26 @@ export default function App() {
           <button
             type="button"
             onClick={() => {
+              setActiveSection('position_sentinel');
+              void fetchPositionSentinelStatus();
+            }}
+            className={`px-3.5 py-1.5 transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              activeSection === 'position_sentinel'
+                ? 'apple-segmented-pill-active font-semibold'
+                : 'hover:text-slate-100'
+            }`}
+          >
+            持倉哨兵 ({positionSentinelStatus?.summary.totalTracked ?? 0}
+            {(positionSentinelStatus?.summary.earlyReversalCount ?? 0) +
+              (positionSentinelStatus?.summary.thesisBrokenCount ?? 0) >
+            0
+              ? ` · ${(positionSentinelStatus?.summary.earlyReversalCount ?? 0) + (positionSentinelStatus?.summary.thesisBrokenCount ?? 0)}預警`
+              : ''}
+            )
+          </button>
+          <button
+            type="button"
+            onClick={() => {
               setActiveSection('notifications');
               fetchSchedulerStatus();
             }}
@@ -1329,8 +3241,19 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: 1 Primary Action Button */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: Unified Settings & Formulas Hub + Primary Scan Action */}
+        <div className="flex items-center gap-2 shrink-0 order-2 xl:order-3">
+          <button
+            type="button"
+            onClick={() => {
+              setSettingsHubTab('settings');
+              setSettingsModalOpen(true);
+            }}
+            className="flex items-center gap-1.5 rounded-full border border-slate-700/80 bg-slate-900/90 px-3.5 py-2 text-xs font-medium text-slate-200 hover:border-amber-400/60 hover:text-amber-200 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5 text-amber-400" />
+            <span>設定與公式</span>
+          </button>
           <button
             type="button"
             onClick={() => executeMarketScan()}
@@ -1346,8 +3269,8 @@ export default function App() {
       </header>
 
       {/* Quiet Apple-Style Status & Safety Disclosure Strip */}
-      <div className="border-b border-white/[0.08] bg-slate-950/60 px-6 py-2 backdrop-blur-md">
-        <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-3 text-xs">
+      <div className="border-b border-white/[0.08] bg-slate-950/60 px-4 sm:px-6 py-2 backdrop-blur-md">
+        <div className="mx-auto flex max-w-[1680px] flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex flex-wrap items-center gap-2 font-mono text-amber-300">
             <span className="inline-block h-2 w-2 rounded-full bg-emerald-400 shrink-0" />
             <span className="font-semibold">{TRADING_SAFETY_FLAGS.mode}</span>
@@ -1359,6 +3282,23 @@ export default function App() {
             <span className="font-semibold">
               {TRADING_SAFETY_FLAGS.executionPolicy}
             </span>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSettingsHubTab('settings');
+                setSettingsModalOpen(true);
+              }}
+              className="font-semibold text-slate-200 hover:text-amber-300 cursor-pointer"
+            >
+              {dataMode === 'demo'
+                ? 'Demo 驗證模式 (DEMO_ONLY)'
+                : selectedExchange === 'bybit_linear'
+                  ? 'Bybit Linear (LIVE)'
+                  : selectedExchange === 'bingx_swap'
+                    ? 'BingX Swap (LIVE)'
+                    : 'Binance USDⓈ-M (LIVE)'}
+            </button>
             <span aria-hidden="true">·</span>
             <span className="font-sans text-slate-400">
               快取狀態：
@@ -1380,9 +3320,23 @@ export default function App() {
               ({smcScanStatus?.cacheCoverageRate ?? scanData?.cacheCoverageRate ?? 100}%)
             </span>
             <span aria-hidden="true">·</span>
-            <span className="font-sans text-slate-400 hidden xl:inline">
-              Phase 2：Binance / Bybit / BingX 跨所掃描、歷史量能異常 (Median/MAD/Z/RVOL)、SQLite 紙上帳本與回測報表
-            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setSettingsHubTab('controls');
+                setSettingsModalOpen(true);
+              }}
+              className="font-mono text-slate-300 hover:text-amber-300 underline decoration-slate-600 underline-offset-2 cursor-pointer"
+            >
+              SMC 佇列:{' '}
+              {smcScanStatus?.succeededCount ??
+                scanData?.smcScanStatus?.succeededCount ??
+                0}
+              /
+              {smcScanStatus?.totalJobs ??
+                scanData?.totalContractsScanned ??
+                0}
+            </button>
           </div>
 
           {scanData?.provenance && (
@@ -1396,8 +3350,8 @@ export default function App() {
 
       {/* Explicit Live API Failure Banner (Never Faking Live Data, Preserving 503 & Provenance) */}
       {scanError && (
-        <div className="border-b border-rose-500/40 bg-rose-950/60 px-6 py-4 backdrop-blur-md">
-          <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-4">
+        <div className="border-b border-rose-500/40 bg-rose-950/60 px-4 sm:px-6 py-4 backdrop-blur-md">
+          <div className="mx-auto flex max-w-[1680px] flex-wrap items-center justify-between gap-4">
             <div className="space-y-1.5">
               <div className="flex items-center gap-2 text-sm font-bold text-rose-300">
                 <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
@@ -1436,2741 +3390,47 @@ export default function App() {
       )}
 
       {/* Main Content Container */}
-      <main className="mx-auto w-full max-w-[1440px] flex-1 px-6 py-7 flex flex-col gap-6">
-        {/* Apple Segmented Workspace Control Bar (order-1) */}
-        <section className="apple-bento-card order-1 flex flex-wrap items-center justify-between gap-4 px-5 py-3.5">
-          {/* Left: Exchange Adapter & Mode Selector */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="apple-segmented-track flex flex-wrap items-center gap-1">
-              <button
-                type="button"
-                onClick={() => switchToLiveExchange('binance_usdm')}
-                className={`px-3 py-1.5 text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                  dataMode === 'live' && selectedExchange === 'binance_usdm'
-                    ? 'apple-segmented-pill-active font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                Binance USDⓈ-M (LIVE)
-              </button>
-              <button
-                type="button"
-                onClick={() => switchToLiveExchange('bybit_linear')}
-                className={`px-3 py-1.5 text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                  dataMode === 'live' && selectedExchange === 'bybit_linear'
-                    ? 'apple-segmented-pill-active font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                Bybit Linear (LIVE)
-              </button>
-              <button
-                type="button"
-                onClick={() => switchToLiveExchange('bingx_swap')}
-                className={`px-3 py-1.5 text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                  dataMode === 'live' && selectedExchange === 'bingx_swap'
-                    ? 'apple-segmented-pill-active font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                BingX Swap (LIVE)
-              </button>
-              <button
-                type="button"
-                onClick={switchToExplicitDemoMode}
-                className={`px-3 py-1.5 text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                  dataMode === 'demo'
-                    ? 'apple-segmented-pill-active text-amber-300 font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                切換 Demo 驗證模式 (DEMO_ONLY)
-              </button>
-            </div>
-
-            {/* Minimum 24h Quote Volume Filter */}
-            <div className="flex items-center gap-2 text-xs">
-              <label
-                htmlFor="min-vol-select"
-                className="text-slate-400 whitespace-nowrap"
-              >
-                最低 24h 成交額:
-              </label>
-              <select
-                id="min-vol-select"
-                value={minQuoteVolume24h}
-                onChange={(e) => setMinQuoteVolume24h(Number(e.target.value))}
-                className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-1.5 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none"
-              >
-                <option value={0}>全部標的 ($0+)</option>
-                <option value={15_000_000}>≥ $1,500萬 (排除低流動性)</option>
-                <option value={50_000_000}>≥ $5,000萬 (50M USDT)</option>
-                <option value={100_000_000}>≥ $1億 (100M USDT)</option>
-                <option value={500_000_000}>≥ $5億 (500M USDT)</option>
-              </select>
-            </div>
-
-            {/* Primary Timeframe Selector */}
-            <div className="flex items-center gap-1.5 text-xs">
-              <span className="text-slate-400 whitespace-nowrap">結構週期:</span>
-              <div className="apple-segmented-track flex items-center gap-1">
-                {(['5m', '15m', '1h', '4h'] as Timeframe[]).map((tf) => (
-                  <button
-                    key={tf}
-                    type="button"
-                    onClick={() => {
-                      setSelectedTimeframe(tf);
-                      if (selectedSymbol && !scanError) {
-                        loadSymbolDetail(selectedSymbol, tf);
-                      }
-                    }}
-                    className={`px-2.5 py-1 text-xs font-mono transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                      selectedTimeframe === tf
-                        ? 'apple-segmented-pill-active font-semibold'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {tf}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Right: Theme Switcher (Apple Space Black vs Studio Silver) + Search Symbol */}
-          <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
-            <div className="apple-segmented-track flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => setThemeMode('dark')}
-                className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium transition-all cursor-pointer whitespace-nowrap ${
-                  themeMode === 'dark'
-                    ? 'apple-segmented-pill-active font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Moon className="h-3.5 w-3.5" />
-                <span>深色專業</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setThemeMode('light')}
-                className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium transition-all cursor-pointer whitespace-nowrap ${
-                  themeMode === 'light'
-                    ? 'apple-segmented-pill-active font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Sun className="h-3.5 w-3.5" />
-                <span>淺色白晝</span>
-              </button>
-            </div>
-
-            <div className="relative flex-1 sm:w-64">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜尋幣種 (例如 SOL, SUI, BTC)..."
-                className="w-full rounded-xl border border-slate-800 bg-slate-950 py-1.5 pl-8 pr-3 text-xs text-slate-100 placeholder-slate-500 focus:border-amber-500 focus:outline-none"
-              />
-            </div>
-          </div>
-        </section>
-
-        {/* Apple Bento Summary Grid + Plain-Language Market Weather & Top 3 Focus Cards (order-2) */}
-        <section className="order-2 space-y-5">
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
-            <button
-              type="button"
-              onClick={() => {
-                setCategoryFilter(
-                  categoryFilter === '雷達多頭觀察' ? 'ALL' : '雷達多頭觀察'
-                );
-                setActiveSection('radar');
-              }}
-              className={`apple-bento-card text-left p-5 cursor-pointer relative overflow-hidden group ${
-                categoryFilter === '雷達多頭觀察' ||
-                categoryFilter === '多頭候選'
-                  ? 'ring-1 ring-emerald-500/60 bg-emerald-500/[0.04]'
-                  : ''
-              }`}
-            >
-              <div className="text-xs font-medium text-slate-400 group-hover:text-slate-300 transition-colors">
-                第一層：雷達多頭觀察 (Radar Long)
-              </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight font-mono tabular-nums text-emerald-400">
-                {scanData?.marketRadarLongCount ??
-                  scanData?.marketRadarCounts?.['雷達多頭觀察'] ??
-                  0}
-              </div>
-              <div className="mt-2 text-[11px] text-slate-400 font-mono">
-                最終多頭候選: {scanData?.summaryCounts['多頭候選'] ?? 0} · SMC
-                LONG: {scanData?.smcLongCandidateCount ?? 0}
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setCategoryFilter(
-                  categoryFilter === '雷達空頭觀察' ? 'ALL' : '雷達空頭觀察'
-                );
-                setActiveSection('radar');
-              }}
-              className={`apple-bento-card text-left p-5 cursor-pointer relative overflow-hidden group ${
-                categoryFilter === '雷達空頭觀察' ||
-                categoryFilter === '空頭候選'
-                  ? 'ring-1 ring-rose-500/60 bg-rose-500/[0.04]'
-                  : ''
-              }`}
-            >
-              <div className="text-xs font-medium text-slate-400 group-hover:text-slate-300 transition-colors">
-                第一層：雷達空頭觀察 (Radar Short)
-              </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight font-mono tabular-nums text-rose-400">
-                {scanData?.marketRadarShortCount ??
-                  scanData?.marketRadarCounts?.['雷達空頭觀察'] ??
-                  0}
-              </div>
-              <div className="mt-2 text-[11px] text-slate-400 font-mono">
-                最終空頭候選: {scanData?.summaryCounts['空頭候選'] ?? 0} · SMC
-                SHORT: {scanData?.smcShortCandidateCount ?? 0}
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setCategoryFilter(
-                  categoryFilter === '準備觀察' ? 'ALL' : '準備觀察'
-                );
-                setActiveSection('radar');
-              }}
-              className={`apple-bento-card text-left p-5 cursor-pointer relative overflow-hidden group ${
-                categoryFilter === '準備觀察'
-                  ? 'ring-1 ring-sky-500/60 bg-sky-500/[0.04]'
-                  : ''
-              }`}
-            >
-              <div className="text-xs font-medium text-slate-400 group-hover:text-slate-300 transition-colors">
-                準備觀察 (Prepare)
-              </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight font-mono tabular-nums text-sky-300">
-                {scanData?.marketRadarCounts?.['準備觀察'] ??
-                  scanData?.summaryCounts['準備觀察'] ??
-                  0}
-              </div>
-              <div className="mt-2 text-[11px] text-slate-400 font-mono">
-                含基線降級準備觀察: {scanData?.summaryCounts['準備觀察'] ?? 0}
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setCategoryFilter(
-                  categoryFilter === '高風險' ? 'ALL' : '高風險'
-                );
-                setActiveSection('radar');
-              }}
-              className={`apple-bento-card text-left p-5 cursor-pointer relative overflow-hidden group ${
-                categoryFilter === '高風險'
-                  ? 'ring-1 ring-amber-500/60 bg-amber-500/[0.04]'
-                  : ''
-              }`}
-            >
-              <div className="text-xs font-medium text-slate-400 group-hover:text-slate-300 transition-colors">
-                高風險 (High Risk)
-              </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight font-mono tabular-nums text-amber-400">
-                {scanData?.summaryCounts['高風險'] ?? 0}
-              </div>
-              <div className="mt-2 text-[11px] text-slate-400">
-                極端費率 · 低流動性高波動
-              </div>
-            </button>
-
-            <div className="apple-bento-card p-5 relative overflow-hidden">
-              <div className="text-xs font-medium text-slate-400">
-                BTC 24h 基準 / 低流動性數
-              </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight font-mono tabular-nums text-slate-100">
-                {scanData?.btcBenchmarkChange24h !== null &&
-                scanData?.btcBenchmarkChange24h !== undefined
-                  ? `${scanData.btcBenchmarkChange24h >= 0 ? '+' : ''}${scanData.btcBenchmarkChange24h.toFixed(2)}%`
-                  : 'N/A'}
-              </div>
-              <div className="mt-2 text-[11px] font-mono text-slate-400 truncate">
-                低流動性: {scanData?.liquidityRejectedCount ?? 0} 檔 ·{' '}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCategoryFilter(
-                      categoryFilter === 'WATCHLIST' ? 'ALL' : 'WATCHLIST'
-                    );
-                    setActiveSection('radar');
-                  }}
-                  className="underline text-amber-300 cursor-pointer"
-                >
-                  觀察清單({watchlist.length})
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Apple Bento: Plain-Language Market Weather Banner + 5-Stage Funnel + Top 3 Focus Cards */}
-          {activeSection === 'radar' && scanData && !scanError && (
-            <div className="apple-bento-card p-6 space-y-4">
-              {(() => {
-                const scanCycle = scanData.cycleId ?? scanData.scanCycleId ?? null;
-                const smcCycle =
-                  smcScanStatus?.cycleId ?? smcScanStatus?.scanCycleId ?? null;
-                const scanSnap = scanData.snapshotAt ?? null;
-                const smcSnap = smcScanStatus?.snapshotAt ?? null;
-                const scanVer = scanData.statsVersion ?? null;
-                const smcVer = smcScanStatus?.statsVersion ?? null;
-                const hasSnapshotMismatch =
-                  dataMode === 'live' &&
-                  Boolean(scanCycle && smcCycle) &&
-                  (scanCycle !== smcCycle ||
-                    (scanVer !== null && smcVer !== null && scanVer !== smcVer) ||
-                    (scanSnap !== null &&
-                      smcSnap !== null &&
-                      scanSnap !== smcSnap));
-                const funnel =
-                  scanData.candidateFunnel ?? smcScanStatus?.candidateFunnel;
-                const gateDiag =
-                  scanData.smcGateDiagnostics ??
-                  smcScanStatus?.smcGateDiagnostics;
-                const scopedStats =
-                  scanData.scopedGateStatistics ??
-                  smcScanStatus?.scopedGateStatistics ??
-                  gateDiag?.scopedGateStatistics;
-                const shadowComp =
-                  scanData.observationShadowComparison ??
-                  smcScanStatus?.observationShadowComparison ??
-                  gateDiag?.observationShadowComparison;
-                const smcCandTotal =
-                  (scanData.smcLongCandidateCount ?? 0) +
-                  (scanData.smcShortCandidateCount ?? 0);
-                const nearMissTotal =
-                  gateDiag?.nearMissCount ??
-                  funnel?.nearMissCount ??
-                  scanData.nearMissCount ??
-                  0;
-                const nearMiss1 =
-                  gateDiag?.nearMissMissing1Count ??
-                  funnel?.nearMissOneGateCount ??
-                  scanData.nearMissMissing1Count ??
-                  0;
-                const nearMiss2 =
-                  gateDiag?.nearMissMissing2Count ??
-                  funnel?.nearMissTwoGatesCount ??
-                  scanData.nearMissMissing2Count ??
-                  0;
-                const blockedByPaper =
-                  scanData.blockedByPaperEligibilityCount ??
-                  smcScanStatus?.blockedByPaperEligibilityCount ??
-                  0;
-                const eligiblePaper =
-                  scanData.eligiblePaperSignalCount ??
-                  smcScanStatus?.eligiblePaperSignalCount ??
-                  0;
-                const missedWindow =
-                  scanData.entryWindowMissedCount ??
-                  smcScanStatus?.entryWindowMissedCount ??
-                  0;
-                const paperOpened =
-                  scanData.paperOpenedCount ??
-                  smcScanStatus?.paperOpenedCount ??
-                  0;
-                const paperClosed =
-                  scanData.paperClosedCount ??
-                  smcScanStatus?.paperClosedCount ??
-                  funnel?.paperClosedCount ??
-                  0;
-                const formalCandidateList = scanData.candidates.filter(
-                  (c) =>
-                    c.smcEvaluationStatus === 'EVALUATED' &&
-                    (c.smcActionState === 'LONG CANDIDATE' ||
-                      c.smcActionState === 'SHORT CANDIDATE')
-                );
-                const nearMissCandidateList = scanData.candidates.filter(
-                  (c) =>
-                    c.nearMissStatus === 'NEAR_MISS_ONE_GATE' ||
-                    c.nearMissStatus === 'NEAR_MISS_TWO_GATES' ||
-                    c.gateEvaluation?.nearMissStatus === 'NEAR_MISS_ONE_GATE' ||
-                    c.gateEvaluation?.nearMissStatus === 'NEAR_MISS_TWO_GATES'
-                );
-
-                return (
-                  <div className="space-y-4 border-b border-slate-800/80 pb-4">
-                    {hasSnapshotMismatch && (
-                      <div className="rounded-xl border border-rose-500/60 bg-rose-950/70 px-4 py-2.5 text-xs font-semibold text-rose-200 flex items-center justify-between gap-3">
-                        <span>
-                          ⚠️ 不同時間快照，不可直接比較（/api/scan cycleId={scanCycle} vs /api/smc-scan/status cycleId={smcCycle}）
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => executeMarketScan()}
-                          className="rounded border border-rose-400/50 bg-rose-900/50 px-2.5 py-1 text-[11px] text-rose-100 hover:bg-rose-800 cursor-pointer"
-                        >
-                          同步最新快照
-                        </button>
-                      </div>
-                    )}
-
-                    {/* Phase 18.2: Mandatory Notices Banner */}
-                    <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-medium">
-                      <span className="rounded-md border border-emerald-500/25 bg-emerald-500/[0.06] px-2.5 py-0.5 text-emerald-300">
-                        {smcCandTotal === 0
-                          ? '目前週期沒有正式候選'
-                          : `目前週期有 ${smcCandTotal} 檔正式候選`}
-                      </span>
-                      <span className="rounded-md border border-rose-500/25 bg-rose-500/[0.06] px-2.5 py-0.5 text-rose-300">
-                        歷史上曾有候選但錯過進場
-                      </span>
-                      <span className="rounded-md border border-amber-500/25 bg-amber-500/[0.06] px-2.5 py-0.5 text-amber-300">
-                        Near-Miss 不等於正式訊號
-                      </span>
-                      <span className="rounded-md border border-sky-500/25 bg-sky-500/[0.06] px-2.5 py-0.5 text-sky-300">
-                        Radar Long/Short 不等於 SMC Long/Short
-                      </span>
-                      <span className="rounded-md border border-white/10 bg-white/[0.04] px-2.5 py-0.5 text-slate-300">
-                        PENDING 不等於 WAIT
-                      </span>
-                      <span className="rounded-md border border-white/10 bg-white/[0.04] px-2.5 py-0.5 text-slate-300">
-                        WAIT/WATCH 不會建立 Paper 交易
-                      </span>
-                    </div>
-
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-400">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="rounded bg-slate-900 px-2 py-0.5 text-slate-200 border border-slate-800">
-                          快照一致性:{' '}
-                          <strong
-                            className={
-                              hasSnapshotMismatch
-                                ? 'text-rose-400'
-                                : 'text-emerald-400'
-                            }
-                          >
-                            {hasSnapshotMismatch
-                              ? '不同時間快照，不可直接比較'
-                              : '同週期原子快照 (CONSISTENT)'}
-                          </strong>
-                        </span>
-                        <span>
-                          cycleId:{' '}
-                          <strong className="text-slate-200">
-                            {scanCycle ?? smcCycle ?? '—'}
-                          </strong>
-                        </span>
-                        <span>
-                          · snapshotAt:{' '}
-                          <strong className="text-slate-200">
-                            {scanSnap ?? smcSnap ?? scanData.fetchedAt}
-                          </strong>
-                        </span>
-                        <span>
-                          · statsVersion:{' '}
-                          <strong className="text-amber-300">
-                            {scanVer ?? smcVer ?? 1}
-                          </strong>
-                        </span>
-                      </div>
-                      {gateDiag && (
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-slate-300">
-                            Near-Miss (僅差1~2項Gate):{' '}
-                            <strong className="text-amber-300">
-                              {nearMissTotal} 檔
-                            </strong>{' '}
-                            (NEAR_MISS_ONE_GATE:{nearMiss1} / NEAR_MISS_TWO_GATES:
-                            {nearMiss2})
-                          </span>
-                          <span>
-                            · 最常見阻擋 Gate:{' '}
-                            <strong className="text-sky-300">
-                              {gateDiag.lastBlockingGate ?? 'MTF_ALIGNMENT'}
-                            </strong>
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Phase 18 Section 七: 7-Stage Signal Funnel Bar */}
-                    <div>
-                      <div className="mb-2 flex items-center justify-between text-xs text-slate-300">
-                        <span className="font-semibold text-slate-200">
-                          完整訊號漏斗追蹤：Radar 觀察 → SMC 已評估 → Near-Miss → 正式 SMC 候選 → Paper Eligible → Paper Opened → Paper Closed
-                        </span>
-                        <span className="font-mono text-[11px] text-slate-400">
-                          ENTRY_WINDOW_MISSED: {missedWindow} · BLOCKED: {blockedByPaper}
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7 font-mono text-xs">
-                        <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5">
-                          <div className="font-sans text-[11px] text-slate-400">
-                            1. Radar 觀察 (1. 第一層雷達觀察)
-                          </div>
-                          <div className="mt-1 text-base font-bold text-slate-100">
-                            {(scanData.marketRadarLongCount ?? 0) +
-                              (scanData.marketRadarShortCount ?? 0)}{' '}
-                            檔
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-slate-400">
-                            Radar Long {scanData.marketRadarLongCount ?? 0} · Short{' '}
-                            {scanData.marketRadarShortCount ?? 0}
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5">
-                          <div className="font-sans text-[11px] text-slate-400">
-                            2. SMC 已評估 (2. 第二層 SMC 已評估)
-                          </div>
-                          <div className="mt-1 text-base font-bold text-sky-400">
-                            {funnel?.smcEvaluatedCount ??
-                              (scanData.totalContractsScanned ?? 0) -
-                                (scanData.smcPendingCount ?? 0)}{' '}
-                            / {scanData.totalContractsScanned ?? 0}
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-slate-400">
-                            WAIT {scanData.smcWaitCount ?? 0} · WATCH{' '}
-                            {scanData.smcWatchCount ?? 0} · HIGH RISK{' '}
-                            {scanData.smcHighRiskCount ?? 0}
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-amber-500/30 bg-amber-500/[0.04] p-2.5">
-                          <div className="font-sans text-[11px] text-amber-300">
-                            3. Near-Miss (觀察)
-                          </div>
-                          <div className="mt-1 text-base font-bold text-amber-400">
-                            {nearMissTotal} 檔
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-amber-300/80">
-                            差1項: {nearMiss1} · 差2項: {nearMiss2}
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/[0.04] p-2.5">
-                          <div className="font-sans text-[11px] text-emerald-300">
-                            4. 正式 SMC 候選 (3. SMC 候選)
-                          </div>
-                          <div className="mt-1 text-base font-bold text-emerald-400">
-                            {smcCandTotal} 檔
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-slate-300">
-                            LONG: {scanData.smcLongCandidateCount ?? 0} · SHORT:{' '}
-                            {scanData.smcShortCandidateCount ?? 0}
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5">
-                          <div className="font-sans text-[11px] text-slate-400">
-                            5. Paper Eligible (4. Paper 合格訊號)
-                          </div>
-                          <div className="mt-1 text-base font-bold text-amber-400">
-                            {eligiblePaper} 檔
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-slate-400">
-                            BLOCKED: {blockedByPaper} 檔
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5">
-                          <div className="font-sans text-[11px] text-slate-400">
-                            6. Paper Opened (5. 已錯過進場窗口)
-                          </div>
-                          <div className="mt-1 text-base font-bold text-emerald-400">
-                            {paperOpened} 檔
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-rose-300">
-                            MISSED: {missedWindow} 檔
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5">
-                          <div className="font-sans text-[11px] text-slate-400">
-                            7. Paper Closed
-                          </div>
-                          <div className="mt-1 text-base font-bold text-slate-100">
-                            {paperClosed} 檔
-                          </div>
-                          <div className="mt-0.5 text-[10px] text-slate-400">
-                            已結算部位數
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Phase 18.2: Explicit Three-Scope Separation (目前週期 / 監控視窗 / 歷史累計) */}
-                      <div className="mt-2.5 grid grid-cols-1 gap-2 md:grid-cols-3 font-mono text-[11px]">
-                        <div className="rounded-xl border border-emerald-500/25 bg-slate-950/70 px-3 py-2 space-y-1">
-                          <div className="flex items-center justify-between text-emerald-300 font-semibold">
-                            <span>目前週期 (CURRENT_CYCLE)</span>
-                            <span
-                              className={`rounded px-1.5 py-0.5 text-[10px] ${
-                                (scanData.statsConsistency ??
-                                  funnel?.statsConsistency ??
-                                  'VALID') === 'VALID'
-                                  ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-500/40'
-                                  : 'bg-rose-950/70 text-rose-300 border border-rose-500/50'
-                              }`}
-                            >
-                              {scanData.statsConsistency ??
-                                funnel?.statsConsistency ??
-                                'VALID'}
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-slate-300">
-                            <span>
-                              formalCandidateCount={' '}
-                              <strong className="text-emerald-300">
-                                {scanData.formalCandidateCount ??
-                                  funnel?.formalCandidateCount ??
-                                  smcCandTotal}
-                              </strong>
-                            </span>
-                            <span>
-                              currentCyclePaperEligibleCount={' '}
-                              <strong className="text-emerald-300">
-                                {scanData.currentCyclePaperEligibleCount ??
-                                  funnel?.currentCyclePaperEligibleCount ??
-                                  eligiblePaper}
-                              </strong>
-                            </span>
-                            <span>
-                              currentCycleEntryWindowMissedCount={' '}
-                              <strong className="text-slate-100">
-                                {scanData.currentCycleEntryWindowMissedCount ??
-                                  funnel?.currentCycleEntryWindowMissedCount ??
-                                  missedWindow}
-                              </strong>
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-amber-500/25 bg-slate-950/70 px-3 py-2 space-y-1">
-                          <div className="flex items-center justify-between text-amber-300 font-semibold">
-                            <span>監控視窗 (30D/60D/90D · OUTSIDE_CURRENT_CYCLE)</span>
-                            <span className="text-[10px] text-slate-400">
-                              RAYSOL / ALGO 等
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-slate-300">
-                            <span>
-                              monitoringWindowPaperEligibleCount={' '}
-                              <strong className="text-amber-300">
-                                {scanData.monitoringWindowPaperEligibleCount ??
-                                  funnel?.monitoringWindowPaperEligibleCount ??
-                                  scanData.monitoringWindowFunnel?.paperEligibleCount ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              monitoringWindowEntryWindowMissedCount={' '}
-                              <strong className="text-amber-300">
-                                {scanData.monitoringWindowEntryWindowMissedCount ??
-                                  funnel?.monitoringWindowEntryWindowMissedCount ??
-                                  0}
-                              </strong>
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-sky-500/25 bg-slate-950/70 px-3 py-2 space-y-1">
-                          <div className="flex items-center justify-between text-sky-300 font-semibold">
-                            <span>歷史累計 (CUMULATIVE / OUTSIDE_MONITORING_WINDOW)</span>
-                            <span className="text-[10px] text-slate-400">
-                              分母{' '}
-                              {scanData.evaluatedDenominator ??
-                                funnel?.evaluatedDenominator ??
-                                0}
-                              /
-                              {scanData.evaluationUniverseSize ??
-                                funnel?.evaluationUniverseSize ??
-                                scanData.totalContractsScanned ??
-                                0}
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-slate-300">
-                            <span>
-                              cumulativePaperEligibleCount={' '}
-                              <strong className="text-sky-300">
-                                {scanData.cumulativePaperEligibleCount ??
-                                  funnel?.cumulativePaperEligibleCount ??
-                                  scanData.cumulativeFunnel?.paperEligibleCount ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              cumulativeEntryWindowMissedCount={' '}
-                              <strong className="text-slate-100">
-                                {scanData.cumulativeEntryWindowMissedCount ??
-                                  funnel?.cumulativeEntryWindowMissedCount ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              historicalSignalsOutsideWindowCount={' '}
-                              <strong className="text-rose-300">
-                                {scanData.historicalSignalsOutsideWindowCount ??
-                                  funnel?.historicalSignalsOutsideWindowCount ??
-                                  scanData.historicalSignalsOutsideWindow?.count ??
-                                  0}
-                              </strong>
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Phase 18.3 Section 五: 正式候選捕捉效率 (Demo Fixture SLA vs Live 實際 SLA 分離) */}
-                    <div
-                      data-testid="phase18-3-capture-efficiency-panel"
-                      className="rounded-2xl border border-indigo-500/30 bg-slate-900/80 p-3.5 space-y-3"
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="text-xs font-semibold text-indigo-300">
-                          正式候選捕捉效率 (Phase 18.3 · 15m 收盤事件觸發 Fast Lane / Live 與 Demo 證據嚴格分離)
-                        </div>
-                        <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
-                          <span className="rounded-md bg-emerald-950/70 px-2 py-0.5 text-emerald-300 border border-emerald-500/40">
-                            Demo SLA 不等於 Live SLA。
-                          </span>
-                          <span className="rounded-md bg-amber-950/70 px-2 py-0.5 text-amber-300 border border-amber-500/40">
-                            Near-Miss 不等於正式訊號。
-                          </span>
-                          <span className="rounded-md bg-sky-950/70 px-2 py-0.5 text-sky-300 border border-sky-500/40">
-                            Radar Long/Short 不等於 SMC LONG/SHORT。
-                          </span>
-                          <span className="rounded-md bg-slate-950/90 px-2 py-0.5 text-slate-300 border border-white/15">
-                            沒有正式候選時，延遲統計為 null。
-                          </span>
-                          <span className="rounded-md bg-rose-950/70 px-2 py-0.5 text-rose-300 border border-rose-500/40">
-                            ENTRY_WINDOW_MISSED 不得建立回溯 Paper 部位。
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 lg:grid-cols-4 text-[11px] font-mono">
-                        {/* 1. Demo Fixture SLA */}
-                        <div className="rounded-xl border border-violet-500/25 bg-slate-950/75 px-3 py-2.5 space-y-1">
-                          <div className="flex items-center justify-between text-violet-300 font-semibold">
-                            <span>Demo Fixture SLA</span>
-                            <span className="rounded bg-violet-950/80 px-1.5 py-0.5 text-[10px] text-violet-200 border border-violet-500/35">
-                              {scanData.DEMO_LATENCY_FIXTURE?.evidenceType ??
-                                'DEMO_LATENCY_FIXTURE'}
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-slate-300">
-                            <span>
-                              候選數={' '}
-                              <strong className="text-violet-300">
-                                {scanData.DEMO_LATENCY_FIXTURE
-                                  ?.formalCandidateCount ?? 2}
-                              </strong>
-                            </span>
-                            <span>
-                              進場前偵測={' '}
-                              <strong className="text-emerald-300">
-                                {scanData.DEMO_LATENCY_FIXTURE
-                                  ?.detectedBeforeEntryWindowCount ?? 2}
-                              </strong>
-                            </span>
-                            <span>
-                              P50={' '}
-                              <strong className="text-slate-100">
-                                {scanData.DEMO_LATENCY_FIXTURE
-                                  ?.detectionLatencyP50 !== undefined &&
-                                scanData.DEMO_LATENCY_FIXTURE
-                                  ?.detectionLatencyP50 !== null
-                                  ? `${scanData.DEMO_LATENCY_FIXTURE.detectionLatencyP50}ms`
-                                  : 'null'}
-                              </strong>
-                            </span>
-                            <span>
-                              P95={' '}
-                              <strong className="text-slate-100">
-                                {scanData.DEMO_LATENCY_FIXTURE
-                                  ?.detectionLatencyP95 !== undefined &&
-                                scanData.DEMO_LATENCY_FIXTURE
-                                  ?.detectionLatencyP95 !== null
-                                  ? `${scanData.DEMO_LATENCY_FIXTURE.detectionLatencyP95}ms`
-                                  : 'null'}
-                              </strong>
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* 2. Live 實際 SLA */}
-                        <div className="rounded-xl border border-emerald-500/25 bg-slate-950/75 px-3 py-2.5 space-y-1">
-                          <div className="flex items-center justify-between text-emerald-300 font-semibold">
-                            <span>Live 實際 SLA</span>
-                            <span className="text-[10px] text-slate-400">
-                              LIVE_FORMAL_CANDIDATE_COUNT={' '}
-                              {scanData.LIVE_FORMAL_CANDIDATE_COUNT ??
-                                funnel?.LIVE_FORMAL_CANDIDATE_COUNT ??
-                                0}
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-slate-300">
-                            <span>
-                              進場前偵測={' '}
-                              <strong className="text-emerald-300">
-                                {scanData.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT ??
-                                  funnel?.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              LIVE_P50={' '}
-                              <strong className="text-slate-100">
-                                {scanData.LIVE_DETECTION_LATENCY_P50 !==
-                                  undefined &&
-                                scanData.LIVE_DETECTION_LATENCY_P50 !== null
-                                  ? `${scanData.LIVE_DETECTION_LATENCY_P50}ms`
-                                  : 'null'}
-                              </strong>
-                            </span>
-                            <span>
-                              LIVE_P95={' '}
-                              <strong className="text-slate-100">
-                                {scanData.LIVE_DETECTION_LATENCY_P95 !==
-                                  undefined &&
-                                scanData.LIVE_DETECTION_LATENCY_P95 !== null
-                                  ? `${scanData.LIVE_DETECTION_LATENCY_P95}ms`
-                                  : 'null'}
-                              </strong>
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* 3. Fast Lane vs Bulk Queue */}
-                        <div className="rounded-xl border border-sky-500/25 bg-slate-950/75 px-3 py-2.5 space-y-1">
-                          <div className="flex items-center justify-between text-sky-300 font-semibold">
-                            <span>Fast Lane vs Bulk Queue</span>
-                            <span className="text-[10px] text-slate-400">
-                              15m 收盤優先佇列
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-slate-300">
-                            <span>
-                              Fast Lane={' '}
-                              <strong className="text-emerald-300">
-                                {scanData.LIVE_FAST_LANE_COUNT ??
-                                  scanData.fastLaneFormalCandidateCount ??
-                                  0}
-                              </strong>{' '}
-                              (P50:{' '}
-                              {scanData.LIVE_FAST_LANE_DETECTION_LATENCY_P50 !==
-                                undefined &&
-                              scanData.LIVE_FAST_LANE_DETECTION_LATENCY_P50 !==
-                                null
-                                ? `${scanData.LIVE_FAST_LANE_DETECTION_LATENCY_P50}ms`
-                                : 'null'}
-                              , P95:{' '}
-                              {scanData.LIVE_FAST_LANE_DETECTION_LATENCY_P95 !==
-                                undefined &&
-                              scanData.LIVE_FAST_LANE_DETECTION_LATENCY_P95 !==
-                                null
-                                ? `${scanData.LIVE_FAST_LANE_DETECTION_LATENCY_P95}ms`
-                                : 'null'}
-                              )
-                            </span>
-                            <span>
-                              Bulk Queue={' '}
-                              <strong className="text-amber-300">
-                                {scanData.LIVE_BULK_COUNT ??
-                                  scanData.bulkFormalCandidateCount ??
-                                  0}
-                              </strong>{' '}
-                              (P50:{' '}
-                              {scanData.LIVE_BULK_DETECTION_LATENCY_P50 !==
-                                undefined &&
-                              scanData.LIVE_BULK_DETECTION_LATENCY_P50 !== null
-                                ? `${scanData.LIVE_BULK_DETECTION_LATENCY_P50}ms`
-                                : 'null'}
-                              , P95:{' '}
-                              {scanData.LIVE_BULK_DETECTION_LATENCY_P95 !==
-                                undefined &&
-                              scanData.LIVE_BULK_DETECTION_LATENCY_P95 !== null
-                                ? `${scanData.LIVE_BULK_DETECTION_LATENCY_P95}ms`
-                                : 'null'}
-                              )
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* 4. 週期與視窗 ENTRY_WINDOW_MISSED 分離 */}
-                        <div className="rounded-xl border border-amber-500/25 bg-slate-950/75 px-3 py-2.5 space-y-1">
-                          <div className="flex items-center justify-between text-amber-300 font-semibold">
-                            <span>ENTRY_WINDOW_MISSED 範圍分離</span>
-                            <span className="text-[10px] text-slate-400">
-                              嚴格不回溯開盤價
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-slate-300">
-                            <span>
-                              目前週期正式候選={' '}
-                              <strong className="text-emerald-300">
-                                {scanData.formalCandidateCount ??
-                                  funnel?.formalCandidateCount ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              目前週期 ENTRY_WINDOW_MISSED={' '}
-                              <strong className="text-slate-100">
-                                {scanData.currentCycleEntryWindowMissedCount ??
-                                  funnel?.currentCycleEntryWindowMissedCount ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              監控視窗內 ENTRY_WINDOW_MISSED={' '}
-                              <strong className="text-amber-300">
-                                {scanData.monitoringWindowEntryWindowMissedCount ??
-                                  funnel?.monitoringWindowEntryWindowMissedCount ??
-                                  0}
-                              </strong>
-                            </span>
-                            <span>
-                              歷史視窗外 ENTRY_WINDOW_MISSED={' '}
-                              <strong className="text-rose-300">
-                                {scanData.historicalSignalsOutsideWindow
-                                  ?.entryWindowMissedCount ??
-                                  scanData.historicalSignalsOutsideWindowCount ??
-                                  0}
-                              </strong>
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Phase 18 Section 七: Three Dedicated Panels (正式候選 / 接近候選 / 目前沒有正式候選的主要原因) */}
-                    <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-3 pt-1">
-                      {/* Panel 1: 正式候選 */}
-                      <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/[0.03] p-4 space-y-2.5">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-emerald-300">
-                            區塊一：正式候選 (STRICT_PRODUCTION)
-                          </span>
-                          <span className="font-mono text-xs font-bold text-emerald-400">
-                            {formalCandidateList.length} 檔
-                          </span>
-                        </div>
-                        {formalCandidateList.length === 0 ? (
-                          <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-3 text-xs text-slate-300 leading-relaxed space-y-1.5">
-                            <div>
-                              <strong>目前週期沒有正式候選</strong>（formalCandidateCount=0, LONG CANDIDATE=0, SHORT CANDIDATE=0）。
-                            </div>
-                            <div className="text-[11px] font-mono text-slate-400">
-                              <strong>歷史上曾有候選但錯過進場</strong>：監控視窗內 OUTSIDE_CURRENT_CYCLE={scanData.historicalSignalsOutsideCurrentCycleCount ?? funnel?.historicalSignalsOutsideCurrentCycleCount ?? 0} 筆 · 視窗外 OUTSIDE_MONITORING_WINDOW={scanData.historicalSignalsOutsideWindowCount ?? funnel?.historicalSignalsOutsideWindowCount ?? 0} 筆。無正式候選時延遲統計 P50/P95=null（不補 0）。
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
-                            {formalCandidateList.map((fc) => (
-                              <button
-                                key={fc.symbol}
-                                type="button"
-                                onClick={() =>
-                                  loadSymbolDetail(fc.symbol, selectedTimeframe)
-                                }
-                                className="w-full text-left rounded-xl border border-emerald-500/35 bg-emerald-500/[0.06] px-3 py-2 text-xs hover:bg-emerald-500/[0.12] transition-colors cursor-pointer"
-                              >
-                                <div className="flex items-center justify-between font-mono">
-                                  <span className="font-bold text-slate-100">
-                                    {fc.symbol} · {fc.smcActionState}
-                                  </span>
-                                  <span className="text-emerald-300">
-                                    {fc.finalTradeSignal}
-                                  </span>
-                                </div>
-                                <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-300">
-                                  <span>Radar: {fc.marketRadarCategory}</span>
-                                  <span>· 評分: {fc.score}</span>
-                                  <span>
-                                    · candidateDetectionLatencyMs:{' '}
-                                    {fc.candidateDetectionLatencyMs ??
-                                      fc.detectionLatencyMs ??
-                                      'null'}
-                                    ms
-                                  </span>
-                                  <span>
-                                    · entryWindowMissed:{' '}
-                                    {fc.entryWindowMissed
-                                      ? 'true (MISSED)'
-                                      : 'false'}
-                                  </span>
-                                </div>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Panel 2: 接近候選 (Near-Miss) */}
-                      <div className="rounded-2xl border border-amber-500/25 bg-amber-500/[0.03] p-4 space-y-2.5">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-amber-300">
-                            區塊二：接近候選 (Near-Miss · 僅供觀察)
-                          </span>
-                          <span className="font-mono text-xs font-bold text-amber-400">
-                            {nearMissCandidateList.length} 檔 (全市場 {nearMissTotal} 檔)
-                          </span>
-                        </div>
-                        {nearMissCandidateList.length === 0 &&
-                        (gateDiag?.nearMissSymbols?.length ?? 0) === 0 ? (
-                          <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-3 text-xs text-slate-400">
-                            目前無差 1～2 項條件之 Near-Miss 標的。
-                          </div>
-                        ) : (
-                          <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
-                            {(nearMissCandidateList.length > 0
-                              ? nearMissCandidateList.slice(0, 8).map((nm) => ({
-                                  symbol: nm.symbol,
-                                  direction:
-                                    nm.intendedDirection ??
-                                    nm.gateEvaluation?.intendedDirection ??
-                                    (nm.marketRadarCategory === '雷達多頭觀察'
-                                      ? 'LONG'
-                                      : nm.marketRadarCategory === '雷達空頭觀察'
-                                        ? 'SHORT'
-                                        : 'NEUTRAL'),
-                                  marketRadarCategory: nm.marketRadarCategory,
-                                  score: nm.score,
-                                  nearMissStatus:
-                                    nm.nearMissStatus ??
-                                    nm.gateEvaluation?.nearMissStatus ??
-                                    'NEAR_MISS_ONE_GATE',
-                                  missingGates:
-                                    nm.missingGates ??
-                                    nm.gateEvaluation?.missingGates ??
-                                    [],
-                                  evaluationLatencyMs:
-                                    nm.evaluationLatencyMs ??
-                                    nm.smcEvaluationLatencyMs ??
-                                    null,
-                                  nextBarRemainingMs:
-                                    nm.nextBarRemainingMs ?? null,
-                                  stale: nm.provenance.stale,
-                                  isDemo: nm.provenance.isDemo,
-                                }))
-                              : (gateDiag?.nearMissSymbols ?? [])
-                                  .slice(0, 8)
-                                  .map((g) => ({
-                                    symbol: g.symbol,
-                                    direction: g.intendedDirection ?? 'NEUTRAL',
-                                    marketRadarCategory: g.marketRadarCategory,
-                                    score: g.score ?? 0,
-                                    nearMissStatus:
-                                      g.nearMissStatus ??
-                                      (g.missingGateCount === 1
-                                        ? 'NEAR_MISS_ONE_GATE'
-                                        : 'NEAR_MISS_TWO_GATES'),
-                                    missingGates: g.missingGates ?? [],
-                                    evaluationLatencyMs:
-                                      g.evaluationLatencyMs ?? null,
-                                    nextBarRemainingMs:
-                                      g.nextBarRemainingMs ?? null,
-                                    stale: Boolean(g.stale),
-                                    isDemo: g.isDemo ?? isDemoActive,
-                                  }))
-                            ).map((item) => (
-                              <button
-                                key={item.symbol}
-                                type="button"
-                                onClick={() =>
-                                  loadSymbolDetail(
-                                    item.symbol,
-                                    selectedTimeframe
-                                  )
-                                }
-                                className="w-full text-left rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-[11px] hover:border-amber-500/50 cursor-pointer"
-                              >
-                                <div className="flex items-center justify-between font-mono">
-                                  <span className="font-bold text-slate-100">
-                                    {item.symbol} ({item.direction}) ·{' '}
-                                    {item.nearMissStatus}
-                                  </span>
-                                  <span className="text-amber-300">
-                                    評分 {item.score}
-                                  </span>
-                                </div>
-                                <div className="mt-0.5 text-slate-300 font-mono">
-                                  Radar: {item.marketRadarCategory} · 缺少 Gate:{' '}
-                                  <strong className="text-rose-300">
-                                    {item.missingGates.join(', ') || 'NONE'}
-                                  </strong>
-                                </div>
-                                <div className="mt-0.5 text-slate-400 font-mono">
-                                  evaluationLatencyMs:{' '}
-                                  {item.evaluationLatencyMs ?? 'null'}ms ·
-                                  nextBarRemainingMs:{' '}
-                                  {item.nextBarRemainingMs ?? 'null'}ms ·
-                                  新鮮度: {item.stale ? 'STALE' : 'FRESH'} ·
-                                  isDemo: {String(item.isDemo)}
-                                </div>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Panel 3: 目前沒有正式候選的主要原因 */}
-                      <div className="rounded-2xl border border-sky-500/25 bg-sky-500/[0.03] p-4 space-y-2.5">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-sky-300">
-                            區塊三：目前沒有正式候選的主要原因與影子校準
-                          </span>
-                          <span className="font-mono text-[11px] text-slate-400">
-                            statisticScope 分層口徑
-                          </span>
-                        </div>
-                        <div className="space-y-1.5 text-[11px] font-mono text-slate-300">
-                          <div>
-                            • 根因診斷:{' '}
-                            <strong className="text-amber-300">
-                              {scanData.rootCauseVerdict ??
-                                smcScanStatus?.rootCauseVerdict ??
-                                'STRICT_GATE_NO_CURRENT_SIGNAL'}
-                            </strong>
-                          </div>
-                          {scopedStats && (
-                            <div className="rounded-lg border border-white/[0.07] bg-white/[0.02] p-2.5 space-y-1">
-                              <div className="text-slate-400">
-                                全市場評估 (ALL_EVALUATED, 分母=
-                                {scopedStats.allEvaluatedDenominator}
-                                , 排除={scopedStats.allEvaluatedExcludedCount}
-                                ):
-                              </div>
-                              <div>
-                                MTF_ALIGNMENT 通過:{' '}
-                                {scopedStats.allEvaluated.MTF_ALIGNMENT
-                                  ?.passRate ?? 0}
-                                % · BOS_MSS:{' '}
-                                {scopedStats.allEvaluated.BOS_MSS
-                                  ?.passRate ?? 0}
-                                % · DISPLACEMENT:{' '}
-                                {scopedStats.allEvaluated.DISPLACEMENT
-                                  ?.passRate ?? 0}
-                                %
-                              </div>
-                              <div className="text-amber-200/90">
-                                Near-Miss 子集合 (NEAR_MISS_ONLY, 分母=
-                                {scopedStats.nearMissDenominator}
-                                ): 最常缺{' '}
-                                {gateDiag?.lastBlockingGate ?? 'MTF_ALIGNMENT'}
-                              </div>
-                            </div>
-                          )}
-                          {shadowComp && (
-                            <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-2 space-y-0.5 text-[10px]">
-                              <div className="text-slate-300 font-semibold">
-                                STRICT_PRODUCTION vs OBSERVATION_SHADOW 對照:
-                              </div>
-                              <div>
-                                • STRICT_PRODUCTION (正式):{' '}
-                                <strong className="text-emerald-400">
-                                  {shadowComp.strictProduction.candidateCount} 檔
-                                </strong>{' '}
-                                (paperClosed={shadowComp.strictProduction.paperClosedCount} · winRate={String(shadowComp.strictProduction.winRate)})
-                              </div>
-                              <div>
-                                • SHADOW (差1項 Gate 觀察):{' '}
-                                <strong className="text-amber-300">
-                                  {
-                                    shadowComp.observationShadowOneGateMissing
-                                      .candidateCount
-                                  }{' '}
-                                  檔
-                                </strong>{' '}
-                                (nearMiss={shadowComp.observationShadowOneGateMissing.nearMissCount} · 不建立 Paper / 不推播)
-                              </div>
-                              <div>
-                                • SHADOW (差1~2項 Gate 觀察):{' '}
-                                <strong className="text-sky-300">
-                                  {
-                                    shadowComp.observationShadowTwoGatesMissing
-                                      .candidateCount
-                                  }{' '}
-                                  檔
-                                </strong>{' '}
-                                (nearMiss={shadowComp.observationShadowTwoGatesMissing.nearMissCount} · winRate={String(shadowComp.observationShadowTwoGatesMissing.winRate)})
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2 text-base font-semibold tracking-tight text-slate-100">
-                    <span>今日市場白話氣象台與置頂潛力焦點</span>
-                    <span className="text-xs font-normal text-slate-400">
-                      · 自動將雙層機構規則轉譯為直覺操作建議
-                    </span>
-                  </div>
-                  <p className="text-[13px] text-slate-300 leading-relaxed max-w-5xl">
-                    {(scanData.summaryCounts['多頭候選'] ?? 0) +
-                      (scanData.summaryCounts['空頭候選'] ?? 0) >
-                    0
-                      ? `目前全市場 ${scanData.totalContractsScanned ?? 0} 檔合約中，已有 ${
-                          (scanData.summaryCounts['多頭候選'] ?? 0) +
-                          (scanData.summaryCounts['空頭候選'] ?? 0)
-                        } 檔同時通過「第一層動能雷達」與「第二層 SMC 機構結構確認」（其中已錯過下一根 K 線開盤進場窗口 ${
-                          scanData.entryWindowMissedCount ?? 0
-                        } 檔，Paper 已開倉 ${
-                          scanData.paperOpenedCount ?? 0
-                        } 檔）！請點擊下方焦點卡片查看右側 K 線與五步闖關進度。`
-                      : `目前全市場共掃描 ${scanData.totalContractsScanned ?? 0} 檔合約，其中 ${
-                          (scanData.marketRadarLongCount ?? 0) +
-                          (scanData.marketRadarShortCount ?? 0)
-                        } 檔進入第一層多空動能觀察，但尚無標的完全滿足嚴格的 15m SMC 突破與回踩條件（0 檔立即進場訊號）。這代表市場多處於結構整理期，系統已自動幫您過濾假突破雜訊；建議先點選下方評分最高的前 3 檔潛力幣種，觀察其右側 K 線結構。`}
+      <main className="mx-auto w-full max-w-[1680px] min-w-0 flex-1 px-4 sm:px-6 py-5 flex flex-col gap-5">
+        {/* SECTION 0: Long-Term Paper Quality, Regimes, Gate Drift & System Stability */}
+        {activeSection === 'paper_quality' && (
+          <div className="order-3 space-y-5">
+            <div className="apple-bento-card p-5 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-semibold text-slate-100">
+                    長期 Paper 品質與系統穩定性監控中心
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    統一檢視 Phase 11–14 訊號品質統計、7 大市場狀態分層、Phase 17 系統穩定性與 SQLite 備份健康度。
                   </p>
                 </div>
-                <a
-                  href="#engineering-telemetry-section"
-                  className="text-xs font-medium text-amber-300 hover:underline whitespace-nowrap shrink-0"
-                >
-                  查看底部工程與 SLA 統計 ↓
-                </a>
-              </div>
-
-              {scanData.candidates.length > 0 && (
-                <div className="grid grid-cols-1 gap-3.5 md:grid-cols-3 pt-1">
-                  {[...scanData.candidates]
-                    .sort((a, b) => b.score - a.score)
-                    .slice(0, 3)
-                    .map((topC, idx) => {
-                      const isSel = topC.symbol === selectedSymbol;
-                      const plainInfo = getPlainLanguageRowExplanation(
-                        topC,
-                        topC.smcActionState,
-                        topC.smcEvaluationStatus
-                      );
-                      return (
-                        <button
-                          key={topC.symbol}
-                          type="button"
-                          onClick={() =>
-                            loadSymbolDetail(topC.symbol, selectedTimeframe)
-                          }
-                          className={`text-left border p-4 rounded-2xl transition-all cursor-pointer ${
-                            isSel
-                              ? 'border-amber-500/80 bg-slate-950 shadow-sm'
-                              : 'border-slate-800/80 bg-slate-950/60 hover:border-slate-700'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs font-mono font-bold text-amber-400">
-                                0{idx + 1}.
-                              </span>
-                              <span className="text-base font-bold font-mono text-slate-100">
-                                {topC.symbol}
-                              </span>
-                              <span className="text-xs text-slate-400">
-                                · {topC.marketRadarCategory}
-                              </span>
-                            </div>
-                            <span className="font-mono text-xs font-semibold text-slate-200">
-                              評分 {topC.score}/96
-                            </span>
-                          </div>
-                          <div className="mt-2 flex items-center justify-between text-xs font-mono tabular-nums">
-                            <span className="text-slate-200 font-medium">
-                              現價 ${formatPriceDynamic(topC.lastPrice)}
-                            </span>
-                            <span
-                              className={
-                                topC.priceChangePercent24h >= 0
-                                  ? 'text-emerald-400 font-semibold'
-                                  : 'text-rose-400 font-semibold'
-                              }
-                            >
-                              24h{' '}
-                              {topC.priceChangePercent24h >= 0 ? '+' : ''}
-                              {topC.priceChangePercent24h.toFixed(2)}%
-                            </span>
-                            <span className="text-slate-400">
-                              量能{' '}
-                              {topC.historicalVolume.status === 'READY'
-                                ? `${topC.historicalVolume.rvol}x`
-                                : '收集中'}
-                            </span>
-                          </div>
-                          <div
-                            className={`mt-2.5 text-xs truncate ${plainInfo.toneClass}`}
-                          >
-                            {plainInfo.headline}
-                          </div>
-                        </button>
-                      );
-                    })}
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-
-        {/* Engineering & Full-Market Gate Telemetry Section (order-5: cleanly placed below the Dual-Column Workstation) */}
-        <section
-          id="engineering-telemetry-section"
-          className="order-5 space-y-3 pt-4 border-t border-slate-800/80"
-        >
-          {/* Full-Market Gate & Two-Layer Telemetry Bar */}
-          <div className="border border-slate-800 bg-slate-950/90 px-4 py-3">
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800/80 text-xs">
-              <span className="font-semibold text-slate-200">
-                全市場雙層雷達與安全閘門統計 (總掃描合約:{' '}
-                {scanData?.totalContractsScanned ?? 0} · 市場雷達候選數量:{' '}
-                {(scanData?.marketRadarLongCount ?? 0) +
-                  (scanData?.marketRadarShortCount ?? 0)}{' '}
-                · SMC PENDING (尚未評估): {scanData?.smcPendingCount ?? 0} · SMC
-                LONG CANDIDATE 數量: {scanData?.smcLongCandidateCount ?? 0} ·
-                SMC SHORT CANDIDATE 數量:{' '}
-                {scanData?.smcShortCandidateCount ?? 0} · WATCH 數量:{' '}
-                {scanData?.smcWatchCount ?? 0} · WAIT 數量 (已評估):{' '}
-                {scanData?.smcWaitCount ?? 0} · HIGH RISK (已評估):{' '}
-                {scanData?.smcHighRiskCount ?? 0} · SMC_GATE_NOT_CONFIRMED
-                (僅計已評估): {scanData?.smcGateNotConfirmedCount ?? 0})
-              </span>
-              <span className="text-[11px] font-mono text-slate-400">
-                /api/scan Snapshot:{' '}
-                {scanData?.snapshotAt ?? scanData?.fetchedAt ?? 'N/A'} (v
-                {scanData?.statsVersion ?? 1}) · 尚未載入多週期 K 線 = PENDING
-                (不計入 WAIT)
-              </span>
-            </div>
-            <div className="mt-2.5 grid grid-cols-2 gap-2 sm:grid-cols-6 lg:grid-cols-12 font-mono tabular-nums text-[11px]">
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  marketRadarLongCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-emerald-400">
-                  {scanData?.marketRadarLongCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  雷達多頭觀察
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  marketRadarShortCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-rose-400">
-                  {scanData?.marketRadarShortCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  雷達空頭觀察
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">smcPendingCount</div>
-                <div className="mt-0.5 text-sm font-bold text-slate-300">
-                  {scanData?.smcPendingCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  SMC 尚未評估 (PENDING)
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">smcWaitCount</div>
-                <div className="mt-0.5 text-sm font-bold text-amber-300">
-                  {scanData?.smcWaitCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  已評估 WAIT 數量
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">smcWatchCount</div>
-                <div className="mt-0.5 text-sm font-bold text-sky-300">
-                  {scanData?.smcWatchCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  已評估 WATCH 數量
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  smcLongCandidateCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-emerald-300">
-                  {scanData?.smcLongCandidateCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  SMC LONG CANDIDATE
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  smcShortCandidateCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-rose-300">
-                  {scanData?.smcShortCandidateCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  SMC SHORT CANDIDATE
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  smcGateNotConfirmedCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-amber-400">
-                  {scanData?.smcGateNotConfirmedCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  已評估未通過 SMC Gate
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  insufficientHistoryCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-slate-200">
-                  {scanData?.insufficientHistoryCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  歷史樣本 &lt;30 筆
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  baselineUnstableCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-amber-400">
-                  {scanData?.baselineUnstableCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  BASELINE_UNSTABLE
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  liquidityRejectedCount
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-slate-200">
-                  {scanData?.liquidityRejectedCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  低流動性攔截
-                </div>
-              </div>
-              <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                <div className="text-slate-400 truncate">
-                  momentum / relBtc
-                </div>
-                <div className="mt-0.5 text-sm font-bold text-sky-300">
-                  {scanData?.momentumPassedCount ?? 0} /{' '}
-                  {scanData?.relativeBtcPassedCount ?? 0}
-                </div>
-                <div className="text-[10px] font-sans text-slate-500">
-                  24h動能 / 相對BTC通過
-                </div>
-              </div>
-            </div>
-
-            {/* Reason Statistics Transparency Strip (Explicitly Split Scopes: WAIT+WATCH vs HIGH RISK vs ALL NON-CANDIDATE) */}
-            {scanData?.waitWatchReasonStats && (
-              <div className="mt-2.5 border-t border-slate-800/80 pt-2 text-[11px] font-mono text-slate-400 flex flex-col gap-1.5">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <span className="text-slate-300 font-semibold">
-                      waitWatchReasonStats [範圍: 僅已評估 WAIT + WATCH, 不含 HIGH RISK 與 PENDING]：
-                    </span>
-                    <span>
-                      不重複幣種數 (uniqueSymbolCount)={' '}
-                      <strong className="text-slate-200">
-                        {scanData.waitWatchReasonStats.uniqueSymbolCount}
-                      </strong>
-                    </span>{' '}
-                    ·{' '}
-                    <span>
-                      可重疊原因總次數 (totalReasonOccurrences)={' '}
-                      <strong className="text-amber-300">
-                        {scanData.waitWatchReasonStats.totalReasonOccurrences}
-                      </strong>
-                    </span>
-                  </div>
-                  {scanData.highRiskReasonStats && (
-                    <div>
-                      <span className="text-amber-300 font-semibold">
-                        highRiskReasonStats [範圍: 僅已評估 HIGH RISK]：
-                      </span>
-                      <span>
-                        uniqueSymbolCount={' '}
-                        <strong className="text-slate-200">
-                          {scanData.highRiskReasonStats.uniqueSymbolCount}
-                        </strong>
-                      </span>{' '}
-                      ·{' '}
-                      <span>
-                        totalReasonOccurrences={' '}
-                        <strong className="text-rose-300">
-                          {scanData.highRiskReasonStats.totalReasonOccurrences}
-                        </strong>
-                      </span>
-                    </div>
-                  )}
-                </div>
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  {scanData.nonCandidateReasonStats && (
-                    <div>
-                      <span className="text-slate-300 font-semibold">
-                        nonCandidateReasonStats [範圍: 全部已評估非候選 WAIT + WATCH + HIGH RISK]：
-                      </span>
-                      <span>
-                        uniqueSymbolCount={' '}
-                        <strong className="text-slate-200">
-                          {scanData.nonCandidateReasonStats.uniqueSymbolCount}
-                        </strong>
-                      </span>{' '}
-                      ·{' '}
-                      <span>
-                        totalReasonOccurrences={' '}
-                        <strong className="text-amber-300">
-                          {
-                            scanData.nonCandidateReasonStats
-                              .totalReasonOccurrences
-                          }
-                        </strong>
-                      </span>
-                    </div>
-                  )}
-                  {scanData.radarGateReasonStats && (
-                    <div>
-                      <span className="text-slate-300 font-semibold">
-                        第一層雷達閘門降級統計 (radarGateReasonStats)：
-                      </span>
-                      <span>
-                        uniqueSymbolCount={' '}
-                        <strong className="text-slate-200">
-                          {scanData.radarGateReasonStats.uniqueSymbolCount}
-                        </strong>
-                      </span>{' '}
-                      ·{' '}
-                      <span>
-                        totalReasonOccurrences={' '}
-                        <strong className="text-sky-300">
-                          {scanData.radarGateReasonStats.totalReasonOccurrences}
-                        </strong>
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Phase 3 & Phase 16: SMC 全市場掃描進度、PENDING 原因分類、Worker 健康度與卡住診斷 */}
-          {(() => {
-            const activeSmc = smcScanStatus ?? scanData?.smcScanStatus ?? null;
-            const totalJobs =
-              activeSmc?.totalJobs ??
-              activeSmc?.totalContractsCount ??
-              scanData?.totalContractsScanned ??
-              0;
-            const queuedCount = activeSmc?.queuedCount ?? 0;
-            const runningJobCount =
-              activeSmc?.runningJobCount ?? activeSmc?.runningCount ?? 0;
-            const waitingForCacheCount = activeSmc?.waitingForCacheCount ?? 0;
-            const waitingForRateLimitCount =
-              activeSmc?.waitingForRateLimitCount ??
-              activeSmc?.rateLimitedCount ??
-              0;
-            const waitingForNextBatchCount =
-              activeSmc?.waitingForNextBatchCount ?? 0;
-            const retryScheduledCount = activeSmc?.retryScheduledCount ?? 0;
-            const failedRetryableCount = activeSmc?.failedRetryableCount ?? 0;
-            const inFlightRequestCount = activeSmc?.inFlightRequestCount ?? 0;
-            const succeededCount = activeSmc?.succeededCount ?? 0;
-            const failedCount = activeSmc?.failedCount ?? 0;
-            const rateLimitedCount = activeSmc?.rateLimitedCount ?? 0;
-            const pendingCount =
-              activeSmc?.pendingCount ?? scanData?.smcPendingCount ?? 0;
-            const waitCount =
-              activeSmc?.waitCount ?? scanData?.smcWaitCount ?? 0;
-            const watchCount =
-              activeSmc?.watchCount ?? scanData?.smcWatchCount ?? 0;
-            const longCandidateCount =
-              activeSmc?.longCandidateCount ??
-              scanData?.smcLongCandidateCount ??
-              0;
-            const shortCandidateCount =
-              activeSmc?.shortCandidateCount ??
-              scanData?.smcShortCandidateCount ??
-              0;
-            const highRiskCount =
-              activeSmc?.highRiskCount ?? scanData?.smcHighRiskCount ?? 0;
-            const stalledSuspected = activeSmc?.stalledSuspected ?? false;
-            const stalledReasons = activeSmc?.stalledReasons ?? [];
-            const diagnosisLabel =
-              activeSmc?.diagnosisLabel ??
-              (stalledSuspected
-                ? '背景掃描疑似卡住'
-                : pendingCount === 0 && totalJobs > 0 && succeededCount === totalJobs
-                  ? '掃描已完成'
-                  : '正常背景評估中');
-            const pendingBreakdownConsistency =
-              activeSmc?.pendingBreakdownConsistency ?? 'VALID';
-
-            return (
-              <div className="border border-slate-800 bg-slate-950/90 px-4 py-3">
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800/80 text-xs">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-semibold text-amber-300">
-                      SMC 全市場掃描進度與 Phase 16 背景 Worker 健康度診斷
-                    </span>
-                    <span className="font-mono text-slate-300">
-                      掃描進度：已完成{' '}
-                      <strong className="text-emerald-400">
-                        {succeededCount}
-                      </strong>{' '}
-                      / 總數{' '}
-                      <strong className="text-slate-100">{totalJobs}</strong>{' '}
-                      (完成數 / 總數)
-                    </span>
-                    <span
-                      className={`px-2 py-0.5 font-mono text-[11px] font-bold border ${
-                        stalledSuspected ||
-                        pendingBreakdownConsistency === 'INVALID'
-                          ? 'border-rose-500/60 bg-rose-950/50 text-rose-300'
-                          : diagnosisLabel === '掃描已完成'
-                            ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300'
-                            : 'border-sky-500/50 bg-sky-950/40 text-sky-300'
-                      }`}
-                    >
-                      診斷說明：{diagnosisLabel} (stalledSuspected=
-                      {String(stalledSuspected)})
-                    </span>
-                    <span className="text-[11px] font-mono text-slate-400">
-                      · monitorWorkerState:{' '}
-                      {activeSmc?.monitorWorkerState ??
-                        systemDbHealth?.monitorWorkerState ??
-                        'RUNNING'}{' '}
-                      · scanWorkerState:{' '}
-                      {activeSmc?.scanWorkerState ??
-                        systemDbHealth?.scanWorkerState ??
-                        'IDLE'}{' '}
-                      · queueWorkerState:{' '}
-                      {activeSmc?.queueWorkerState ??
-                        systemDbHealth?.queueWorkerState ??
-                        'HEALTHY'}{' '}
-                      · scannerHealth: {activeSmc?.scannerHealth ?? 'HEALTHY'} ·
-                      queueHealth: {activeSmc?.queueHealth ?? 'HEALTHY'} ·
-                      exchangeApiHealth:{' '}
-                      {activeSmc?.exchangeApiHealth ?? 'HEALTHY'} · 佇列
-                      Snapshot: {activeSmc?.snapshotAt ?? 'N/A'} (statsVersion=
-                      {activeSmc?.statsVersion ?? 1})
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <button
-                      type="button"
-                      disabled={smcQueueLoading}
-                      onClick={() => controlSmcQueue('start')}
-                      className="inline-flex items-center gap-1 border border-emerald-500/50 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/25 cursor-pointer disabled:opacity-50"
-                    >
-                      <Play className="h-3 w-3" />
-                      啟動背景分批掃描
-                    </button>
-                    <button
-                      type="button"
-                      disabled={smcQueueLoading}
-                      onClick={() => controlSmcQueue('step')}
-                      className="inline-flex items-center gap-1 border border-sky-500/50 bg-sky-500/15 px-2.5 py-1 text-[11px] font-medium text-sky-200 hover:bg-sky-500/25 cursor-pointer disabled:opacity-50"
-                    >
-                      <RefreshCw
-                        className={`h-3 w-3 ${smcQueueLoading ? 'animate-spin' : ''}`}
-                      />
-                      執行下一批次
-                    </button>
-                    <button
-                      type="button"
-                      disabled={smcQueueLoading}
-                      onClick={() => controlSmcQueue('pause')}
-                      className="inline-flex items-center gap-1 border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/25 cursor-pointer disabled:opacity-50"
-                    >
-                      <Square className="h-3 w-3" />
-                      暫停佇列
-                    </button>
-                    <button
-                      type="button"
-                      disabled={smcQueueLoading}
-                      onClick={() => controlSmcQueue('resume')}
-                      className="inline-flex items-center gap-1 border border-slate-700 bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-200 hover:bg-slate-700 cursor-pointer disabled:opacity-50"
-                    >
-                      繼續佇列
-                    </button>
-                    <button
-                      type="button"
-                      disabled={smcQueueLoading}
-                      onClick={() => retryStuckSmcJobs()}
-                      className="inline-flex items-center gap-1 border border-rose-500/50 bg-rose-500/15 px-2.5 py-1 text-[11px] font-medium text-rose-200 hover:bg-rose-500/25 cursor-pointer disabled:opacity-50"
-                    >
-                      重試卡住任務 (retry-stuck)
-                    </button>
-                    {selectedSymbol && (
-                      <button
-                        type="button"
-                        disabled={smcQueueLoading}
-                        onClick={() => refreshSingleSmcSymbol(selectedSymbol)}
-                        className="inline-flex items-center gap-1 border border-cyan-500/50 bg-cyan-500/15 px-2.5 py-1 text-[11px] font-medium text-cyan-200 hover:bg-cyan-500/25 cursor-pointer disabled:opacity-50"
-                      >
-                        單檔刷新 ({selectedSymbol})
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Phase 16 Mandatory PENDING Semantics Disclosure Banner */}
-                <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border border-amber-500/30 bg-amber-950/20 px-3 py-1.5 text-[11px] font-mono text-amber-200">
-                  <div className="flex flex-wrap items-center gap-3 font-semibold">
-                    <span>· PENDING 不等於 WAIT</span>
-                    <span>· PENDING 不代表 SMC 通過</span>
-                    <span>· PENDING 不代表 SMC 被拒絕</span>
-                    <span className="text-amber-300/90">
-                      (SMC 尚未評估／點擊載入單幣種結構)
-                    </span>
-                  </div>
-                  <div className="text-slate-300">
-                    Fast Lane PENDING:{' '}
-                    <strong className="text-amber-300">
-                      {activeSmc?.fastLanePendingCount ?? 0}
-                    </strong>{' '}
-                    · Bulk PENDING:{' '}
-                    <strong className="text-sky-300">
-                      {activeSmc?.bulkPendingCount ?? 0}
-                    </strong>{' '}
-                    · 每分鐘完成速率:{' '}
-                    <strong className="text-emerald-300">
-                      {activeSmc?.progressRatePerMinute ?? 0}/min
-                    </strong>{' '}
-                    · 最舊 PENDING 等待時間:{' '}
-                    <strong className="text-amber-300">
-                      {activeSmc?.oldestPendingAgeMs !== null &&
-                      activeSmc?.oldestPendingAgeMs !== undefined
-                        ? `${activeSmc.oldestPendingAgeMs}ms`
-                        : '0ms'}
-                    </strong>
-                  </div>
-                </div>
-
-                <div className="mt-2.5 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-12 font-mono tabular-nums text-[11px]">
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      PENDING 數 ({`PENDING(${pendingCount})`})
-                    </div>
-                    <div className="mt-0.5 text-sm font-bold text-slate-300">
-                      {pendingCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      尚未完成 (一致性: {pendingBreakdownConsistency})
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      QUEUED / RUNNING
-                    </div>
-                    <div className="mt-0.5 text-sm font-bold text-sky-300">
-                      Q:{queuedCount} / R:{runningJobCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      含下一批等待:{waitingForNextBatchCount} (並行≤
-                      {activeSmc?.config.maxConcurrency ?? 2})
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      WAITING_FOR_CACHE / IN-FLIGHT REQUESTS
-                    </div>
-                    <div className="mt-0.5 text-sm font-bold text-cyan-300">
-                      {waitingForCacheCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      等待快取預熱 (IN-FLIGHT REQUESTS: {inFlightRequestCount})
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      RATE LIMITED / RATE_LIMITED / RETRY
-                    </div>
-                    <div className="mt-0.5 text-sm font-bold text-amber-400">
-                      RL:{waitingForRateLimitCount || rateLimitedCount} / RETRY:
-                      {retryScheduledCount + failedRetryableCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      等待重試:{retryScheduledCount} · 可重試失敗:
-                      {failedRetryableCount}
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">SUCCEEDED</div>
-                    <div className="mt-0.5 text-sm font-bold text-emerald-400">
-                      {succeededCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      已完成有效 SMC 結果數
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">WAIT</div>
-                    <div className="mt-0.5 text-sm font-bold text-amber-300">
-                      {waitCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      已評估等待確認
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">WATCH</div>
-                    <div className="mt-0.5 text-sm font-bold text-sky-300">
-                      {watchCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      已評估觀察結構
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      LONG / SHORT 候選
-                    </div>
-                    <div className="mt-0.5 text-sm font-bold text-emerald-400">
-                      L:{longCandidateCount} /{' '}
-                      <span className="text-rose-400">
-                        S:{shortCandidateCount}
-                      </span>
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      HIGH RISK: {highRiskCount}
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">FAILED 數</div>
-                    <div className="mt-0.5 text-sm font-bold text-rose-400">
-                      {failedCount}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-500">
-                      終端失敗 (不計入 PENDING)
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      最後完成時間 / 進度時間
-                    </div>
-                    <div className="mt-0.5 text-xs font-bold text-slate-200 truncate">
-                      {activeSmc?.lastJobCompletedAt ?? activeSmc?.lastCompletedAt
-                        ? new Date(
-                            activeSmc?.lastJobCompletedAt ??
-                              activeSmc?.lastCompletedAt ??
-                              ''
-                          ).toLocaleTimeString('zh-TW', { hour12: false })
-                        : '尚無完成紀錄'}
-                    </div>
-                    <div className="text-[10px] font-sans text-sky-300 truncate">
-                      資料新鮮度 · 最後進度:{' '}
-                      {activeSmc?.lastProgressAt
-                        ? new Date(activeSmc.lastProgressAt).toLocaleTimeString(
-                            'zh-TW',
-                            { hour12: false }
-                          )
-                        : 'N/A'}
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      速率 / 預估剩餘時間
-                    </div>
-                    <div className="mt-0.5 text-xs font-bold text-emerald-300 truncate">
-                      {activeSmc?.progressRatePerMinute ?? 0} 檔/分 (
-                      {activeSmc?.progressRateStatus ??
-                        (pendingCount === 0
-                          ? 'NO_ACTIVE_PROGRESS'
-                          : 'ACTIVE')}
-                      )
-                    </div>
-                    <div className="text-[10px] font-sans text-amber-300 truncate">
-                      預估剩餘: {activeSmc?.estimatedRemaining ?? '0s'}
-                    </div>
-                  </div>
-                  <div className="border border-slate-800/80 bg-slate-900/50 p-2">
-                    <div className="text-slate-400 truncate">
-                      卡住診斷 (stalledJobCount)
-                    </div>
-                    <div
-                      className={`mt-0.5 text-xs font-bold truncate ${
-                        stalledSuspected ? 'text-rose-400' : 'text-emerald-400'
-                      }`}
-                    >
-                      {stalledSuspected
-                        ? `疑似卡住 (${activeSmc?.stalledJobCount ?? 0})`
-                        : `正常 (0)`}
-                    </div>
-                    <div className="text-[10px] font-sans text-slate-400 truncate">
-                      {stalledReasons.length > 0
-                        ? stalledReasons.join(', ')
-                        : `門檻 ${activeSmc?.stalledThresholdMs ?? 45000}ms`}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Atomic Snapshot & Phase 16 PENDING Breakdown Consistency Proof Strip */}
-                <div className="mt-2 border-t border-slate-800/80 pt-2 text-[11px] font-mono text-slate-400 flex flex-wrap items-center justify-between gap-2">
-                  <span>
-                    佇列總數恆等式 / Phase 16 PENDING 統計恆等式：pendingCount(
-                    {pendingCount}) = queuedCount({queuedCount}) +
-                    runningJobCount({runningJobCount}) + waitingForCacheCount(
-                    {waitingForCacheCount}) + waitingForRateLimitCount(
-                    {waitingForRateLimitCount}) + retryScheduledCount(
-                    {retryScheduledCount}) + failedRetryableCount(
-                    {failedRetryableCount}) · pendingBreakdownConsistency=
-                    <strong
-                      className={
-                        pendingBreakdownConsistency === 'VALID'
-                          ? 'text-emerald-400'
-                          : 'text-rose-400'
-                      }
-                    >
-                      {pendingBreakdownConsistency}
-                    </strong>
-                  </span>
-                  <span>
-                    SUCCEEDED({succeededCount}) = WAIT({waitCount}) + WATCH(
-                    {watchCount}) + LONG({longCandidateCount}) + SHORT(
-                    {shortCandidateCount}) + HIGH_RISK({highRiskCount}) ·
-                    FAILED({failedCount}) 不計入 PENDING
-                  </span>
-                </div>
-
-                {/* Phase 8: Two-Stage Radar + Fast Lane Priority SMC Detection Latency Telemetry */}
-                <div className="mt-2 border-t border-slate-800/80 pt-2 text-[11px] font-mono text-slate-300 space-y-1.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-semibold text-amber-300">
-                        Phase 8 兩階段掃描與 Fast Lane 延遲統計：
-                      </span>
-                      <span>
-                        lastFullRadarScanAt:{' '}
-                        <strong className="text-slate-100">
-                          {activeSmc?.lastFullRadarScanAt ??
-                            paperMonitorStatus?.lastFullRadarScanAt ??
-                            'N/A'}
-                        </strong>
-                      </span>
-                      <span>
-                        · lastPriorityScanAt:{' '}
-                        <strong className="text-slate-100">
-                          {activeSmc?.lastPriorityScanAt ??
-                            paperMonitorStatus?.lastPriorityScanAt ??
-                            'N/A'}
-                        </strong>
-                      </span>
-                      <span>
-                        · queueWaitMs:{' '}
-                        <strong className="text-sky-300">
-                          {activeSmc?.queueWaitMs ??
-                            paperMonitorStatus?.queueWaitMs ??
-                            0}
-                          ms
-                        </strong>
-                      </span>
-                      <span>
-                        · detectionLatencyMs:{' '}
-                        <strong className="text-amber-300">
-                          {activeSmc?.detectionLatencyMs ??
-                            paperMonitorStatus?.detectionLatencyMs ??
-                            0}
-                          ms
-                        </strong>
-                      </span>
-                      <span>
-                        · FastLane p50:{' '}
-                        <strong
-                          className={
-                            (activeSmc?.p50PriorityDetectionLatencyMs ??
-                              activeSmc?.p50DetectionLatencyMs ??
-                              0) <= 60_000
-                              ? 'text-emerald-400'
-                              : 'text-amber-400'
-                          }
-                        >
-                          {activeSmc?.p50PriorityDetectionLatencyMs ??
-                            activeSmc?.p50DetectionLatencyMs ??
-                            paperMonitorStatus?.p50PriorityDetectionLatencyMs ??
-                            paperMonitorStatus?.p50DetectionLatencyMs ??
-                            0}
-                          ms (目標 &lt; 60s)
-                        </strong>
-                      </span>
-                      <span>
-                        · FastLane p95:{' '}
-                        <strong
-                          className={
-                            (activeSmc?.p95PriorityDetectionLatencyMs ??
-                              activeSmc?.p95DetectionLatencyMs ??
-                              0) <= 120_000
-                              ? 'text-emerald-400'
-                              : 'text-amber-400'
-                          }
-                        >
-                          {activeSmc?.p95PriorityDetectionLatencyMs ??
-                            activeSmc?.p95DetectionLatencyMs ??
-                            paperMonitorStatus?.p95PriorityDetectionLatencyMs ??
-                            paperMonitorStatus?.p95DetectionLatencyMs ??
-                            0}
-                          ms (目標 &lt; 120s)
-                        </strong>
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span>
-                        candidateDetectedBeforeEntryWindowCount:{' '}
-                        <strong className="text-emerald-400">
-                          {activeSmc?.candidateDetectedBeforeEntryWindowCount ??
-                            paperMonitorStatus?.candidateDetectedBeforeEntryWindowCount ??
-                            0}
-                        </strong>
-                      </span>
-                      <span>
-                        · entryWindowMissedCount:{' '}
-                        <strong className="text-amber-400">
-                          {activeSmc?.entryWindowMissedCount ??
-                            paperMonitorStatus?.entryWindowMissedCount ??
-                            0}
-                        </strong>
-                      </span>
-                      {selectedSymbol && (
-                        <button
-                          type="button"
-                          disabled={smcQueueLoading}
-                          onClick={() => refreshSingleSmcSymbol(selectedSymbol)}
-                          className="inline-flex items-center gap-1 border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200 hover:bg-amber-500/25 cursor-pointer disabled:opacity-50"
-                        >
-                          Fast Lane 優先評估 ({selectedSymbol})
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400 border-t border-slate-800/50 pt-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span>
-                        priorityDetectionSLA:{' '}
-                        <strong
-                          className={
-                            (activeSmc?.priorityDetectionSLA ??
-                              paperMonitorStatus?.priorityDetectionSLA) ===
-                            'MET'
-                              ? 'text-emerald-400'
-                              : 'text-amber-400'
-                          }
-                        >
-                          {activeSmc?.priorityDetectionSLA ??
-                            paperMonitorStatus?.priorityDetectionSLA ??
-                            'PENDING'}
-                        </strong>
-                      </span>
-                      <span>
-                        · coldStartPrioritySLA:{' '}
-                        <strong
-                          className={
-                            (activeSmc?.coldStartPrioritySLA ??
-                              paperMonitorStatus?.coldStartPrioritySLA) ===
-                            'MET'
-                              ? 'text-emerald-400'
-                              : 'text-amber-400'
-                          }
-                        >
-                          {activeSmc?.coldStartPrioritySLA ??
-                            paperMonitorStatus?.coldStartPrioritySLA ??
-                            'PENDING'}
-                        </strong>{' '}
-                        (p95:{' '}
-                        {activeSmc?.coldStartP95 ??
-                          paperMonitorStatus?.coldStartP95 ??
-                          0}
-                        ms)
-                      </span>
-                      <span>
-                        · warmCachePrioritySLA:{' '}
-                        <strong
-                          className={
-                            (activeSmc?.warmCachePrioritySLA ??
-                              paperMonitorStatus?.warmCachePrioritySLA) ===
-                            'MET'
-                              ? 'text-emerald-400'
-                              : 'text-amber-400'
-                          }
-                        >
-                          {activeSmc?.warmCachePrioritySLA ??
-                            paperMonitorStatus?.warmCachePrioritySLA ??
-                            'PENDING'}
-                        </strong>{' '}
-                        (p95:{' '}
-                        {activeSmc?.warmCacheP95 ??
-                          paperMonitorStatus?.warmCacheP95 ??
-                          0}
-                        ms)
-                      </span>
-                      <span>
-                        · prewarmDurationMs:{' '}
-                        <strong className="text-sky-300">
-                          {activeSmc?.prewarmDurationMs ??
-                            paperMonitorStatus?.prewarmDurationMs ??
-                            0}
-                          ms
-                        </strong>
-                      </span>
-                      <span>
-                        · Bulk p95 QueueWait:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.p95BulkQueueWaitMs ??
-                            paperMonitorStatus?.p95BulkQueueWaitMs ??
-                            0}
-                          ms
-                        </strong>
-                      </span>
-                      <span>
-                        · 全市場完整耗時 (fullUniverseCompletionDuration):{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.fullUniverseCompletionDuration ??
-                            activeSmc?.fullUniverseCompletionDurationMs ??
-                            paperMonitorStatus?.fullUniverseCompletionDurationMs ??
-                            0}
-                          ms
-                        </strong>{' '}
-                        (coldStartFullUniverseDuration:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.coldStartFullUniverseDuration ??
-                            activeSmc?.coldStartFullUniverseCompletionDuration ??
-                            0}
-                          ms
-                        </strong>
-                        )
-                      </span>
-                      <span>
-                        · 快取命中率:{' '}
-                        <strong className="text-emerald-300">
-                          {activeSmc?.cacheHitRate ??
-                            paperMonitorStatus?.cacheHitRate ??
-                            0}
-                          %
-                        </strong>{' '}
-                        (Hit:{' '}
-                        {activeSmc?.cacheHitCount ??
-                          paperMonitorStatus?.cacheHitCount ??
-                          0}{' '}
-                        / Miss:{' '}
-                        {activeSmc?.cacheMissCount ??
-                          paperMonitorStatus?.cacheMissCount ??
-                          0}
-                        )
-                      </span>
-                    </div>
-                    {activeSmc?.latencyBreakdown && (
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span>
-                          階段拆解 p95：queueWait=
-                          {activeSmc.latencyBreakdown.queueWait.p95}ms ·
-                          prewarm={activeSmc.latencyBreakdown.prewarmWait?.p95 ?? 0}ms ·
-                          HTTP={activeSmc.latencyBreakdown.httpFetch.p95}ms ·
-                          SMC={activeSmc.latencyBreakdown.smcCalculation.p95}ms ·
-                          DB={activeSmc.latencyBreakdown.databaseWrite.p95}ms ·
-                          429退避={activeSmc.latencyBreakdown.rateLimitBackoff.p95}
-                          ms
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                  {/* Phase 9: Persistent Warm Cache Snapshot & Timeframe Coverage Telemetry */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-300 border-t border-slate-800/50 pt-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-semibold text-cyan-300">
-                        Phase 9 持久化預熱快照與多週期快取覆蓋率：
-                      </span>
-                      <span
-                        className={`px-1.5 py-0.5 font-bold border ${
-                          (activeSmc?.cacheStatusLabel ??
-                            scanData?.cacheStatusLabel) === '快取可用'
-                            ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
-                            : (activeSmc?.cacheStatusLabel ??
-                                  scanData?.cacheStatusLabel) === '正在預熱'
-                              ? 'border-sky-500/50 bg-sky-500/15 text-sky-300'
-                              : (activeSmc?.cacheStatusLabel ??
-                                    scanData?.cacheStatusLabel) === '快取過期'
-                                ? 'border-amber-500/50 bg-amber-500/15 text-amber-300'
-                                : 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                        }`}
-                      >
-                        {activeSmc?.cacheStatusLabel ??
-                          scanData?.cacheStatusLabel ??
-                          '資料不可用'}
-                      </span>
-                      <span>
-                        cacheCoverageRate:{' '}
-                        <strong className="text-emerald-300">
-                          {activeSmc?.cacheCoverageRate ??
-                            scanData?.cacheCoverageRate ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      <span>
-                        · freshCacheCount:{' '}
-                        <strong className="text-emerald-400">
-                          {activeSmc?.freshCacheCount ??
-                            scanData?.freshCacheCount ??
-                            0}
-                        </strong>
-                      </span>
-                      <span>
-                        · expiredCacheCount:{' '}
-                        <strong className="text-amber-300">
-                          {activeSmc?.expiredCacheCount ??
-                            scanData?.expiredCacheCount ??
-                            0}
-                        </strong>
-                      </span>
-                      <span>
-                        · staleCacheCount:{' '}
-                        <strong className="text-rose-300">
-                          {activeSmc?.staleCacheCount ??
-                            scanData?.staleCacheCount ??
-                            0}
-                        </strong>
-                      </span>
-                      <span>
-                        · prewarmRequiredCount:{' '}
-                        <strong className="text-sky-300">
-                          {activeSmc?.prewarmRequiredCount ??
-                            scanData?.prewarmRequiredCount ??
-                            0}
-                        </strong>
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 text-slate-400">
-                      <span>
-                        5m:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.['5mCacheCoverage'] ??
-                            scanData?.['5mCacheCoverage'] ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      <span>
-                        · 15m:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.['15mCacheCoverage'] ??
-                            scanData?.['15mCacheCoverage'] ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      <span>
-                        · 1h:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.['1hCacheCoverage'] ??
-                            scanData?.['1hCacheCoverage'] ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      <span>
-                        · 4h:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.['4hCacheCoverage'] ??
-                            scanData?.['4hCacheCoverage'] ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      <span>
-                        · OI:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.oiCacheCoverage ??
-                            scanData?.oiCacheCoverage ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      <span>
-                        · Funding:{' '}
-                        <strong className="text-slate-200">
-                          {activeSmc?.fundingCacheCoverage ??
-                            scanData?.fundingCacheCoverage ??
-                            0}
-                          %
-                        </strong>
-                      </span>
-                      {activeSmc?.latestPrewarmSnapshot && (
-                        <span>
-                          · 快照ID:{' '}
-                          <strong className="text-cyan-300">
-                            {activeSmc.latestPrewarmSnapshot.snapshotId}
-                          </strong>{' '}
-                          (有效至 {activeSmc.latestPrewarmSnapshot.freshUntil})
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Phase 17: 系統穩定性 (System Stability, Worker Recovery, SQLite Health & Long-Running Windows) */}
-                  <div className="mt-2 border-t border-slate-800/80 pt-2.5 text-[11px] font-mono text-slate-300 space-y-2">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-semibold text-emerald-300">
-                          系統穩定性 (Phase 17 長時間 Live Paper 掃描穩定性 · Worker 恢復 · SQLite 一致性)
-                        </span>
-                        <span className="px-2 py-0.5 border border-emerald-500/40 bg-emerald-950/30 text-emerald-300 font-semibold">
-                          SQLite:{' '}
-                          {systemDbHealth?.integrityCheckPassed !== false
-                            ? 'HEALTHY'
-                            : 'CORRUPTED'}{' '}
-                          ({systemDbHealth?.integrityCheck ?? 'ok'} · WAL=
-                          {systemDbHealth?.walStatus ?? 'ACTIVE'})
-                        </span>
-                        <span className="px-2 py-0.5 border border-cyan-500/40 bg-cyan-950/30 text-cyan-300 font-semibold">
-                          快取健康: {systemDbHealth?.cacheHealth ?? 'HEALTHY'} (
-                          {activeSmc?.cacheStatusLabel ?? '快取可用'})
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          disabled={dbCheckLoading}
-                          onClick={() => runSystemDbCheck()}
-                          className="inline-flex items-center gap-1 border border-emerald-500/50 bg-emerald-500/15 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25 cursor-pointer disabled:opacity-50"
-                        >
-                          {dbCheckLoading
-                            ? 'SQLite 檢查備份中...'
-                            : '執行 SQLite 檢查與安全備份 (database-check)'}
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Phase 17 Mandatory 3 Stability Notices */}
-                    <div className="flex flex-wrap items-center justify-between gap-2 border border-sky-500/30 bg-sky-950/20 px-3 py-1.5 text-[11px] text-sky-200">
-                      <div className="flex flex-wrap items-center gap-4 font-semibold">
-                        <span>· PENDING 不等於 WAIT</span>
-                        <span>· 掃描中不代表候選已確認</span>
-                        <span>· 候選數為 0 不代表服務故障</span>
-                      </div>
-                      <div className="text-[10px] text-slate-300">
-                        429 次數:{' '}
-                        <strong className="text-amber-300">
-                          {systemDbHealth?.rateLimit429Count ??
-                            activeSmc?.rateLimitCount ??
-                            0}
-                        </strong>{' '}
-                        · 503 次數:{' '}
-                        <strong className="text-rose-300">
-                          {systemDbHealth?.http503Count ?? 0}
-                        </strong>{' '}
-                        · 最後一次錯誤:{' '}
-                        <strong className="text-slate-200">
-                          {systemDbHealth?.lastError ?? '無異常'}
-                        </strong>
-                      </div>
-                    </div>
-
-                    {/* Stability Core Telemetry Grid */}
-                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6 text-[10px]">
-                      <div className="border border-slate-800/80 bg-slate-900/40 p-2">
-                        <div className="text-slate-400">
-                          Monitor / Scan / Queue Worker 狀態
-                        </div>
-                        <div className="mt-0.5 font-bold text-slate-100 truncate">
-                          Monitor:{' '}
-                          <span className="text-emerald-300">
-                            {systemDbHealth?.monitorWorkerState ??
-                              activeSmc?.monitorWorkerState ??
-                              'RUNNING'}
-                          </span>{' '}
-                          · Scan:{' '}
-                          <span className="text-sky-300">
-                            {systemDbHealth?.scanWorkerState ??
-                              activeSmc?.scanWorkerState ??
-                              'IDLE'}
-                          </span>{' '}
-                          · Queue:{' '}
-                          <span className="text-cyan-300">
-                            {systemDbHealth?.queueWorkerState ??
-                              activeSmc?.queueWorkerState ??
-                              'HEALTHY'}
-                          </span>
-                        </div>
-                        <div className="text-slate-400 truncate">
-                          每分鐘速率:{' '}
-                          {systemDbHealth?.progressRatePerMinute ??
-                            activeSmc?.progressRatePerMinute ??
-                            0}
-                          /min (
-                          {systemDbHealth?.progressRateStatus ??
-                            activeSmc?.progressRateStatus ??
-                            'NO_ACTIVE_PROGRESS'}
-                          ) · stalled=
-                          <span
-                            className={
-                              (systemDbHealth?.stalledSuspected ??
-                              stalledSuspected)
-                                ? 'text-rose-400'
-                                : 'text-emerald-400'
-                            }
-                          >
-                            {String(
-                              systemDbHealth?.stalledSuspected ??
-                                stalledSuspected
-                            )}
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/40 p-2">
-                        <div className="text-slate-400">
-                          最後進度 / 最後完成任務
-                        </div>
-                        <div className="mt-0.5 font-bold text-slate-100 truncate">
-                          進度:{' '}
-                          {systemDbHealth?.lastProgressAt ??
-                            activeSmc?.lastProgressAt ??
-                            'N/A'}
-                        </div>
-                        <div className="text-slate-400 truncate">
-                          完成:{' '}
-                          {systemDbHealth?.lastJobCompletedAt ??
-                            activeSmc?.lastJobCompletedAt ??
-                            'N/A'}
-                        </div>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/40 p-2">
-                        <div className="text-slate-400">
-                          最舊 PENDING 等待 / 錯誤統計
-                        </div>
-                        <div className="mt-0.5 font-bold text-amber-300">
-                          最舊等待:{' '}
-                          {systemDbHealth?.oldestPendingAgeMs ??
-                            activeSmc?.oldestPendingAgeMs ??
-                            0}
-                          ms
-                        </div>
-                        <div className="text-slate-400 truncate">
-                          429: {systemDbHealth?.rateLimit429Count ?? 0} · 503:{' '}
-                          {systemDbHealth?.http503Count ?? 0} · Stalled:{' '}
-                          {systemDbHealth?.stalledDetectedCount ?? 0}
-                        </div>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/40 p-2">
-                        <div className="text-slate-400">
-                          SQLite 一致性與安全備份
-                        </div>
-                        <div className="mt-0.5 font-bold text-emerald-300 truncate">
-                          DB: {systemDbHealth?.databaseInstanceId ?? 'N/A'} (v
-                          {systemDbHealth?.statsVersion ??
-                            activeSmc?.statsVersion ??
-                            1}
-                          )
-                        </div>
-                        <div className="text-slate-400 truncate">
-                          備份: {systemDbHealth?.lastBackupAt ?? '尚未備份'} (
-                          {systemDbHealth?.backupFileVerified
-                            ? 'READABLE_OK'
-                            : 'PENDING'}
-                          ) · 快取列:{systemDbHealth?.cacheRowCount ?? 0}
-                        </div>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/40 p-2">
-                        <div className="text-slate-400">
-                          目前窗口 / 窗口狀態 / 窗口剩餘時間 / 是否可完成
-                        </div>
-                        <div className="mt-0.5 font-bold text-sky-300 truncate">
-                          目前窗口:{' '}
-                          {systemDbHealth?.monitoringWindows?.['24h']
-                            ?.monitoringWindowId ??
-                            systemDbHealth?.monitoringWindowId ??
-                            'N/A'}
-                        </div>
-                        <div className="text-slate-400 truncate">
-                          窗口狀態:{' '}
-                          <strong className="text-emerald-300">
-                            {systemDbHealth?.monitoringWindows?.['24h']
-                              ?.windowStatus ?? 'RUNNING'}
-                          </strong>{' '}
-                          · 窗口剩餘時間:{' '}
-                          {systemDbHealth?.monitoringWindows?.['24h']
-                            ?.remainingDuration ?? '24h 00m 00s'}{' '}
-                          · 是否可完成:{' '}
-                          <strong className="text-amber-300">
-                            {String(
-                              systemDbHealth?.monitoringWindows?.['24h']
-                                ?.canMarkCompleted ?? false
-                            )}
-                          </strong>
-                        </div>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/40 p-2">
-                        <div className="text-slate-400">
-                          本窗口 vs 服務累計重啟與恢復計數 (Phase 17.3)
-                        </div>
-                        <div className="mt-0.5 font-bold text-cyan-300 truncate">
-                          本窗口計畫性重啟:{' '}
-                          {systemDbHealth?.windowPlannedRestartCount ??
-                            activeSmc?.windowPlannedRestartCount ??
-                            0}{' '}
-                          · 本窗口非預期重啟:{' '}
-                          <span
-                            className={
-                              (systemDbHealth?.windowUnexpectedRestartCount ??
-                                0) > 0
-                                ? 'text-rose-400'
-                                : 'text-emerald-300'
-                            }
-                          >
-                            {systemDbHealth?.windowUnexpectedRestartCount ??
-                              activeSmc?.windowUnexpectedRestartCount ??
-                              0}
-                          </span>{' '}
-                          · 本窗口 Lease 恢復:{' '}
-                          {systemDbHealth?.windowLeaseRecoveryCount ??
-                            activeSmc?.windowLeaseRecoveryCount ??
-                            0}{' '}
-                          · 本窗口資料庫恢復:{' '}
-                          {systemDbHealth?.windowDatabaseRecoveryCount ??
-                            activeSmc?.windowDatabaseRecoveryCount ??
-                            0}
-                        </div>
-                        <div className="text-slate-400 truncate">
-                          服務累計計畫性重啟:{' '}
-                          {systemDbHealth?.lifetimePlannedRestartCount ??
-                            systemDbHealth?.plannedRestartCount ??
-                            0}{' '}
-                          · 服務累計非預期重啟:{' '}
-                          {systemDbHealth?.lifetimeUnexpectedRestartCount ??
-                            systemDbHealth?.unexpectedRestartCount ??
-                            0}{' '}
-                          · 服務累計 Lease 恢復:{' '}
-                          {systemDbHealth?.lifetimeLeaseRecoveryCount ??
-                            systemDbHealth?.leaseRecoveryCount ??
-                            0}{' '}
-                          · 服務累計資料庫恢復:{' '}
-                          {systemDbHealth?.lifetimeDatabaseRecoveryCount ??
-                            systemDbHealth?.databaseRecoveryCount ??
-                            0}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Phase 17.1 & 17.3 Concurrency Cap, Current vs Previous Window & Finalization Strip */}
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-3 text-[10px]">
-                      <div className="border border-slate-800/80 bg-slate-900/50 px-2.5 py-1.5 flex items-center justify-between">
-                        <span className="text-slate-400">
-                          並行限制驗證 (runningJobCount &lt;= maxConcurrency)
-                        </span>
-                        <span className="font-mono font-bold text-slate-100">
-                          最大並行數:{' '}
-                          <strong className="text-cyan-300">
-                            {systemDbHealth?.maxConcurrency ??
-                              activeSmc?.maxConcurrency ??
-                              activeSmc?.config?.maxConcurrency ??
-                              2}
-                          </strong>{' '}
-                          · 目前執行數:{' '}
-                          <strong className="text-amber-300">
-                            {systemDbHealth?.runningJobCount ??
-                              activeSmc?.runningJobCount ??
-                              0}
-                          </strong>{' '}
-                          · 並行限制是否通過:{' '}
-                          <strong
-                            className={
-                              (systemDbHealth?.concurrencyValid ??
-                                activeSmc?.concurrencyValid ??
-                                true)
-                                ? 'text-emerald-300'
-                                : 'text-rose-400'
-                            }
-                          >
-                            {(systemDbHealth?.concurrencyValid ??
-                              activeSmc?.concurrencyValid ??
-                              true)
-                              ? 'PASS (true)'
-                              : 'FAIL (false)'}
-                          </strong>
-                        </span>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/50 px-2.5 py-1.5 flex items-center justify-between">
-                        <span className="text-slate-400">
-                          目前窗口 (24h / 72h) 收尾驗證
-                        </span>
-                        <span className="font-mono font-bold text-slate-200 truncate">
-                          24h:{' '}
-                          <strong className="text-sky-300">
-                            {systemDbHealth?.monitoringWindows?.['24h']
-                              ?.windowStatus ?? 'RUNNING'}
-                          </strong>{' '}
-                          ({systemDbHealth?.monitoringWindows?.['24h']
-                            ?.remainingDuration ?? '24h'}) · 72h:{' '}
-                          <strong className="text-sky-300">
-                            {systemDbHealth?.monitoringWindows?.['72h']
-                              ?.windowStatus ?? 'RUNNING'}
-                          </strong>{' '}
-                          ({systemDbHealth?.monitoringWindows?.['72h']
-                            ?.remainingDuration ?? '72h'}) · 是否可完成:{' '}
-                          <strong className="text-amber-300">
-                            {String(
-                              systemDbHealth?.monitoringWindows?.['24h']
-                                ?.canMarkCompleted ?? false
-                            )}
-                          </strong>
-                        </span>
-                      </div>
-
-                      <div className="border border-slate-800/80 bg-slate-900/50 px-2.5 py-1.5 flex items-center justify-between">
-                        <span className="text-slate-400">
-                          上一個窗口 (歷史終態追蹤)
-                        </span>
-                        <span className="font-mono font-bold text-slate-200 truncate">
-                          {systemDbHealth?.previousWindows?.['24h'] ? (
-                            <>
-                              {
-                                systemDbHealth.previousWindows['24h']
-                                  .monitoringWindowId
-                              }{' '}
-                              · 狀態:{' '}
-                              <strong className="text-rose-300">
-                                {
-                                  systemDbHealth.previousWindows['24h']
-                                    .windowStatus
-                                }
-                              </strong>{' '}
-                              · 原因:{' '}
-                              <span className="text-amber-300">
-                                {systemDbHealth.previousWindows['24h']
-                                  .terminalReason ?? 'N/A'}
-                              </span>
-                            </>
-                          ) : (
-                            '無上一個窗口紀錄'
-                          )}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Phase 7: 24-Hour Paper Shadow Monitoring Window Compact Telemetry Bar */}
-          <div className="border border-slate-800 bg-slate-950/90 px-4 py-3">
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-              <div className="flex flex-wrap items-center gap-2.5">
-                <span className="font-semibold text-amber-300">
-                  Phase 7 · 24 小時 Paper 影子監控視窗
-                </span>
-                <span
-                  className={`px-2 py-0.5 font-mono text-[11px] font-bold border ${
-                    paperWindowReport?.windowStatus === 'COMPLETED'
-                      ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
-                      : paperWindowReport?.windowStatus === 'ERROR'
-                        ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                        : paperWindowReport?.windowStatus === 'INTERRUPTED'
-                          ? 'border-amber-500/50 bg-amber-500/15 text-amber-300'
-                          : 'border-sky-500/50 bg-sky-500/15 text-sky-300'
-                  }`}
-                >
-                  24 小時監控狀態: {paperWindowReport?.windowStatus ?? 'RUNNING'} (
-                  {paperWindowReport?.windowStatus === 'COMPLETED'
-                    ? '24 小時監控：已完成'
-                    : '24 小時監控：未完成／未驗證'}
-                  )
-                </span>
-                <span className="font-mono text-[11px] text-slate-300">
-                  已運行時間:{' '}
-                  <strong className="text-slate-100">
-                    {paperWindowReport?.windowElapsedFormatted ??
-                      paperMonitorStatus?.windowElapsedFormatted ??
-                      '0h 0m 0s'}
-                  </strong>{' '}
-                  · 剩餘時間:{' '}
-                  <strong className="text-amber-300">
-                    {paperWindowReport?.windowRemainingFormatted ??
-                      paperMonitorStatus?.windowRemainingFormatted ??
-                      '24h 0m 0s'}
-                  </strong>{' '}
-                  · 完成掃描週期數:{' '}
-                  <strong className="text-emerald-400">
-                    {paperWindowReport?.completedScanCycles ?? 0}
-                  </strong>
-                  /{paperWindowReport?.totalScanCycles ?? 0} ·
-                  最後一次掃描時間:{' '}
-                  <strong className="text-slate-200">
-                    {paperMonitorStatus?.lastScanAt ?? '尚未執行'}
-                  </strong>
-                </span>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
-                <span
-                  className={`px-2 py-0.5 border ${
-                    paperWindowReport?.candidateStatus === 'NO_CANDIDATE_VALID'
-                      ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300'
-                      : paperWindowReport?.candidateStatus ===
-                          'NO_CANDIDATE_SUSPECTED'
-                        ? 'border-rose-500/40 bg-rose-950/30 text-rose-300'
-                        : 'border-sky-500/40 bg-sky-950/30 text-sky-300'
-                  }`}
-                >
-                  candidateStatus:{' '}
-                  {paperWindowReport?.candidateStatus ?? 'NO_CANDIDATE_VALID'}
-                </span>
-                <span className="text-slate-400">
-                  LONG 候選數:{' '}
-                  <strong className="text-emerald-400">
-                    {paperMonitorStatus?.longCandidateCount ?? 0}
-                  </strong>{' '}
-                  · SHORT 候選數:{' '}
-                  <strong className="text-rose-400">
-                    {paperMonitorStatus?.shortCandidateCount ?? 0}
-                  </strong>{' '}
-                  · Paper 訊號數:{' '}
-                  <strong className="text-sky-300">
-                    {paperWindowReport?.totalSignals ?? 0}
-                  </strong>{' '}
-                  · 外部通知請求數:{' '}
-                  <strong className="text-emerald-400">
-                    Telegram=
-                    {paperWindowReport?.externalTelegramRequestsCount ?? 0} /
-                    TradingView=
-                    {paperWindowReport?.externalTradingViewRequestsCount ?? 0}
-                  </strong>
-                </span>
                 <button
                   type="button"
-                  onClick={() => setActiveSection('notifications')}
-                  className="underline text-amber-300 hover:text-amber-200 cursor-pointer"
+                  onClick={() => fetchPaperMonitorAll()}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-amber-400/60 hover:text-amber-200 cursor-pointer"
                 >
-                  開啟 24h 影子監控完整面板 →
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  重新整理品管數據
                 </button>
               </div>
             </div>
-          </div>
+
+            <SystemStabilityPanel
+              systemDbHealth={systemDbHealth}
+              activeSmc={smcScanStatus ?? scanData?.smcScanStatus ?? null}
+              dbCheckLoading={dbCheckLoading}
+              onRunSystemDbCheck={runSystemDbCheck}
+              watchdogStatus={watchdogStatus}
+              watchdogLoading={watchdogLoading}
+              onRunWatchdogCheck={runWatchdogCheck}
+              onUpdateWatchdogConfig={updateWatchdogConfig}
+            />
+
+
+
+
+
+
 
           {/* Phase 11: SMC 訊號品質與 Gate 分析 (SMC Signal Quality & Gate Analysis Panel) */}
           <div
@@ -4777,29 +4037,29 @@ export default function App() {
                   <div
                     key={winKey}
                     onClick={() => setPaperQualitySelectedWindow(winKey)}
-                    className={`border p-3 cursor-pointer transition-colors ${
+                    className={`min-w-0 border p-3 cursor-pointer transition-colors ${
                       isSelected
                         ? 'border-amber-500/60 bg-slate-900/70'
                         : 'border-slate-800/80 bg-slate-900/35 hover:border-slate-700'
                     }`}
                   >
-                    <div className="flex items-center justify-between border-b border-slate-800/70 pb-1.5 mb-1.5">
-                      <span className="font-bold text-xs text-slate-100">
+                    <div className="flex flex-wrap items-center justify-between gap-1.5 border-b border-slate-800/70 pb-1.5 mb-1.5">
+                      <span className="font-bold text-xs text-slate-100 min-w-0 break-all">
                         {winKey} 長期監控週期 ({winSum?.monitoringWindowId ?? `win_${winKey}`})
                       </span>
                       <span
-                        className={
+                        className={`shrink-0 ${
                           winSum?.sampleSufficiency === 'SUFFICIENT'
                             ? 'text-emerald-400 font-semibold'
                             : 'text-amber-300 font-semibold'
-                        }
+                        }`}
                       >
                         {winSum?.sampleSufficiency ?? 'INSUFFICIENT'} (n=
                         {winSum?.sampleCount ?? 0})
                       </span>
                     </div>
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-slate-300">
-                      <div className="flex justify-between">
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-x-3 gap-y-1 text-slate-300">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0">
                         <span className="text-slate-400">最新/去重/累計評估:</span>
                         <strong className="text-slate-100">
                           {winSum?.latestCycleEvaluatedCount ?? 0} /{' '}
@@ -4807,7 +4067,7 @@ export default function App() {
                           {winSum?.cumulativeEvaluationEvents ?? 0}
                         </strong>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0">
                         <span className="text-slate-400">完整/中斷週期:</span>
                         <strong className="text-slate-200">
                           {winSum?.completedScanCycles ?? 0} /{' '}
@@ -4815,32 +4075,32 @@ export default function App() {
                           {winSum?.totalScanCycles ?? 0})
                         </strong>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0">
                         <span className="text-slate-400">候選數 (L/S):</span>
                         <strong className="text-slate-100">
                           {winSum?.totalSignals ?? 0} ({winSum?.longSignals ?? 0}/
                           {winSum?.shortSignals ?? 0})
                         </strong>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0">
                         <span className="text-slate-400">開倉 / 結算:</span>
                         <strong className="text-slate-100">
                           {winSum?.paperOpened ?? 0} / {winSum?.paperClosed ?? 0}
                         </strong>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0">
                         <span className="text-slate-400">ENTRY_WINDOW_MISSED:</span>
                         <strong className="text-amber-300">
                           {winSum?.entryWindowMissed ?? 0}
                         </strong>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0">
                         <span className="text-slate-400">metricStatus:</span>
                         <strong className="text-sky-300">
                           {winSum?.metricStatus ?? 'NO_TRADES'}
                         </strong>
                       </div>
-                      <div className="flex justify-between col-span-2">
+                      <div className="flex flex-wrap justify-between gap-1 min-w-0 xl:col-span-2">
                         <span className="text-slate-400">勝率 / 平均 R:</span>
                         <strong className="text-slate-200">
                           {winSum?.winRate !== null && winSum?.winRate !== undefined
@@ -5066,106 +4326,933 @@ export default function App() {
               </div>
             </div>
           </div>
-        </section>
-
-        {/* Historical Volume Anomaly & Auxiliary 24h Rank Disclosure Notice */}
-        <div className="order-4 flex flex-wrap items-center justify-between gap-2 border border-slate-800/80 bg-slate-900/25 px-4 py-2 text-xs text-slate-400">
-          <span>
-            <strong>Phase 2 歷史量能異常與真實盤口政策：</strong>
-            已啟用 SQLite 歷史成交量 Collector 計算每個幣種之{' '}
-            <code className="font-mono text-slate-200">
-              Rolling Median / MAD / Z-Score / RVOL
-            </code>
-            ；原有的「全市場 24h 成交額百分位 (PR)」已改為<strong>輔助指標 (Auxiliary)</strong>，絕不冒充歷史異常成交量。
-            低流動性標的強制標示「低流動性：不列入一般候選」。
-          </span>
-          <div className="flex items-center gap-2">
-            <span>目前篩選:</span>
-            <button
-              type="button"
-              onClick={() => setCategoryFilter('ALL')}
-              className={`underline cursor-pointer ${
-                categoryFilter === 'ALL'
-                  ? 'text-amber-300 font-semibold'
-                  : 'text-slate-400'
-              }`}
-            >
-              顯示全部 ({scanData?.candidates.length ?? 0})
-            </button>
-          </div>
-        </div>
-
-        {/* SECTION 1: Full Market Radar + Selected Symbol SMC/ICT Detail Split (Apple Stocks Two-Column Workstation + Plain-Language Guide) */}
-        {activeSection === 'paper_quality' && (
-          <div className="order-3 apple-bento-card p-6 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
-              <div>
-                <h2 className="text-base font-bold text-slate-100">
-                  長期 Paper 品質監控中心（30d / 60d / 90d 樣本累積、Gate 穩定度與市場狀態分層）
-                </h2>
-                <p className="text-xs text-amber-300 font-semibold mt-1">
-                  目前樣本不足，不代表策略有效或無效 · {paperQualityStatus?.sampleSufficiencyNotice ?? '樣本不足，僅供觀察'}
-                </p>
-              </div>
-              <div className="text-xs font-mono text-slate-400">
-                PAPER ONLY · LIVE ORDERS DISABLED · NEVER AUTO-PLACE ORDERS
-              </div>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 font-mono text-xs">
-              {(paperQualityRegimes?.dimensionList ?? []).map((dim) => (
-                <div
-                  key={dim.dimension}
-                  className="border border-slate-800 bg-slate-950/70 p-3 space-y-1.5"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-slate-200">{dim.label}</span>
-                    <span className="text-[11px] text-amber-300">
-                      {dim.currentMarketState}
-                    </span>
-                  </div>
-                  {dim.buckets.map((b) => (
-                    <div
-                      key={b.bucketKey}
-                      className="flex items-center justify-between text-[11px] text-slate-300 border-t border-slate-800/60 pt-1"
-                    >
-                      <span>{b.bucketLabel}</span>
-                      <span>
-                        評估 {b.evaluatedCount} · 訊號 {b.signalCount} · 結算{' '}
-                        {b.paperClosed} ({b.sampleSufficiency})
-                      </span>
-                    </div>
-                  ))}
-                  <div className="text-[10px] text-slate-400 pt-1">
-                    {dim.conclusion}
-                  </div>
-                </div>
-              ))}
-            </div>
           </div>
         )}
+
+        {/* SECTION 1: Standalone Full Market Radar + Selected Symbol SMC/ICT Workstation */}
         {activeSection === 'radar' && (
-          <div className="order-3 grid grid-cols-1 gap-6 xl:grid-cols-12 items-start">
-            {/* Left Column (60%): Candidate Table */}
-            <div className="xl:col-span-7 apple-bento-card overflow-hidden">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/70 px-5 py-4">
-                <div>
+          <div className="order-3 space-y-4">
+            {/* Compact Radar Workspace Toolbar */}
+            <div className="apple-bento-card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCategoryFilter('ALL');
+                    setSectorFilter('ALL');
+                  }}
+                  className={`rounded-lg px-2.5 py-1 font-mono transition-colors cursor-pointer ${
+                    categoryFilter === 'ALL' && sectorFilter === 'ALL'
+                      ? 'bg-slate-800 text-slate-100 font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  全市場 {scanData?.totalContractsScanned ?? 0}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setCategoryFilter(
+                      categoryFilter === '雷達多頭觀察' ? 'ALL' : '雷達多頭觀察'
+                    )
+                  }
+                  className={`rounded-lg px-2.5 py-1 font-mono transition-colors cursor-pointer ${
+                    categoryFilter === '雷達多頭觀察'
+                      ? 'bg-emerald-500/20 text-emerald-300 font-semibold ring-1 ring-emerald-500/50'
+                      : 'text-emerald-400/90 hover:bg-emerald-500/10'
+                  }`}
+                >
+                  多頭雷達{' '}
+                  {scanData?.marketRadarLongCount ??
+                    scanData?.marketRadarCounts?.['雷達多頭觀察'] ??
+                    0}{' '}
+                  (SMC {scanData?.smcLongCandidateCount ?? 0})
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setCategoryFilter(
+                      categoryFilter === '雷達空頭觀察' ? 'ALL' : '雷達空頭觀察'
+                    )
+                  }
+                  className={`rounded-lg px-2.5 py-1 font-mono transition-colors cursor-pointer ${
+                    categoryFilter === '雷達空頭觀察'
+                      ? 'bg-rose-500/20 text-rose-300 font-semibold ring-1 ring-rose-500/50'
+                      : 'text-rose-400/90 hover:bg-rose-500/10'
+                  }`}
+                >
+                  空頭雷達{' '}
+                  {scanData?.marketRadarShortCount ??
+                    scanData?.marketRadarCounts?.['雷達空頭觀察'] ??
+                    0}{' '}
+                  (SMC {scanData?.smcShortCandidateCount ?? 0})
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setCategoryFilter(
+                      categoryFilter === '高風險' ? 'ALL' : '高風險'
+                    )
+                  }
+                  className={`rounded-lg px-2.5 py-1 font-mono transition-colors cursor-pointer ${
+                    categoryFilter === '高風險'
+                      ? 'bg-amber-500/20 text-amber-300 font-semibold ring-1 ring-amber-500/50'
+                      : 'text-amber-400/90 hover:bg-amber-500/10'
+                  }`}
+                >
+                  高風險 {scanData?.summaryCounts['高風險'] ?? 0}
+                </button>
+                <span className="font-mono text-slate-400 px-1 tabular-nums">
+                  BTC 24h:{' '}
+                  <strong className="text-slate-200">
+                    {scanData?.btcBenchmarkChange24h !== null &&
+                    scanData?.btcBenchmarkChange24h !== undefined
+                      ? `${scanData.btcBenchmarkChange24h >= 0 ? '+' : ''}${scanData.btcBenchmarkChange24h.toFixed(2)}%`
+                      : 'N/A'}
+                  </strong>
+                  {scanData?.btcMarketRegime &&
+                    scanData.btcMarketRegime.state !== 'UNKNOWN' && (
+                      <>
+                        <span className="mx-1.5 text-slate-600">·</span>
+                        <span
+                          title={scanData.btcMarketRegime.warningZh}
+                          className={
+                            scanData.btcMarketRegime.state === 'VOLATILITY_SPIKE'
+                              ? 'text-rose-300 font-semibold'
+                              : scanData.btcMarketRegime.state === 'BEAR_TREND'
+                                ? 'text-amber-300'
+                                : scanData.btcMarketRegime.state === 'BULL_TREND'
+                                  ? 'text-emerald-300'
+                                  : 'text-slate-400'
+                          }
+                        >
+                          {scanData.btcMarketRegime.state === 'VOLATILITY_SPIKE'
+                            ? '大盤濾網：極端波動攔截山寨'
+                            : scanData.btcMarketRegime.state === 'BEAR_TREND'
+                              ? '大盤濾網：BTC 偏空壓制 (擋逆勢多)'
+                              : scanData.btcMarketRegime.state === 'BULL_TREND'
+                                ? '大盤濾網：BTC 偏多推升 (擋逆勢空)'
+                                : '大盤濾網：震盪區間'}
+                        </span>
+                      </>
+                    )}
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* Quick Timeframe Pills */}
+                <div className="apple-segmented-track flex items-center gap-1">
+                  {(['5m', '15m', '1h', '4h'] as Timeframe[]).map((tf) => (
+                    <button
+                      key={tf}
+                      type="button"
+                      onClick={() => {
+                        setSelectedTimeframe(tf);
+                        if (selectedSymbol && !scanError) {
+                          loadSymbolDetail(selectedSymbol, tf);
+                        }
+                      }}
+                      className={`px-2.5 py-1 text-xs font-mono transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                        selectedTimeframe === tf
+                          ? 'apple-segmented-pill-active font-semibold'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {tf}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Symbol Search */}
+                <div className="relative w-52 sm:w-60">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="搜尋幣種 (如 SOL, SUI, BTC)..."
+                    className="w-full rounded-xl border border-slate-800 bg-slate-950 py-1.5 pl-8 pr-3 text-xs text-slate-100 placeholder-slate-500 focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setAlertDrawerOpen(true)}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium cursor-pointer whitespace-nowrap transition-colors ${
+                    priceAlerts.some((r) => r.enabled && !r.triggered)
+                      ? 'border-amber-500/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                      : 'border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-700 hover:text-slate-100'
+                  }`}
+                >
+                  <Bell className="h-3.5 w-3.5" />
+                  <span>
+                    條件告警 (
+                    {priceAlerts.filter((r) => r.enabled && !r.triggered).length}
+                    )
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowMarketWeather((v) => !v)}
+                  className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-700 hover:text-slate-100 cursor-pointer whitespace-nowrap"
+                >
+                  {showMarketWeather
+                    ? '收合市場情報列'
+                    : '展開市場情報列'}
+                </button>
+              </div>
+            </div>
+
+            {/* Compact Position Sentinel Strip (shown on Radar whenever positions are tracked) */}
+            {positionSentinelStatus &&
+              positionSentinelStatus.positions.length > 0 && (
+                <div className="apple-bento-card flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 text-xs">
                   <div className="flex flex-wrap items-center gap-2.5">
-                    <h2 className="text-base font-semibold tracking-tight text-slate-100">
-                      USDT 永續合約候選清單 ({filteredCandidates.length})
-                    </h2>
-                    <span className="text-[11px] font-medium text-amber-300">
-                      · 左欄快篩表 · 點擊任一幣種即可在右側查看 K 線與白話文 5 步闖關診斷
+                    <span className="font-semibold text-emerald-300">
+                      持倉趨勢即時守護中
+                    </span>
+                    <span className="text-slate-600" aria-hidden="true">
+                      |
+                    </span>
+                    {positionSentinelStatus.positions.slice(0, 5).map((pos) => {
+                      const stateTone =
+                        pos.healthState === 'THESIS_BROKEN'
+                          ? 'text-rose-300 border-rose-500/40 bg-rose-950/30'
+                          : pos.healthState === 'EARLY_REVERSAL'
+                            ? 'text-orange-300 border-orange-500/40 bg-orange-950/25'
+                            : pos.healthState === 'MOMENTUM_FADING'
+                              ? 'text-amber-300 border-amber-500/40 bg-amber-950/25'
+                              : 'text-emerald-300 border-emerald-500/35 bg-emerald-950/20';
+                      return (
+                        <button
+                          key={pos.id}
+                          type="button"
+                          onClick={() => setActiveSection('position_sentinel')}
+                          className={`inline-flex items-center gap-1.5 rounded border px-2 py-0.5 font-mono text-[11px] cursor-pointer ${stateTone}`}
+                        >
+                          <strong className="text-slate-100">
+                            {pos.symbol}
+                          </strong>
+                          <span>{pos.side}</span>
+                          <span className="tabular-nums">
+                            {pos.unrealizedPnlPercent >= 0 ? '+' : ''}
+                            {pos.unrealizedPnlPercent.toFixed(2)}%
+                          </span>
+                          <span>· {pos.healthLabelZh}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveSection('position_sentinel')}
+                    className="font-medium text-sky-300 hover:text-sky-200 cursor-pointer whitespace-nowrap"
+                  >
+                    前往持倉哨兵詳情 →
+                  </button>
+                </div>
+              )}
+
+            {latestAlertToast && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/50 bg-amber-950/40 px-4 py-2.5 text-xs text-amber-100">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Bell className="h-4 w-4 text-amber-300 shrink-0" />
+                  <span className="font-semibold shrink-0">條件告警觸發：</span>
+                  <span className="truncate">{latestAlertToast.messageZh}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setAlertDrawerOpen(true)}
+                    className="rounded-lg border border-amber-400/40 bg-amber-500/20 px-2.5 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/30 cursor-pointer"
+                  >
+                    檢視告警中心
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLatestAlertToast(null)}
+                    className="text-[11px] text-amber-300/80 hover:text-amber-100 cursor-pointer"
+                  >
+                    關閉提示
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Unified Compact Market Intel Dock: Top 3 + WATCH + Near-Miss + Breadth & 8 Sectors */}
+            {showMarketWeather && scanData && !scanError && (
+              <div className="@container apple-bento-card p-3.5 space-y-3 overflow-hidden">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                    <span className="text-xs font-semibold text-slate-100">
+                      當前最推薦 Top 3、接近 SMC 完整評估 (WATCH) 與差一點 (Near-Miss)
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      —{' '}
+                      {(scanData.summaryCounts['多頭候選'] ?? 0) +
+                        (scanData.summaryCounts['空頭候選'] ?? 0) >
+                      0
+                        ? `已有 ${(scanData.summaryCounts['多頭候選'] ?? 0) + (scanData.summaryCounts['空頭候選'] ?? 0)} 檔通過完整 SMC 結構確認`
+                        : `掃描 ${scanData.totalContractsScanned ?? 0} 檔 · WATCH ${scanData.smcWatchCount ?? watchApproachCandidates.length} 檔 · Near-Miss ${nearMissSymbolSet.size} 檔`}
                     </span>
                   </div>
-                  <p className="mt-1 text-xs text-slate-400">
-                    明確分離「第一層：市場雷達分類」、「第二層：SMC 評估狀態 (PENDING 尚未評估 vs EVALUATED 已評估)」與「最終交易訊號」
-                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSettingsHubTab('telemetry');
+                      setSettingsModalOpen(true);
+                    }}
+                    className="text-[11px] font-medium text-amber-300 hover:underline cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    開啟漏斗與工程遙測 →
+                  </button>
+                </div>
+
+                {/* Compact Top 3 + WATCH + Near-Miss Row */}
+                <div className="grid grid-cols-1 gap-2.5 @4xl:grid-cols-12 items-stretch">
+                  {/* Left 6 cols: Top 3 Focus Cards */}
+                  {top3Recommended.length > 0 && (
+                    <div className="@4xl:col-span-6 grid grid-cols-1 gap-2 @lg:grid-cols-3">
+                      {top3Recommended.map((topC, idx) => {
+                        const isSel = topC.symbol === selectedSymbol;
+                        const plainInfo = getPlainLanguageRowExplanation(
+                          topC,
+                          topC.smcActionState,
+                          topC.smcEvaluationStatus
+                        );
+                        return (
+                          <button
+                            key={topC.symbol}
+                            type="button"
+                            onClick={() =>
+                              loadSymbolDetail(topC.symbol, selectedTimeframe)
+                            }
+                            className={`min-w-0 overflow-hidden text-left border px-2.5 py-2 rounded-xl transition-all cursor-pointer ${
+                              isSel
+                                ? 'border-amber-500/80 bg-slate-950 shadow-sm'
+                                : 'border-slate-800/80 bg-slate-950/60 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5">
+                              <div className="flex items-center gap-1 min-w-0">
+                                <span className="text-[11px] font-mono font-bold text-amber-400 shrink-0">
+                                  0{idx + 1}.
+                                </span>
+                                <span className="text-xs font-bold font-mono text-slate-100 truncate">
+                                  {topC.symbol}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1 shrink-0 font-mono text-[10px]">
+                                <span className={getSmcStateColor(topC.smcActionState)}>
+                                  {topC.smcActionState}
+                                </span>
+                                <span className="font-semibold text-slate-200">
+                                  {topC.score}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="mt-1 flex items-center justify-between gap-1 text-[11px] font-mono tabular-nums">
+                              <span className="text-slate-200 truncate">
+                                ${formatPriceDynamic(topC.lastPrice)}
+                              </span>
+                              <span
+                                className={`shrink-0 ${
+                                  topC.priceChangePercent24h >= 0
+                                    ? 'text-emerald-400 font-semibold'
+                                    : 'text-rose-400 font-semibold'
+                                }`}
+                              >
+                                {topC.priceChangePercent24h >= 0 ? '+' : ''}
+                                {topC.priceChangePercent24h.toFixed(2)}%
+                              </span>
+                              <span className="text-slate-400 shrink-0">
+                                {topC.historicalVolume.status === 'READY'
+                                  ? `${topC.historicalVolume.rvol}x`
+                                  : '收集中'}
+                              </span>
+                            </div>
+                            <div
+                              className={`mt-0.5 text-[10px] truncate ${plainInfo.toneClass}`}
+                            >
+                              {plainInfo.headline}
+                            </div>
+                            {topC.tradeHorizon &&
+                              topC.tradeHorizon.category !==
+                                'PENDING_OR_NEUTRAL' && (
+                                <div
+                                  className={`mt-0.5 text-[10px] font-mono tabular-nums truncate ${getTradeHorizonToneClass(
+                                    topC.tradeHorizon.category
+                                  )}`}
+                                >
+                                  建議週期：{topC.tradeHorizon.labelZh} ·{' '}
+                                  {topC.tradeHorizon.holdingWindowZh}
+                                </div>
+                              )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Right 6 cols: WATCH & Near-Miss compact side-by-side */}
+                  <div className="@4xl:col-span-6 grid grid-cols-1 gap-2 @xl:grid-cols-2 text-xs">
+                    {/* Approaching Full SMC Evaluation (WATCH / Candidates) */}
+                    <div className="min-w-0 overflow-hidden rounded-xl border border-sky-500/25 bg-slate-950/70 px-3 py-2 space-y-1.5">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-semibold text-[11px] text-sky-300 truncate">
+                            接近 SMC 完整評估狀態 (WATCH / 結構已成形)
+                          </span>
+                          <span className="rounded bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] text-sky-300 shrink-0">
+                            {watchApproachCandidates.length}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCategoryFilter(
+                              categoryFilter === 'SMC_WATCH' ? 'ALL' : 'SMC_WATCH'
+                            )
+                          }
+                          className="text-[10px] font-medium text-sky-300 hover:underline cursor-pointer shrink-0 whitespace-nowrap"
+                        >
+                          {categoryFilter === 'SMC_WATCH' ? '全部' : '篩選 →'}
+                        </button>
+                      </div>
+                      {watchApproachCandidates.length === 0 ? (
+                        <div className="text-[10px] text-slate-400 truncate">
+                          尚無 WATCH 或正式候選標的（背景評估中）。
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {watchApproachCandidates.slice(0, 4).map((wc) => (
+                            <button
+                              key={wc.symbol}
+                              type="button"
+                              onClick={() =>
+                                loadSymbolDetail(wc.symbol, selectedTimeframe)
+                              }
+                              className={`min-w-0 overflow-hidden text-left rounded-lg border px-2 py-1 transition-colors cursor-pointer ${
+                                wc.symbol === selectedSymbol
+                                  ? 'border-amber-500/80 bg-slate-900'
+                                  : 'border-slate-800/80 bg-slate-900/50 hover:border-slate-700'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-1 font-mono text-[10px]">
+                                <span className="font-bold text-slate-100 truncate">
+                                  {wc.symbol.replace('USDT', '')}
+                                </span>
+                                <span
+                                  className={`font-semibold shrink-0 ${getSmcStateColor(wc.smcActionState)}`}
+                                >
+                                  {wc.score}
+                                </span>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Near-Miss (Missing 1-2 Gates) */}
+                    <div className="min-w-0 overflow-hidden rounded-xl border border-amber-500/25 bg-slate-950/70 px-3 py-2 space-y-1.5">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-semibold text-[11px] text-amber-300 truncate">
+                            差一點就通過 (Near-Miss 差 1~2 項 Gate)
+                          </span>
+                          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-300 shrink-0">
+                            {nearMissSymbolSet.size}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCategoryFilter(
+                              categoryFilter === 'NEAR_MISS' ? 'ALL' : 'NEAR_MISS'
+                            )
+                          }
+                          className="text-[10px] font-medium text-amber-300 hover:underline cursor-pointer shrink-0 whitespace-nowrap"
+                        >
+                          {categoryFilter === 'NEAR_MISS' ? '全部' : '篩選 →'}
+                        </button>
+                      </div>
+                      {nearMissRecords.length === 0 ? (
+                        <div className="text-[10px] text-slate-400 truncate">
+                          尚無只差 1~2 項 Gate 的 Near-Miss 標的。
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {nearMissRecords.slice(0, 4).map((nm) => (
+                            <button
+                              key={nm.symbol}
+                              type="button"
+                              onClick={() =>
+                                loadSymbolDetail(nm.symbol, selectedTimeframe)
+                              }
+                              className={`min-w-0 overflow-hidden text-left rounded-lg border px-2 py-1 transition-colors cursor-pointer ${
+                                nm.symbol === selectedSymbol
+                                  ? 'border-amber-500/80 bg-slate-900'
+                                  : 'border-slate-800/80 bg-slate-900/50 hover:border-slate-700'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-1 font-mono text-[10px]">
+                                <span className="font-bold text-slate-100 truncate">
+                                  {nm.symbol.replace('USDT', '')}
+                                </span>
+                                <span
+                                  className={`rounded px-1 text-[9px] font-bold shrink-0 ${
+                                    nm.missingGateCount === 1
+                                      ? 'bg-amber-500/20 text-amber-300'
+                                      : 'bg-slate-800 text-slate-300'
+                                  }`}
+                                >
+                                  -{nm.missingGateCount}項
+                                </span>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Dedicated Formal Confirmed SMC Candidates Strip (Strict Gate Passed Only) */}
+                <div
+                  id="formal-smc-panel"
+                  className="border-t border-slate-800/70 pt-2.5 space-y-2"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2 min-w-0">
+                      <span className="text-xs font-semibold text-emerald-300">
+                        正式 SMC 確認清單 (Formal SMC · 已通過全部結構與閘門)
+                      </span>
+                      <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
+                        {confirmedSmcCandidates.length} 檔
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-300">
+                        多 {confirmedSmcLongCount} · 空 {confirmedSmcShortCount}
+                      </span>
+                      <span className="text-[10px] text-slate-400 truncate">
+                        僅列第二層為 LONG / SHORT CANDIDATE 之正式候選標的（與 finalTradeSignal 1:1 一致，PAPER ONLY）
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCategoryFilter(
+                          categoryFilter === 'SMC_CONFIRMED'
+                            ? 'ALL'
+                            : 'SMC_CONFIRMED'
+                        )
+                      }
+                      className="text-[11px] font-medium text-emerald-300 hover:underline cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      {categoryFilter === 'SMC_CONFIRMED'
+                        ? '顯示全部 →'
+                        : '僅看正式 SMC →'}
+                    </button>
+                  </div>
+
+                  {confirmedSmcCandidates.length === 0 ? (
+                    <div className="rounded-xl border border-slate-800/70 bg-slate-950/60 px-3 py-2 text-[11px] text-slate-400">
+                      目前尚無同時通過多週期共振與全部安全閘門之正式 SMC 候選標的（可先觀察上方 WATCH 或下方「早鳥起漲」）。
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-2 @md:grid-cols-2 @4xl:grid-cols-4">
+                      {confirmedSmcCandidates.slice(0, 8).map((cc) => {
+                        const isSel = cc.symbol === selectedSymbol;
+                        const isLong = cc.smcActionState === 'LONG CANDIDATE';
+                        const zone = cc.entryZoneSummary;
+                        return (
+                          <button
+                            key={cc.symbol}
+                            type="button"
+                            onClick={() =>
+                              loadSymbolDetail(cc.symbol, selectedTimeframe)
+                            }
+                            className={`min-w-0 overflow-hidden text-left rounded-xl border px-3 py-2 transition-all cursor-pointer ${
+                              isSel
+                                ? isLong
+                                  ? 'border-emerald-400/80 bg-slate-950 shadow-sm'
+                                  : 'border-rose-400/80 bg-slate-950 shadow-sm'
+                                : isLong
+                                  ? 'border-emerald-500/25 bg-slate-950/60 hover:border-emerald-400/50'
+                                  : 'border-rose-500/25 bg-slate-950/60 hover:border-rose-400/50'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5 font-mono text-[11px]">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className="font-bold text-slate-100 truncate">
+                                  {cc.symbol}
+                                </span>
+                                <span
+                                  className={`rounded px-1.5 py-0.5 text-[9px] font-semibold shrink-0 ${
+                                    isLong
+                                      ? 'bg-emerald-500/15 text-emerald-300'
+                                      : 'bg-rose-500/15 text-rose-300'
+                                  }`}
+                                >
+                                  {isLong ? '正式多單' : '正式空單'}
+                                </span>
+                              </div>
+                              <span
+                                className={`font-bold shrink-0 ${
+                                  isLong ? 'text-emerald-300' : 'text-rose-300'
+                                }`}
+                              >
+                                {cc.score}分
+                              </span>
+                            </div>
+                            <div className="mt-1 flex items-center justify-between gap-1.5 font-mono text-[10px] tabular-nums">
+                              <span className="text-slate-200 truncate">
+                                ${formatPriceDynamic(cc.lastPrice)}
+                              </span>
+                              <span
+                                className={`shrink-0 ${
+                                  cc.priceChangePercent24h >= 0
+                                    ? 'text-emerald-400 font-semibold'
+                                    : 'text-rose-400 font-semibold'
+                                }`}
+                              >
+                                {cc.priceChangePercent24h >= 0 ? '+' : ''}
+                                {cc.priceChangePercent24h.toFixed(2)}%
+                              </span>
+                              <span className="text-amber-300 shrink-0">
+                                {cc.historicalVolume.status === 'READY'
+                                  ? `15m ${cc.historicalVolume.rvol}x`
+                                  : '收集中'}
+                              </span>
+                            </div>
+                            <div
+                              className={`mt-0.5 text-[10px] truncate ${
+                                zone?.status === 'OVEREXTENDED'
+                                  ? 'text-amber-300'
+                                  : zone?.status === 'IN_DISCOUNT_ZONE'
+                                    ? 'text-emerald-300'
+                                    : zone?.status === 'NEAR_PULLBACK_ZONE'
+                                      ? 'text-sky-300'
+                                      : 'text-slate-400'
+                              }`}
+                            >
+                              {zone?.status === 'OVEREXTENDED'
+                                ? `延伸過熱 (${zone.distanceToZoneAtr !== null ? `${zone.distanceToZoneAtr.toFixed(2)}x ATR` : '遠離區間'}) · 建議等回踩 ${zone.anchorLabel}`
+                                : zone?.status === 'IN_DISCOUNT_ZONE'
+                                  ? `已入 ${zone.anchorLabel} 理想回踩區`
+                                  : zone?.status === 'NEAR_PULLBACK_ZONE'
+                                    ? `接近 ${zone.anchorLabel} 回踩區`
+                                    : isLong
+                                      ? '已通過全部多頭結構與閘門 · 可評估紙上做多'
+                                      : '已通過全部空頭結構與閘門 · 可評估紙上做空'}
+                            </div>
+                            {cc.tradeHorizon &&
+                              cc.tradeHorizon.category !==
+                                'PENDING_OR_NEUTRAL' && (
+                                <div
+                                  className={`mt-0.5 text-[10px] font-mono tabular-nums truncate ${getTradeHorizonToneClass(
+                                    cc.tradeHorizon.category
+                                  )}`}
+                                >
+                                  {cc.tradeHorizon.verdictShortZh} ·{' '}
+                                  {cc.tradeHorizon.holdingWindowZh}
+                                </div>
+                              )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Early Ignition Hunter Strip (Independent of Strict SMC Lag) */}
+                <div
+                  id="early-ignition-panel"
+                  className="border-t border-slate-800/70 pt-2.5 space-y-2"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2 min-w-0">
+                      <span className="text-xs font-semibold text-cyan-300">
+                        早鳥起漲獵手 (Early Ignition · 剛放量且未漲遠)
+                      </span>
+                      <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 font-mono text-[10px] text-cyan-300">
+                        {earlyIgnitionCandidates.length} 檔
+                      </span>
+                      <span className="text-[10px] text-slate-400 truncate">
+                        獨立軌道（尚未等 1h/4h 共振，嚴格守前低／掃單極值止損，不計入正式 SMC 候選）
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCategoryFilter(
+                          categoryFilter === 'EARLY_IGNITION'
+                            ? 'ALL'
+                            : 'EARLY_IGNITION'
+                        )
+                      }
+                      className="text-[11px] font-medium text-cyan-300 hover:underline cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      {categoryFilter === 'EARLY_IGNITION'
+                        ? '顯示全部 →'
+                        : '僅看早鳥起漲 →'}
+                    </button>
+                  </div>
+
+                  {earlyIgnitionCandidates.length === 0 ? (
+                    <div className="rounded-xl border border-slate-800/70 bg-slate-950/60 px-3 py-2 text-[11px] text-slate-400">
+                      目前無同時符合「24h 漲幅溫和 + 15m 剛放量或 5m/15m 剛轉折」之早鳥起漲標的。
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-2 @md:grid-cols-2 @4xl:grid-cols-4">
+                      {earlyIgnitionCandidates.slice(0, 4).map((ec) => {
+                        const ign = ec.earlyIgnition!;
+                        const isSel = ec.symbol === selectedSymbol;
+                        const isLong = ign.direction === 'LONG';
+                        return (
+                          <button
+                            key={ec.symbol}
+                            type="button"
+                            onClick={() =>
+                              loadSymbolDetail(ec.symbol, selectedTimeframe)
+                            }
+                            className={`min-w-0 overflow-hidden text-left rounded-xl border px-3 py-2 transition-all cursor-pointer ${
+                              isSel
+                                ? 'border-cyan-400/80 bg-slate-950 shadow-sm'
+                                : 'border-cyan-500/20 bg-slate-950/60 hover:border-cyan-400/50'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5 font-mono text-[11px]">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className="font-bold text-slate-100 truncate">
+                                  {ec.symbol}
+                                </span>
+                                <span
+                                  className={`rounded px-1.5 py-0.5 text-[9px] font-semibold shrink-0 ${
+                                    isLong
+                                      ? 'bg-emerald-500/15 text-emerald-300'
+                                      : 'bg-rose-500/15 text-rose-300'
+                                  }`}
+                                >
+                                  {isLong ? '早鳥多' : '早鳥空'}
+                                </span>
+                              </div>
+                              <span className="font-bold text-cyan-300 shrink-0">
+                                {ign.ignitionScore}分
+                              </span>
+                            </div>
+                            <div className="mt-1 flex items-center justify-between gap-1.5 font-mono text-[10px] tabular-nums">
+                              <span
+                                className={
+                                  ign.change24hPct >= 0
+                                    ? 'text-emerald-400 font-semibold'
+                                    : 'text-rose-400 font-semibold'
+                                }
+                              >
+                                24h {ign.change24hPct >= 0 ? '+' : ''}
+                                {ign.change24hPct.toFixed(2)}%
+                              </span>
+                              <span className="text-amber-300 truncate">
+                                {ign.rvol15m !== null
+                                  ? `15m ${ign.rvol15m}x`
+                                  : `${ign.triggerTimeframe ?? '15m'} 轉折`}
+                              </span>
+                              {ign.invalidationPrice !== null && (
+                                <span className="text-slate-400 truncate">
+                                  止損 {formatPriceDynamic(ign.invalidationPrice)}
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                              {ign.headlineZh}
+                            </div>
+                            <div
+                              className={`mt-0.5 text-[10px] font-mono tabular-nums truncate ${getTradeHorizonToneClass(
+                                ec.tradeHorizon?.category ?? 'SCALP_FAST'
+                              )}`}
+                            >
+                              {ec.tradeHorizon &&
+                              ec.tradeHorizon.category !== 'PENDING_OR_NEUTRAL'
+                                ? `${ec.tradeHorizon.labelZh} · ${ec.tradeHorizon.holdingWindowZh}`
+                                : '短線快打 · 30分 ~ 2 小時（尚未等 1h/4h 共振）'}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Pullback Ready Sniper Strip (FVG / OB Discount or Near Zone) */}
+                <div
+                  id="pullback-sniper-panel"
+                  className="border-t border-slate-800/70 pt-2.5 space-y-2"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2 min-w-0">
+                      <span className="text-xs font-semibold text-amber-300">
+                        回踩狙擊雷達 (FVG / OB 折價區即時追蹤)
+                      </span>
+                      <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">
+                        {pullbackReadyCandidates.length} 檔
+                      </span>
+                      <span className="text-[10px] text-slate-400 truncate">
+                        已進入或緊貼理想 FVG / OB 回踩區（依貼近距離與回踩 R:R 排序）
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCategoryFilter(
+                          categoryFilter === 'PULLBACK_READY'
+                            ? 'ALL'
+                            : 'PULLBACK_READY'
+                        )
+                      }
+                      className="text-[11px] font-medium text-amber-300 hover:underline cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      {categoryFilter === 'PULLBACK_READY'
+                        ? '顯示全部 →'
+                        : '僅看回踩狙擊 →'}
+                    </button>
+                  </div>
+
+                  {pullbackReadyCandidates.length === 0 ? (
+                    <div className="rounded-xl border border-slate-800/70 bg-slate-950/60 px-3 py-2 text-[11px] text-slate-400">
+                      目前尚無已進入或接近 FVG / OB 理想回踩區間之標的，可先參考上方「正式 SMC」或「早鳥起漲」。
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-2 @md:grid-cols-2 @4xl:grid-cols-4">
+                      {pullbackReadyCandidates.slice(0, 4).map((pc) => {
+                        const ez = pc.entryZoneSummary!;
+                        const isSel = pc.symbol === selectedSymbol;
+                        const isInZone = ez.status === 'IN_DISCOUNT_ZONE';
+                        const isLong = ez.direction === 'LONG';
+                        const distPct =
+                          ez.distanceToZonePct !== null
+                            ? Math.abs(ez.distanceToZonePct)
+                            : 0;
+                        return (
+                          <button
+                            key={pc.symbol}
+                            type="button"
+                            onClick={() =>
+                              loadSymbolDetail(pc.symbol, selectedTimeframe)
+                            }
+                            className={`min-w-0 overflow-hidden text-left rounded-xl border px-3 py-2 transition-all cursor-pointer ${
+                              isSel
+                                ? 'border-amber-400/80 bg-slate-950 shadow-sm'
+                                : isInZone
+                                  ? 'border-emerald-500/30 bg-slate-950/60 hover:border-emerald-400/60'
+                                  : 'border-sky-500/25 bg-slate-950/60 hover:border-sky-400/50'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5 font-mono text-[11px]">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className="font-bold text-slate-100 truncate">
+                                  {pc.symbol}
+                                </span>
+                                <span
+                                  className={`rounded px-1.5 py-0.5 text-[9px] font-semibold shrink-0 ${
+                                    isInZone
+                                      ? 'bg-emerald-500/15 text-emerald-300'
+                                      : 'bg-sky-500/15 text-sky-300'
+                                  }`}
+                                >
+                                  {isInZone ? '已入回踩區' : '接近回踩區'}
+                                </span>
+                              </div>
+                              <span
+                                className={`font-bold shrink-0 ${
+                                  isLong ? 'text-emerald-300' : 'text-rose-300'
+                                }`}
+                              >
+                                {isLong ? '回踩多' : '回踩空'}
+                              </span>
+                            </div>
+                            <div className="mt-1 flex items-center justify-between gap-1.5 font-mono text-[10px] tabular-nums">
+                              <span className="text-slate-200 truncate">
+                                掛 ${formatPriceDynamic(ez.idealPullbackEntry!)}
+                              </span>
+                              <span className="text-amber-300 shrink-0">
+                                距 {distPct.toFixed(2)}%
+                              </span>
+                              {ez.pullbackRR !== null && (
+                                <span className="text-emerald-300 shrink-0">
+                                  R:R 1:{ez.pullbackRR}
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                              {ez.anchorLabel} · {pc.smcActionState}
+                              {pc.tradeHorizon &&
+                              pc.tradeHorizon.category !== 'PENDING_OR_NEUTRAL'
+                                ? ` · ${pc.tradeHorizon.labelZh} (${pc.tradeHorizon.holdingWindowZh})`
+                                : ''}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Integrated Market Breadth & 8-Sector Strip */}
+                <div className="border-t border-slate-800/70 pt-2.5">
+                  <MarketBreadthSectorPanel
+                    breadth={scanData.marketBreadth}
+                    sectors={scanData.sectorRotation}
+                    activeSector={sectorFilter}
+                    onSelectSector={setSectorFilter}
+                    onSelectSymbol={(sym) =>
+                      loadSymbolDetail(sym, selectedTimeframe)
+                    }
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 gap-5 xl:grid-cols-12 items-start">
+            {/* Left Column (42%): Streamlined 5-Column Candidate Table (Hidden when Right Workstation is Full-Width) */}
+            {!detailExpanded && (
+            <div className="xl:col-span-5 apple-bento-card overflow-hidden min-w-0">
+              <div className="flex flex-col gap-2.5 border-b border-slate-800/70 px-4 py-3.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                    <h2 className="text-sm font-semibold tracking-tight text-slate-100">
+                      USDT 永續合約候選清單 ({filteredCandidates.length})
+                    </h2>
+                    <span className="text-[11px] font-medium text-amber-300 truncate">
+                      · 點擊任一標的查看右側工作站
+                    </span>
+                  </div>
                 </div>
                 <div className="apple-segmented-track flex flex-wrap items-center gap-1 p-1 text-[11px]">
                   {(
                     [
                       { key: 'ALL', label: '全部標的' },
-                      { key: 'WATCHLIST', label: `★ 觀察清單 (${watchlist.length})` },
+                      { key: 'WATCHLIST', label: `★ 自選 (${watchlist.length})` },
+                      {
+                        key: 'SMC_CONFIRMED',
+                        label: `正式 SMC (${confirmedSmcCandidates.length})`,
+                      },
+                      {
+                        key: 'EARLY_IGNITION',
+                        label: `早鳥 (${earlyIgnitionCandidates.length})`,
+                      },
+                      {
+                        key: 'PULLBACK_READY',
+                        label: `回踩狙擊 (${pullbackReadyCandidates.length})`,
+                      },
+                      {
+                        key: 'SMC_WATCH',
+                        label: `接近 SMC (${watchApproachCandidates.length})`,
+                      },
+                      {
+                        key: 'NEAR_MISS',
+                        label: `差一點 (${nearMissSymbolSet.size})`,
+                      },
                       { key: '準備觀察', label: '準備觀察' },
                       { key: '雷達多頭觀察', label: '多頭雷達' },
                       { key: '雷達空頭觀察', label: '空頭雷達' },
@@ -5176,8 +5263,13 @@ export default function App() {
                     <button
                       key={f.key}
                       type="button"
-                      onClick={() => setCategoryFilter(f.key)}
-                      className={`px-2.5 py-1 text-[11px] cursor-pointer transition-all ${
+                      onClick={() => {
+                        setCategoryFilter(f.key);
+                        if (f.key === 'ALL') {
+                          setSectorFilter('ALL');
+                        }
+                      }}
+                      className={`px-2 py-1 text-[11px] cursor-pointer transition-all whitespace-nowrap ${
                         categoryFilter === f.key
                           ? 'apple-segmented-pill-active text-amber-200 font-semibold'
                           : 'rounded-lg text-slate-400 hover:text-slate-200'
@@ -5189,35 +5281,20 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="max-h-[680px] overflow-x-auto overflow-y-auto">
-                <table className="w-full border-collapse text-left text-xs">
-                  <thead className="sticky top-0 z-10 border-b border-white/[0.08] bg-[#11131a]/95 backdrop-blur-md text-slate-400">
+              <div className="max-h-[760px] overflow-x-auto overflow-y-auto">
+                <table className="w-full border-collapse text-left text-xs table-fixed">
+                  <thead className="sticky top-0 z-10 border-b border-white/[0.08] bg-[#11131a] text-slate-400 text-[11px]">
                     <tr>
-                      <th className="py-3 pl-5 pr-2 font-medium">觀察</th>
-                      <th className="py-3 px-2 font-medium">合約標的</th>
-                      <th className="py-3 px-2 font-medium">
-                        第一層：市場雷達分類 / 第二層：SMC 評估狀態 / 最終交易訊號
+                      <th className="w-9 py-2.5 pl-3 pr-1 font-medium">★</th>
+                      <th className="w-[104px] py-2.5 px-1.5 font-medium">合約標的</th>
+                      <th className="py-2.5 px-1.5 font-medium">
+                        雙層分類 / SMC 狀態 / 訊號
                       </th>
-                      <th className="py-3 px-2 text-right font-medium">
-                        Score
+                      <th className="w-[110px] py-2.5 px-1.5 text-right font-medium">
+                        價格 / 24h / BTC
                       </th>
-                      <th className="py-3 px-2 text-right font-medium">
-                        最新價格 / Spread
-                      </th>
-                      <th className="py-3 px-2 text-right font-medium">
-                        24h 漲跌
-                      </th>
-                      <th className="py-3 px-2 text-right font-medium">
-                        歷史量能 (RVOL / Z)
-                      </th>
-                      <th className="py-3 px-2 text-right font-medium">
-                        24h 成交額 (輔助 PR)
-                      </th>
-                      <th className="py-3 px-2 text-right font-medium">
-                        Funding
-                      </th>
-                      <th className="py-3 pl-2 pr-5 text-right font-medium">
-                        OI (點選載入)
+                      <th className="w-[92px] py-2.5 pl-1.5 pr-3 text-right font-medium">
+                        Score / 量費
                       </th>
                     </tr>
                   </thead>
@@ -5226,8 +5303,8 @@ export default function App() {
                       Array.from({ length: 8 }).map((_, idx) => (
                         <tr key={idx} className="animate-pulse">
                           <th
-                            colSpan={10}
-                            className="py-3.5 px-5 text-left font-normal text-slate-600"
+                            colSpan={5}
+                            className="py-3.5 px-4 text-left font-normal text-slate-600"
                           >
                             正在載入並計算全市場規則證據...
                           </th>
@@ -5236,8 +5313,8 @@ export default function App() {
                     ) : filteredCandidates.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={10}
-                          className="py-12 text-center font-sans text-sm text-slate-400"
+                          colSpan={5}
+                          className="py-12 text-center font-sans text-sm text-slate-400 px-4"
                         >
                           {scanError
                             ? '即時資料不可用（候選清單已清空）。請重試即時連線，或手動按下「切換 Demo 驗證模式」。'
@@ -5248,9 +5325,6 @@ export default function App() {
                       filteredCandidates.map((c) => {
                         const isSelected = c.symbol === selectedSymbol;
                         const inWatchlist = watchlist.includes(c.symbol);
-                        const loadedOi = loadedOiBySymbol[c.symbol];
-                        const oiValue =
-                          loadedOi?.oiValue ?? c.openInterestValue;
                         const hv = c.historicalVolume;
                         const rowSmcEvalStatus =
                           isSelected && symbolDetail?.symbol === c.symbol
@@ -5265,6 +5339,12 @@ export default function App() {
                           rowSmcState,
                           rowSmcEvalStatus
                         );
+                        const btcCorr = c.btcCorrelation;
+                        const use15m = btcCorr?.pearson15m !== null;
+                        const btcOvVal = use15m
+                          ? btcCorr?.directionalOverlap15m
+                          : btcCorr?.directionalOverlap1h;
+                        const btcRVal = use15m ? btcCorr?.pearson15m : btcCorr?.pearson1h;
 
                         return (
                           <tr
@@ -5272,14 +5352,14 @@ export default function App() {
                             onClick={() =>
                               loadSymbolDetail(c.symbol, selectedTimeframe)
                             }
-                            className={`cursor-pointer transition-colors ${
+                            className={`radar-table-row cursor-pointer ${
                               isSelected
                                 ? 'bg-amber-500/12 text-slate-100'
                                 : 'hover:bg-slate-800/40 text-slate-300'
                             }`}
                           >
                             <td
-                              className="py-3 pl-5 pr-2"
+                              className="py-2.5 pl-3 pr-1 align-top"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 toggleWatchlist(c.symbol);
@@ -5300,180 +5380,145 @@ export default function App() {
                                 />
                               </button>
                             </td>
-                            <td className="py-3 px-2 font-semibold text-slate-100 whitespace-nowrap">
-                              <div className="tracking-tight">{c.symbol}</div>
-                              <div className="text-[10px] font-normal text-slate-400">
+                            <td className="py-2.5 px-1.5 align-top font-semibold text-slate-100">
+                              <div className="tracking-tight truncate">
+                                {c.symbol}
+                              </div>
+                              <div className="text-[10px] font-normal text-slate-400 truncate">
                                 {c.provenance.isDemo ? 'DEMO' : 'LIVE'} ·{' '}
-                                {c.isLowLiquidity
-                                  ? '低流動性'
-                                  : '主流流動性'}
+                                {c.isLowLiquidity ? '低流動' : '主流'}
+                              </div>
+                              <div className="text-[10px] font-normal text-slate-500 truncate">
+                                額 ${formatUsdCompact(c.quoteVolume24h)}
                               </div>
                             </td>
-                            <td className="py-3 px-2 font-sans whitespace-nowrap">
-                              <div
-                                className={getMarketRadarTextColor(
-                                  c.marketRadarCategory
-                                )}
-                              >
-                                第一層：{c.marketRadarCategory}{' '}
-                                <span className="text-[10px] font-normal text-slate-400">
-                                  (非交易訊號)
+                            <td className="py-2.5 px-1.5 align-top font-sans min-w-0">
+                              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px]">
+                                <span
+                                  className={`font-semibold truncate ${getMarketRadarTextColor(
+                                    c.marketRadarCategory
+                                  )}`}
+                                >
+                                  {c.marketRadarCategory}
                                 </span>
-                              </div>
-                              <div className="mt-0.5 text-[10px] font-mono text-slate-400">
-                                第二層：
+                                <span className="text-slate-600">·</span>
                                 {rowSmcEvalStatus === 'PENDING' ||
                                 rowSmcState === 'PENDING' ? (
-                                  <span className="text-slate-400 font-semibold">
-                                    SMC 尚未評估／點擊載入單幣種結構 (PENDING)
+                                  <span className="font-mono text-[10px] text-slate-400 truncate">
+                                    SMC PENDING
                                   </span>
                                 ) : (
                                   <span
-                                    className={`font-semibold ${getSmcStateColor(
+                                    className={`font-mono text-[10px] font-semibold truncate ${getSmcStateColor(
                                       rowSmcState
                                     )}`}
                                   >
-                                    SMC {rowSmcState} ({rowSmcEvalStatus})
+                                    {rowSmcState}
                                   </span>
                                 )}
                               </div>
-                              <div className="mt-0.5 text-[10px] font-mono text-slate-400">
-                                最終交易訊號：
-                                <span
-                                  className={
-                                    c.finalTradeSignal === '多頭交易候選'
-                                      ? 'text-emerald-400 font-semibold'
-                                      : c.finalTradeSignal === '空頭交易候選'
-                                        ? 'text-rose-400 font-semibold'
-                                        : 'text-slate-300'
-                                  }
-                                >
-                                  {c.finalTradeSignal}
-                                </span>{' '}
-                                <span className="text-slate-500">
-                                  · 分類:{c.finalCategory}
-                                </span>
-                              </div>
-                              {c.decisionTrace?.downgradeReasons &&
-                                c.decisionTrace.downgradeReasons.length > 0 && (
-                                  <div
-                                    className="mt-0.5 max-w-[230px] truncate text-[10px] font-mono text-amber-300/90"
-                                    title={c.decisionTrace.downgradeReasons.join(
-                                      ' | '
-                                    )}
+                              <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] font-mono text-slate-400">
+                                <span className="truncate">
+                                  訊號：
+                                  <span
+                                    className={
+                                      c.finalTradeSignal === '多頭交易候選'
+                                        ? 'text-emerald-400 font-semibold'
+                                        : c.finalTradeSignal === '空頭交易候選'
+                                          ? 'text-rose-400 font-semibold'
+                                          : 'text-slate-300'
+                                    }
                                   >
-                                    降級原因:{' '}
-                                    {c.decisionTrace.downgradeReasons[0].split(
-                                      ':'
-                                    )[0] || c.decisionTrace.downgradeReasons[0]}
+                                    {c.finalTradeSignal}
+                                  </span>
+                                </span>
+                                {c.earlyIgnition &&
+                                  c.earlyIgnition.status !== 'NONE' && (
+                                    <span className="rounded bg-cyan-500/15 px-1 py-0.2 text-[9px] font-semibold text-cyan-300 shrink-0">
+                                      {c.earlyIgnition.direction === 'LONG'
+                                        ? '早鳥多'
+                                        : '早鳥空'}
+                                    </span>
+                                  )}
+                                {c.entryZoneSummary?.status ===
+                                  'OVEREXTENDED' && (
+                                  <span className="rounded bg-amber-500/15 px-1 py-0.2 text-[9px] font-semibold text-amber-300 shrink-0">
+                                    延伸警戒
+                                  </span>
+                                )}
+                              </div>
+                              <div
+                                className={`mt-0.5 text-[10px] font-sans truncate ${rowPlain.toneClass}`}
+                                title={rowPlain.headline}
+                              >
+                                {rowPlain.headline}
+                              </div>
+                              {c.tradeHorizon &&
+                                c.tradeHorizon.category !==
+                                  'PENDING_OR_NEUTRAL' && (
+                                  <div
+                                    className={`mt-0.5 text-[10px] font-mono tabular-nums truncate ${getTradeHorizonToneClass(
+                                      c.tradeHorizon.category
+                                    )}`}
+                                  >
+                                    {c.tradeHorizon.labelZh} ·{' '}
+                                    {c.tradeHorizon.holdingWindowZh}
                                   </div>
                                 )}
+                            </td>
+                            <td className="py-2.5 px-1.5 align-top text-right">
+                              <div className="truncate font-semibold text-slate-100">
+                                ${formatPriceDynamic(c.lastPrice)}
+                              </div>
                               <div
-                                className={`mt-1 max-w-[260px] whitespace-normal text-[11px] font-sans ${rowPlain.toneClass}`}
+                                className={`text-[11px] font-medium truncate ${
+                                  c.priceChangePercent24h >= 0
+                                    ? 'text-emerald-400'
+                                    : 'text-rose-400'
+                                }`}
                               >
-                                💡 {rowPlain.headline}
-                              </div>
-                            </td>
-                            <td className="py-3 px-2 text-right font-semibold text-slate-100 whitespace-nowrap">
-                              <div>{c.score}</div>
-                              {c.scoreCapApplied && (
-                                <div className="text-[10px] font-normal text-amber-400">
-                                  原始 {c.rawScoreBeforeCap} (Cap 48)
-                                </div>
-                              )}
-                            </td>
-                            <td className="py-3 px-2 text-right whitespace-nowrap">
-                              <div>${formatPriceDynamic(c.lastPrice)}</div>
-                              <div className="text-[10px] text-slate-400">
-                                {c.spreadPercent !== null
-                                  ? `Spread ${c.spreadPercent.toFixed(3)}%`
-                                  : 'Spread 資料不可用'}
-                              </div>
-                            </td>
-                            <td
-                              className={`py-3 px-2 text-right font-medium ${
-                                c.priceChangePercent24h >= 0
-                                  ? 'text-emerald-400'
-                                  : 'text-rose-400'
-                              }`}
-                            >
-                              <div>
                                 {c.priceChangePercent24h >= 0 ? '+' : ''}
                                 {c.priceChangePercent24h.toFixed(2)}%
                               </div>
-                              <div className="text-[10px] text-slate-400">
-                                vs BTC {c.relativeBtcStrength >= 0 ? '+' : ''}
-                                {c.relativeBtcStrength.toFixed(1)}%
+                              <div className="text-[10px] text-slate-400 truncate">
+                                {c.symbol === 'BTCUSDT'
+                                  ? 'BTC 基準'
+                                  : btcCorr?.status === 'READY' && btcOvVal != null
+                                    ? `重合 ${btcOvVal.toFixed(0)}% · r${btcRVal?.toFixed(2) ?? ''}`
+                                    : `vsBTC ${c.relativeBtcStrength >= 0 ? '+' : ''}${c.relativeBtcStrength.toFixed(1)}%`}
                               </div>
                             </td>
-                            <td className="py-3 px-2 text-right whitespace-nowrap">
-                              {hv.status === 'READY' ? (
-                                <>
-                                  <div
-                                    className={
-                                      hv.isHistoricalAnomaly
-                                        ? 'text-amber-300 font-semibold'
-                                        : 'text-slate-200'
-                                    }
-                                  >
-                                    RVOL {hv.rvol}x ({hv.volumeTimeframe ?? '15m'})
-                                  </div>
-                                  <div className="text-[10px] text-slate-400">
-                                    Z={hv.zScore} (N={hv.sampleCount})
-                                  </div>
-                                </>
-                              ) : hv.status === 'BASELINE_UNSTABLE' ? (
-                                <>
-                                  <div className="text-[10px] text-amber-400 font-semibold">
-                                    BASELINE_UNSTABLE ({hv.sampleCount}/
-                                    {hv.minRequiredSamples})
-                                  </div>
-                                  <div className="text-[10px] text-slate-400">
-                                    MAD/Med{' '}
-                                    {(
-                                      (hv.madToMedianRatio ?? 0) * 100
-                                    ).toFixed(1)}
-                                    % · {hv.volumeTimeframe ?? '15m'}
-                                  </div>
-                                </>
-                              ) : (
-                                <div className="text-[10px] text-slate-500 font-sans">
-                                  INSUFFICIENT_HISTORY ({hv.sampleCount}/
-                                  {hv.minRequiredSamples} ·{' '}
-                                  {hv.volumeTimeframe ?? '15m'})
-                                </div>
-                              )}
-                            </td>
-                            <td className="py-3 px-2 text-right whitespace-nowrap">
-                              <div>${formatUsdCompact(c.quoteVolume24h)}</div>
-                              <div className="text-[10px] text-slate-400">
-                                輔助 PR{' '}
-                                {c.auxiliaryVolumeRankProxyPercentile.toFixed(
-                                  0
+                            <td className="py-2.5 pl-1.5 pr-3 align-top text-right">
+                              <div className="font-bold text-slate-100 truncate">
+                                {c.score}
+                                {c.scoreCapApplied && (
+                                  <span className="ml-0.5 text-[9px] font-normal text-amber-400">
+                                    (Cap)
+                                  </span>
                                 )}
                               </div>
-                            </td>
-                            <td
-                              className={`py-3 px-2 text-right whitespace-nowrap ${
-                                c.extremeFunding
-                                  ? 'text-amber-300 font-semibold'
-                                  : 'text-slate-300'
-                              }`}
-                            >
-                              {c.fundingRate !== null
-                                ? `${(c.fundingRate * 100).toFixed(4)}%`
-                                : '缺失'}
-                            </td>
-                            <td className="py-3 pl-2 pr-5 text-right whitespace-nowrap text-slate-300">
-                              {oiValue !== null && oiValue !== undefined ? (
-                                `$${formatUsdCompact(oiValue)}`
-                              ) : loadedOi && loadedOi.oi === null ? (
-                                <span className="text-rose-400">OI 缺失</span>
-                              ) : (
-                                <span className="text-slate-500 font-sans">
-                                  點選載入
-                                </span>
-                              )}
+                              <div
+                                className={`text-[10px] truncate ${
+                                  hv.status === 'READY' && hv.isHistoricalAnomaly
+                                    ? 'text-amber-300 font-semibold'
+                                    : 'text-slate-400'
+                                }`}
+                              >
+                                {hv.status === 'READY'
+                                  ? `RVOL ${hv.rvol}x`
+                                  : '累積中'}
+                              </div>
+                              <div
+                                className={`text-[10px] truncate ${
+                                  c.extremeFunding
+                                    ? 'text-amber-300 font-semibold'
+                                    : 'text-slate-400'
+                                }`}
+                              >
+                                {c.fundingRate !== null
+                                  ? `F ${(c.fundingRate * 100).toFixed(3)}%`
+                                  : 'F 缺失'}
+                              </div>
                             </td>
                           </tr>
                         );
@@ -5483,9 +5528,14 @@ export default function App() {
                 </table>
               </div>
             </div>
+            )}
 
-            {/* Right Column: Selected Symbol Two-Layer Result, Decision Trace, SMC/ICT Evidence & Gemini Explainer */}
-            <div className="xl:col-span-5 space-y-5">
+            {/* Right Column (58% split or 100% expanded): Tabbed Symbol Workstation */}
+            <div
+              className={`${
+                detailExpanded ? 'xl:col-span-12' : 'xl:col-span-7'
+              } min-w-0 space-y-4`}
+            >
               {scanError ? (
                 <div className="apple-bento-card border-rose-500/40 bg-rose-950/30 p-6 text-xs text-rose-200 space-y-2">
                   <div className="font-semibold text-sm text-rose-300">
@@ -5505,89 +5555,119 @@ export default function App() {
                   {detailError}
                 </div>
               ) : symbolDetail ? (
-                <div className="apple-bento-card p-6 space-y-5">
-                  {/* Symbol Header & Two-Layer Separation Banner */}
-                  <div className="space-y-3.5 border-b border-slate-800/70 pb-4">
-                    <div className="flex flex-wrap items-start justify-between gap-4">
-                      <div>
-                        <div className="flex items-center gap-3">
-                          <h3 className="text-2xl font-bold tracking-tight font-mono text-slate-100">
+                <div className="@container apple-bento-card p-4 sm:p-5 space-y-4 min-w-0 overflow-hidden">
+                  {/* Compact Workstation Header */}
+                  <div className="space-y-2.5 border-b border-slate-800/70 pb-3.5">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex-1 min-w-[240px] space-y-1">
+                        <div className="flex flex-wrap items-baseline gap-2.5">
+                          <h3 className="text-xl sm:text-2xl font-bold tracking-tight font-mono text-slate-100">
                             {symbolDetail.symbol}
                           </h3>
-                          <span className="text-xs text-slate-400">·</span>
+                          <span className="font-mono text-base font-bold text-slate-100 tabular-nums">
+                            ${formatPriceDynamic(symbolDetail.candidate.lastPrice)}
+                          </span>
                           <span
-                            className={`text-sm font-semibold ${getMarketRadarTextColor(
-                              symbolDetail.candidate.marketRadarCategory
-                            )}`}
+                            className={`font-mono text-xs font-semibold tabular-nums ${
+                              symbolDetail.candidate.priceChangePercent24h >= 0
+                                ? 'text-emerald-400'
+                                : 'text-rose-400'
+                            }`}
                           >
-                            {symbolDetail.candidate.marketRadarCategory} (Score:{' '}
-                            {symbolDetail.candidate.score}
-                            {symbolDetail.candidate.scoreCapApplied
-                              ? ` / 原始 ${symbolDetail.candidate.rawScoreBeforeCap}`
-                              : ''}
-                            )
+                            {symbolDetail.candidate.priceChangePercent24h >= 0 ? '+' : ''}
+                            {symbolDetail.candidate.priceChangePercent24h.toFixed(2)}%
                           </span>
                         </div>
-                        <div className="mt-1.5">
-                          <ProvenanceLine
-                            provenance={symbolDetail.provenance}
-                            prefixLabel="單幣種詳情來源"
-                            smcEvaluationStatus={
-                              symbolDetail.smcAnalysis.smcEvaluationStatus
-                            }
-                          />
+                        <div
+                          className={`text-xs font-semibold ${getMarketRadarTextColor(
+                            symbolDetail.candidate.marketRadarCategory
+                          )}`}
+                        >
+                          {symbolDetail.candidate.marketRadarCategory} (Score:{' '}
+                          {symbolDetail.candidate.score}
+                          {symbolDetail.candidate.scoreCapApplied
+                            ? ` / 原始 ${symbolDetail.candidate.rawScoreBeforeCap}`
+                            : ''}
+                          )
                         </div>
                       </div>
 
-                      {/* SMC/ICT Output State Box */}
-                      <div className="rounded-xl border border-slate-800/80 bg-slate-950/90 px-4 py-3 text-right">
-                        <div className="text-[11px] text-slate-400">
-                          第二層：SMC 評估狀態 ({symbolDetail.smcAnalysis.smcEvaluationStatus})
-                        </div>
-                        <div
-                          className={`mt-0.5 text-base font-bold font-mono tracking-wide ${getSmcStateColor(
-                            symbolDetail.smcAnalysis.actionState
-                          )}`}
-                        >
-                          {symbolDetail.smcAnalysis.actionState === 'PENDING'
-                            ? 'SMC 尚未評估／點擊載入單幣種結構'
-                            : symbolDetail.smcAnalysis.actionState}
-                        </div>
-                        <div className="mt-1.5 flex items-center justify-end gap-2 text-[10px] font-mono text-slate-400">
-                          <span>
-                            SMC evaluatedAt:{' '}
-                            {symbolDetail.smcAnalysis.evaluatedAt
-                              ? new Date(
-                                  symbolDetail.smcAnalysis.evaluatedAt
-                                ).toLocaleTimeString('zh-TW', { hour12: false })
-                              : new Date(
-                                  symbolDetail.provenance.fetchedAt
-                                ).toLocaleTimeString('zh-TW', { hour12: false })}
-                          </span>
-                          <button
-                            type="button"
-                            disabled={smcQueueLoading}
-                            onClick={() =>
-                              refreshSingleSmcSymbol(symbolDetail.symbol)
-                            }
-                            className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-amber-300 hover:bg-amber-500/20 cursor-pointer disabled:opacity-50"
+                      {/* SMC/ICT Output State Box + Full-Width Toggle */}
+                      <div className="flex flex-wrap items-start gap-2 shrink-0">
+                        <div className="rounded-xl border border-slate-800/80 bg-slate-950/90 px-3 py-1.5 text-right">
+                          <div className="text-[10px] text-slate-400">
+                            第二層：SMC 評估狀態 ({symbolDetail.smcAnalysis.smcEvaluationStatus})
+                          </div>
+                          <div
+                            className={`text-sm font-bold font-mono tracking-wide ${getSmcStateColor(
+                              symbolDetail.smcAnalysis.actionState
+                            )}`}
                           >
-                            重新評估單幣種 SMC
-                          </button>
+                            {symbolDetail.smcAnalysis.actionState === 'PENDING'
+                              ? 'SMC 尚未評估'
+                              : symbolDetail.smcAnalysis.actionState}
+                          </div>
+                          <div className="mt-0.5 flex items-center justify-end gap-2 text-[10px] font-mono text-slate-400">
+                            <span>
+                              {symbolDetail.smcAnalysis.evaluatedAt
+                                ? new Date(
+                                    symbolDetail.smcAnalysis.evaluatedAt
+                                  ).toLocaleTimeString('zh-TW', { hour12: false })
+                                : new Date(
+                                    symbolDetail.provenance.fetchedAt
+                                  ).toLocaleTimeString('zh-TW', { hour12: false })}
+                            </span>
+                            <button
+                              type="button"
+                              disabled={smcQueueLoading}
+                              onClick={() =>
+                                refreshSingleSmcSymbol(symbolDetail.symbol)
+                              }
+                              className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-amber-300 hover:bg-amber-500/20 cursor-pointer disabled:opacity-50"
+                            >
+                              重新評估單幣種 SMC
+                            </button>
+                          </div>
                         </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setDetailExpanded((v) => !v)}
+                          className="inline-flex items-center gap-1.5 rounded-xl border border-slate-700/80 bg-slate-900/80 px-3 py-2 text-xs font-medium text-slate-200 hover:border-amber-400/60 hover:text-amber-200 cursor-pointer whitespace-nowrap"
+                          title={
+                            detailExpanded
+                              ? '恢復左右雙欄視圖'
+                              : '展開全寬看盤工作站'
+                          }
+                        >
+                          {detailExpanded ? (
+                            <>
+                              <Minimize2 className="h-3.5 w-3.5" />
+                              <span>恢復雙欄</span>
+                            </>
+                          ) : (
+                            <>
+                              <Maximize2 className="h-3.5 w-3.5" />
+                              <span>展開全寬看盤</span>
+                            </>
+                          )}
+                        </button>
                       </div>
                     </div>
 
-                    {/* Explicit Two-Layer Result Box (第一層：市場雷達分類 + 第二層：SMC 評估狀態 + 最終交易訊號 + 原因) */}
-                    <div className="rounded-xl border border-slate-800/80 bg-slate-950/90 p-4 text-xs space-y-1.5">
-                      <div className="font-semibold text-slate-200">
-                        雙層結構判定結果（明確區分「第一層：市場雷達分類」、「第二層：SMC 評估狀態」與「最終交易訊號」）：
-                      </div>
-                      <div className="grid grid-cols-1 gap-1 sm:grid-cols-3 font-mono">
-                        <div>
-                          <span className="text-slate-400">
-                            第一層：市場雷達分類：
-                          </span>
+                    <ProvenanceLine
+                      provenance={symbolDetail.provenance}
+                      prefixLabel="單幣種詳情來源"
+                      smcEvaluationStatus={
+                        symbolDetail.smcAnalysis.smcEvaluationStatus
+                      }
+                    />
+
+                    {/* Slim Two-Layer Result Summary */}
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950/85 px-3.5 py-2.5 text-xs space-y-1">
+                      <div className="grid grid-cols-1 gap-1.5 @xl:grid-cols-3 font-mono text-[11px]">
+                        <div className="min-w-0 truncate">
+                          <span className="text-slate-400">第一層：市場雷達分類：</span>
                           <strong
                             className={getMarketRadarTextColor(
                               symbolDetail.candidate.marketRadarCategory
@@ -5596,10 +5676,8 @@ export default function App() {
                             {symbolDetail.candidate.marketRadarCategory}
                           </strong>
                         </div>
-                        <div>
-                          <span className="text-slate-400">
-                            第二層：SMC 評估狀態：
-                          </span>
+                        <div className="min-w-0 truncate">
+                          <span className="text-slate-400">第二層：SMC 評估狀態：</span>
                           <strong
                             className={getSmcStateColor(
                               symbolDetail.smcAnalysis.actionState
@@ -5610,7 +5688,7 @@ export default function App() {
                               : `${symbolDetail.smcAnalysis.actionState} (${symbolDetail.smcAnalysis.smcEvaluationStatus})`}
                           </strong>
                         </div>
-                        <div>
+                        <div className="min-w-0 truncate">
                           <span className="text-slate-400">最終交易訊號：</span>
                           <strong
                             className={
@@ -5627,23 +5705,15 @@ export default function App() {
                           </strong>
                         </div>
                       </div>
-                      <div className="text-[11px] font-mono text-slate-400">
+                      <div className="text-[11px] font-mono text-slate-400 truncate">
                         SMC evaluatedAt:{' '}
-                        <span className="text-slate-200">
+                        <span className="text-slate-300">
                           {symbolDetail.smcAnalysis.evaluatedAt ??
                             symbolDetail.candidate.smcEvaluatedAt ??
                             symbolDetail.provenance.fetchedAt}
-                        </span>{' '}
-                        · 資料來源與 fetchedAt:{' '}
-                        <span className="text-slate-200">
-                          {symbolDetail.provenance.source} (
-                          {symbolDetail.smcAnalysis.dataFetchedAt ??
-                            symbolDetail.candidate.smcDataFetchedAt ??
-                            symbolDetail.provenance.fetchedAt}
-                          )
                         </span>
                       </div>
-                      <div className="text-slate-300">
+                      <div className="text-[11px] text-slate-300 break-words">
                         <span className="text-slate-400 font-mono">原因：</span>
                         {symbolDetail.smcAnalysis.actionState === 'PENDING'
                           ? 'SMC 尚未評估／點擊載入單幣種結構（尚未載入完整 5m/15m/1h/4h K 線）'
@@ -5660,85 +5730,89 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Template B: Plain-Language 5-Step SMC Gate Checklist & Action Advice */}
+                    {/* Clear Trade Horizon Verdict (Short-Term vs Swing Holding Guide) */}
                     {(() => {
-                      const plainGuide = buildPlainLanguageSmcSteps(
-                        symbolDetail,
-                        decisionTraceData ?? symbolDetail.candidate.decisionTrace
-                      );
+                      const th =
+                        symbolDetail.tradeHorizon ??
+                        symbolDetail.smcAnalysis.tradeHorizon ??
+                        symbolDetail.candidate.tradeHorizon;
+                      if (!th) return null;
+                      const isPending = th.category === 'PENDING_OR_NEUTRAL';
+                      const containerTone =
+                        th.category === 'SWING_EXTENDED'
+                          ? 'border-violet-500/35 bg-slate-950/90'
+                          : th.category === 'INTRADAY_TREND'
+                            ? 'border-sky-500/35 bg-slate-950/90'
+                            : th.category === 'SCALP_FAST'
+                              ? 'border-amber-500/35 bg-slate-950/90'
+                              : 'border-slate-800/80 bg-slate-950/80';
                       return (
-                        <div className="rounded-xl border border-slate-800/80 bg-slate-950/90 p-4 space-y-3">
-                          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/70 pb-2.5">
-                            <div className="flex items-center gap-2.5">
-                              <span className="text-xs font-bold tracking-tight text-amber-300">
-                                白話文 5 步闖關進度
+                        <div
+                          id="trade-horizon-panel"
+                          className={`rounded-xl border px-3.5 py-2.5 text-xs space-y-2 ${containerTone}`}
+                        >
+                          <div className="flex flex-wrap items-baseline justify-between gap-2">
+                            <div className="flex flex-wrap items-baseline gap-2 min-w-0">
+                              <span className="font-semibold text-slate-200">
+                                長短線交易結論
                               </span>
-                              <span className="text-slate-600">·</span>
-                              <span className="text-xs font-semibold text-slate-100">
-                                已通過 {plainGuide.passedCount} / 5 關
+                              <span className="text-slate-600" aria-hidden="true">
+                                ·
                               </span>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                              {plainGuide.steps.map((st, i) => (
-                                <span
-                                  key={i}
-                                  className={`h-2 w-7 rounded-full transition-colors ${
-                                    st.passed ? 'bg-emerald-500' : 'bg-slate-800'
-                                  }`}
-                                  title={`第 ${st.stepNumber} 關: ${st.title}`}
-                                />
-                              ))}
-                            </div>
-                          </div>
-
-                          <div
-                            className={`rounded-xl border p-3.5 text-xs space-y-1 ${
-                              plainGuide.recommendationTone === 'emerald'
-                                ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-200'
-                                : plainGuide.recommendationTone === 'rose'
-                                  ? 'border-rose-500/40 bg-rose-950/20 text-rose-200'
-                                  : plainGuide.recommendationTone === 'sky'
-                                    ? 'border-sky-500/40 bg-sky-950/20 text-sky-200'
-                                    : 'border-amber-500/35 bg-amber-950/15 text-amber-200'
-                            }`}
-                          >
-                            <div className="font-bold text-sm tracking-tight">
-                              {plainGuide.recommendationTitle}
-                            </div>
-                            <p className="text-xs text-slate-300 leading-relaxed">
-                              {plainGuide.recommendationBody}
-                            </p>
-                          </div>
-
-                          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-5 text-xs">
-                            {plainGuide.steps.map((st, idx) => (
-                              <div
-                                key={idx}
-                                className={`rounded-xl border p-3 space-y-1.5 ${
-                                  st.passed
-                                    ? 'border-emerald-500/35 bg-emerald-950/15'
-                                    : 'border-slate-800/80 bg-slate-900/50'
-                                }`}
+                              <span
+                                className={`text-sm font-bold ${getTradeHorizonToneClass(
+                                  th.category
+                                )}`}
                               >
-                                <div className="flex items-center justify-between font-mono text-[10px]">
-                                  <span className="text-slate-400">
-                                    第 {st.stepNumber} 關
+                                {th.verdictShortZh}
+                              </span>
+                              <span className="text-slate-600" aria-hidden="true">
+                                ·
+                              </span>
+                              <span className="font-mono text-[11px] tabular-nums text-slate-200">
+                                建議持倉：{th.holdingWindowZh}
+                              </span>
+                            </div>
+                            <span className="text-[11px] font-mono text-slate-400">
+                              {isPending
+                                ? '先等待方向表態'
+                                : th.category === 'SWING_EXTENDED'
+                                  ? '具備高週期共振與抱單空間'
+                                  : th.category === 'INTRADAY_TREND'
+                                    ? '當日內順勢結案為主'
+                                    : '短線動能訊號，勿扛長單'}
+                            </span>
+                          </div>
+
+                          <div className="text-[11px] text-slate-300 leading-relaxed break-words">
+                            <span>{th.summaryZh}</span>{' '}
+                            <span className="text-slate-100 font-medium">
+                              操作準則：{th.executionPlaybookZh}
+                            </span>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2 pt-1.5 border-t border-slate-800/70 @3xl:grid-cols-4 font-mono tabular-nums text-[11px]">
+                            {th.criteria.map((cr) => (
+                              <div key={cr.key} className="min-w-0 space-y-0.5">
+                                <div className="flex items-center justify-between gap-1 text-[10px]">
+                                  <span className="font-sans text-slate-400 truncate">
+                                    {cr.labelZh}
                                   </span>
                                   <span
-                                    className={`rounded-md font-bold px-1.5 py-0.5 ${
-                                      st.passed
-                                        ? 'bg-emerald-500/20 text-emerald-300'
-                                        : 'bg-slate-800 text-slate-400'
-                                    }`}
+                                    className={
+                                      cr.passedForSwing
+                                        ? 'text-emerald-400 font-semibold shrink-0'
+                                        : 'text-amber-300 shrink-0'
+                                    }
                                   >
-                                    {st.statusLabel}
+                                    {cr.passedForSwing ? '利長抱 ✓' : '偏短線'}
                                   </span>
                                 </div>
-                                <div className="font-semibold text-slate-100">
-                                  {st.title}
+                                <div className="text-slate-100 font-semibold truncate">
+                                  {cr.valueText}
                                 </div>
-                                <div className="text-[11px] text-slate-300 leading-snug">
-                                  {st.plainDesc}
+                                <div className="font-sans text-[10px] text-slate-400 leading-snug break-words">
+                                  {cr.impactZh}
                                 </div>
                               </div>
                             ))}
@@ -5746,556 +5820,1251 @@ export default function App() {
                         </div>
                       );
                     })()}
-                  </div>
 
-                  {/* Key Metrics Row: Price + Bid/Ask Spread, OI, Funding, Historical RVOL/Z */}
-                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 font-mono tabular-nums text-xs">
-                    <div className="border border-slate-800/90 bg-slate-950/70 p-3">
-                      <div className="font-sans text-slate-400">
-                        最新價格 / 盤口 Spread
+                    {/* Key Metrics Row: 2 cols split -> 4 cols wide, strictly overflow-protected */}
+                    <div className="grid grid-cols-2 gap-2.5 @3xl:grid-cols-4 font-mono tabular-nums text-xs">
+                      <div className="min-w-0 overflow-hidden rounded-xl border border-slate-800/90 bg-slate-950/70 p-2.5">
+                        <div className="font-sans text-[10px] text-slate-400 truncate">
+                          最新價格 / 盤口 Spread
+                        </div>
+                        <div className="mt-0.5 text-sm font-semibold text-slate-100 truncate">
+                          ${formatPriceDynamic(symbolDetail.candidate.lastPrice)}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                          {symbolDetail.candidate.spreadPercent !== null
+                            ? `Spread ${symbolDetail.candidate.spreadPercent.toFixed(4)}%`
+                            : 'Spread 不可用'}
+                        </div>
                       </div>
-                      <div className="mt-1 text-sm font-semibold text-slate-100">
-                        ${formatPriceDynamic(symbolDetail.candidate.lastPrice)}
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-slate-400">
-                        {symbolDetail.candidate.spreadPercent !== null
-                          ? `Bid ${symbolDetail.candidate.bidPrice} / Ask ${symbolDetail.candidate.askPrice} (${symbolDetail.candidate.spreadPercent.toFixed(4)}%)`
-                          : 'Spread 資料不可用'}
-                      </div>
-                    </div>
-                    <div className="border border-slate-800/90 bg-slate-950/70 p-3">
-                      <div className="font-sans text-slate-400">
-                        Open Interest (OI) / Funding
-                      </div>
-                      <div className="mt-1 text-sm font-semibold text-slate-100">
-                        {symbolDetail.openInterest.openInterestValue !== null
-                          ? `$${formatUsdCompact(
-                              symbolDetail.openInterest.openInterestValue
-                            )}`
-                          : symbolDetail.openInterest.openInterest !== null
-                            ? `${symbolDetail.openInterest.openInterest}`
-                            : '缺失 (觸發 WAIT)'}
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-slate-400">
-                        Funding:{' '}
-                        <span
-                          className={
-                            symbolDetail.candidate.extremeFunding
-                              ? 'text-amber-300 font-semibold'
-                              : 'text-slate-200'
-                          }
-                        >
-                          {symbolDetail.candidate.fundingRate !== null
-                            ? `${(symbolDetail.candidate.fundingRate * 100).toFixed(4)}%`
-                            : '缺失'}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="border border-slate-800/90 bg-slate-950/70 p-3">
-                      <div className="font-sans text-slate-400">
-                        歷史量能 RVOL / Z ({symbolDetail.candidate.historicalVolume.volumeTimeframe ?? '15m'})
-                      </div>
-                      <div className="mt-1 text-sm font-semibold text-amber-300">
-                        {symbolDetail.candidate.historicalVolume.status ===
-                        'READY'
-                          ? `${symbolDetail.candidate.historicalVolume.rvol}x (Z=${symbolDetail.candidate.historicalVolume.zScore})`
-                          : `${symbolDetail.candidate.historicalVolume.status} (Z=${symbolDetail.candidate.historicalVolume.rawRobustZScore ?? 'N/A'})`}
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-slate-400">
-                        {symbolDetail.candidate.historicalVolume.rollingMedian !==
-                        null
-                          ? `Med $${formatUsdCompact(
-                              symbolDetail.candidate.historicalVolume
-                                .rollingMedian ?? 0
-                            )} / MAD $${formatUsdCompact(
-                              symbolDetail.candidate.historicalVolume.mad ?? 0
-                            )}`
-                          : `N=${symbolDetail.candidate.historicalVolume.sampleCount}/${symbolDetail.candidate.historicalVolume.minRequiredSamples} · ${symbolDetail.candidate.historicalVolume.aggregationWindow ?? '15m_CONFIRMED_KLINE_30_BARS'}`}
-                      </div>
-                    </div>
-                    <div className="border border-slate-800/90 bg-slate-950/70 p-3">
-                      <div className="font-sans text-slate-400">
-                        已確認 ATR(14) ({symbolDetail.primaryTimeframe})
-                      </div>
-                      <div className="mt-1 text-sm font-semibold text-slate-100">
-                        {symbolDetail.smcAnalysis.atr14 !== null
-                          ? `${symbolDetail.smcAnalysis.atr14} (${symbolDetail.smcAnalysis.atrPercent}%)`
-                          : 'K 線不足'}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Decision Trace & 6-Gate Inspector Panel */}
-                  {(() => {
-                    const trace =
-                      decisionTraceData ?? symbolDetail.candidate.decisionTrace;
-                    if (!trace) return null;
-                    const histGate = trace.gates.history;
-                    const madRatioPct =
-                      histGate.madToMedianRatio !== null &&
-                      histGate.madToMedianRatio !== undefined
-                        ? `${(histGate.madToMedianRatio * 100).toFixed(2)}%`
-                        : 'N/A';
-                    return (
-                      <div className="border border-slate-700 bg-slate-950 p-3.5 space-y-2.5 text-xs">
-                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
-                          <span className="font-semibold text-amber-300 font-mono">
-                            Decision Trace 降級與安全閘門追蹤 (/api/symbol/
-                            {symbolDetail.symbol}/decision-trace)
-                          </span>
-                          <span className="font-mono text-[11px] text-slate-300">
-                            marketRadar: <strong>{trace.marketRadarCategory}</strong> · SMCEval:{' '}
-                            <strong>{trace.smcEvaluationStatus}</strong> · SMC:{' '}
-                            <strong>{trace.smcActionState}</strong> → finalTradeSignal:{' '}
-                            <strong>{trace.finalTradeSignal}</strong> (finalCategory:{' '}
-                            <strong>{trace.finalCategory}</strong>)
+                      <div className="min-w-0 overflow-hidden rounded-xl border border-slate-800/90 bg-slate-950/70 p-2.5">
+                        <div className="font-sans text-[10px] text-slate-400 truncate">
+                          Open Interest (OI) / Funding
+                        </div>
+                        <div className="mt-0.5 text-sm font-semibold text-slate-100 truncate">
+                          {symbolDetail.openInterest.openInterestValue !== null
+                            ? `$${formatUsdCompact(
+                                symbolDetail.openInterest.openInterestValue
+                              )}`
+                            : symbolDetail.openInterest.openInterest !== null
+                              ? `${symbolDetail.openInterest.openInterest}`
+                              : '缺失 (觸發 WAIT)'}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                          Funding:{' '}
+                          <span
+                            className={
+                              symbolDetail.candidate.extremeFunding
+                                ? 'text-amber-300 font-semibold'
+                                : 'text-slate-200'
+                            }
+                          >
+                            {symbolDetail.candidate.fundingRate !== null
+                              ? `${(symbolDetail.candidate.fundingRate * 100).toFixed(4)}%`
+                              : '缺失'}
                           </span>
                         </div>
-
-                        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 font-mono text-[11px]">
-                          <div className="border border-slate-800 bg-slate-900/60 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400">
-                                1. history gate
-                              </span>
-                              <span
-                                className={
-                                  histGate.passed
-                                    ? 'text-emerald-400 font-bold'
-                                    : 'text-amber-400 font-bold'
-                                }
-                              >
-                                {histGate.passed ? 'PASS' : 'FAIL'}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-slate-200">
-                              {histGate.sampleCount}/
-                              {histGate.minRequiredSamples} · {histGate.status}
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              TF: {histGate.volumeTimeframe ?? '15m'} · MAD/Med: {madRatioPct}
-                              {histGate.rawRobustZScore !== null &&
-                              histGate.rawRobustZScore !== undefined
-                                ? ` · rawZ=${histGate.rawRobustZScore}`
-                                : ''}
-                            </div>
-                          </div>
-
-                          <div className="border border-slate-800 bg-slate-900/60 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400">
-                                2. liquidity gate
-                              </span>
-                              <span
-                                className={
-                                  trace.gates.liquidity.passed
-                                    ? 'text-emerald-400 font-bold'
-                                    : 'text-rose-400 font-bold'
-                                }
-                              >
-                                {trace.gates.liquidity.passed ? 'PASS' : 'FAIL'}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-slate-200">
-                              Vol $
-                              {formatUsdCompact(
-                                trace.gates.liquidity.quoteVolume24h
-                              )}
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              Spread:{' '}
-                              {trace.gates.liquidity.spreadPercent !== null
-                                ? `${trace.gates.liquidity.spreadPercent.toFixed(4)}%`
-                                : 'null'}
-                            </div>
-                          </div>
-
-                          <div className="border border-slate-800 bg-slate-900/60 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400">
-                                3. momentum gate
-                              </span>
-                              <span
-                                className={
-                                  trace.gates.momentum.passed
-                                    ? 'text-emerald-400 font-bold'
-                                    : 'text-amber-400 font-bold'
-                                }
-                              >
-                                {trace.gates.momentum.passed ? 'PASS' : 'FAIL'}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-slate-200">
-                              24h:{' '}
-                              {trace.gates.momentum.change24h >= 0 ? '+' : ''}
-                              {trace.gates.momentum.change24h.toFixed(2)}%
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              門檻: |change24h| ≥ 3.0%
-                            </div>
-                          </div>
-
-                          <div className="border border-slate-800 bg-slate-900/60 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400">
-                                4. relativeBtc gate
-                              </span>
-                              <span
-                                className={
-                                  trace.gates.relativeBtc.passed
-                                    ? 'text-emerald-400 font-bold'
-                                    : 'text-amber-400 font-bold'
-                                }
-                              >
-                                {trace.gates.relativeBtc.passed
-                                  ? 'PASS'
-                                  : 'FAIL'}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-slate-200">
-                              vs BTC:{' '}
-                              {trace.gates.relativeBtc.value >= 0 ? '+' : ''}
-                              {trace.gates.relativeBtc.value.toFixed(2)}%
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              門檻: 同向 ≥ 1.2%
-                            </div>
-                          </div>
-
-                          <div className="border border-slate-800 bg-slate-900/60 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400">
-                                5. funding gate
-                              </span>
-                              <span
-                                className={
-                                  trace.gates.funding.passed
-                                    ? 'text-emerald-400 font-bold'
-                                    : 'text-rose-400 font-bold'
-                                }
-                              >
-                                {trace.gates.funding.passed ? 'PASS' : 'FAIL'}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-slate-200">
-                              {trace.gates.funding.value !== null
-                                ? `${(trace.gates.funding.value * 100).toFixed(4)}%`
-                                : 'null'}
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              門檻: |Funding| &lt; 0.05%
-                            </div>
-                          </div>
-
-                          <div className="border border-slate-800 bg-slate-900/60 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400">6. smc gate</span>
-                              <span
-                                className={
-                                  trace.gates.smc.passed
-                                    ? 'text-emerald-400 font-bold'
-                                    : 'text-amber-400 font-bold'
-                                }
-                              >
-                                {trace.gates.smc.passed ? 'PASS' : 'FAIL'}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-slate-200">
-                              {trace.gates.smc.actionState} ({trace.gates.smc.evaluationStatus})
-                            </div>
-                            <div className="text-[10px] text-slate-400 truncate">
-                              第二層結構確認
-                            </div>
-                          </div>
+                      </div>
+                      <div className="min-w-0 overflow-hidden rounded-xl border border-slate-800/90 bg-slate-950/70 p-2.5">
+                        <div className="font-sans text-[10px] text-slate-400 truncate">
+                          歷史量能 RVOL / Z ({symbolDetail.candidate.historicalVolume.volumeTimeframe ?? '15m'})
                         </div>
+                        <div className="mt-0.5 text-sm font-semibold text-amber-300 truncate">
+                          {symbolDetail.candidate.historicalVolume.status ===
+                          'READY'
+                            ? `${symbolDetail.candidate.historicalVolume.rvol}x (Z=${symbolDetail.candidate.historicalVolume.zScore})`
+                            : `${symbolDetail.candidate.historicalVolume.status} (Z=${symbolDetail.candidate.historicalVolume.rawRobustZScore ?? 'N/A'})`}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                          {symbolDetail.candidate.historicalVolume.rollingMedian !==
+                          null
+                            ? `Med $${formatUsdCompact(
+                                symbolDetail.candidate.historicalVolume
+                                  .rollingMedian ?? 0
+                              )} / MAD $${formatUsdCompact(
+                                symbolDetail.candidate.historicalVolume.mad ?? 0
+                              )}`
+                            : `N=${symbolDetail.candidate.historicalVolume.sampleCount}/${symbolDetail.candidate.historicalVolume.minRequiredSamples}`}
+                        </div>
+                      </div>
+                      <div className="min-w-0 overflow-hidden rounded-xl border border-slate-800/90 bg-slate-950/70 p-2.5">
+                        <div className="font-sans text-[10px] text-slate-400 truncate">
+                          已確認 ATR(14) ({symbolDetail.primaryTimeframe})
+                        </div>
+                        <div className="mt-0.5 text-sm font-semibold text-slate-100 truncate">
+                          {symbolDetail.smcAnalysis.atr14 !== null
+                            ? `${symbolDetail.smcAnalysis.atr14} (${symbolDetail.smcAnalysis.atrPercent}%)`
+                            : 'K 線不足'}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                          24h 額 ${formatUsdCompact(symbolDetail.candidate.quoteVolume24h)}
+                        </div>
+                      </div>
+                    </div>
 
-                        {trace.downgradeReasons.length > 0 && (
-                          <div className="border-t border-slate-800 pt-2 space-y-1">
-                            <div className="font-semibold text-slate-300">
-                              downgradeReasons (降級與分數封頂規則明細):
-                            </div>
-                            <ul className="list-disc pl-5 space-y-1 text-[11px] text-slate-300 font-mono">
-                              {trace.downgradeReasons.map((reason, idx) => (
-                                <li key={idx}>{reason}</li>
+                    {/* Compact 5-Step Progress Strip & Primary Actions Bar */}
+                    {(() => {
+                      const plainGuide = buildPlainLanguageSmcSteps(
+                        symbolDetail,
+                        decisionTraceData ?? symbolDetail.candidate.decisionTrace
+                      );
+                      return (
+                        <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-slate-800/80 bg-slate-950/85 px-3.5 py-2.5 text-xs">
+                          <div className="flex flex-wrap items-center gap-2 min-w-0">
+                            <span className="font-bold text-amber-300 shrink-0">
+                              5 步闖關 {plainGuide.passedCount}/5
+                            </span>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {plainGuide.steps.map((st, i) => (
+                                <span
+                                  key={i}
+                                  className={`h-2 w-4 rounded-full ${
+                                    st.passed ? 'bg-emerald-500' : 'bg-slate-800'
+                                  }`}
+                                  title={`第 ${st.stepNumber} 關: ${st.title} (${st.statusLabel})`}
+                                />
                               ))}
-                            </ul>
+                            </div>
+                            <span className="text-[11px] text-slate-300 truncate">
+                              {plainGuide.recommendationTitle}
+                            </span>
                           </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={requestGeminiExplanation}
+                              disabled={geminiLoading}
+                              className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-2.5 py-1 text-[11px] font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                            >
+                              <Sparkles className="h-3 w-3" />
+                              <span>
+                                {geminiLoading
+                                  ? '生成中...'
+                                  : '產生 Gemini 證據解釋'}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={recordPaperObservation}
+                              className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium cursor-pointer whitespace-nowrap ${
+                                symbolDetail.entryZoneAnalysis?.status ===
+                                'OVEREXTENDED'
+                                  ? 'border-amber-500/50 bg-amber-950/30 text-amber-200 hover:bg-amber-950/50'
+                                  : 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300 hover:bg-emerald-950/50'
+                              }`}
+                            >
+                              {symbolDetail.entryZoneAnalysis?.status ===
+                              'OVEREXTENDED'
+                                ? '現價追高攔截 (建議回踩掛單)'
+                                : '登記紙上觀察帳本'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void quickGuardSymbolDetail()}
+                              disabled={positionSentinelLoading}
+                              className="rounded-lg border border-sky-500/40 bg-sky-950/30 px-2.5 py-1 text-[11px] font-medium text-sky-200 hover:bg-sky-950/50 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                            >
+                              加入持倉哨兵守護
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                executeBacktest(
+                                  symbolDetail.symbol,
+                                  symbolDetail.primaryTimeframe
+                                );
+                                setActiveSection('backtest');
+                              }}
+                              className="rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1 text-[11px] text-slate-200 hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+                            >
+                              執行回測並存檔
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    {symbolDetail.btcMarketRegime &&
+                      symbolDetail.symbol !== 'BTCUSDT' &&
+                      (symbolDetail.btcMarketRegime.blocksLongAlts ||
+                        symbolDetail.btcMarketRegime.blocksShortAlts) && (
+                        <div className="rounded-xl border border-amber-500/40 bg-amber-950/25 px-3 py-2 text-xs text-amber-200">
+                          大盤順逆勢濾網提示：{symbolDetail.btcMarketRegime.warningZh}
+                        </div>
+                      )}
+
+                    {overextendedChaseWarning &&
+                      overextendedChaseWarning.symbol === symbolDetail.symbol && (
+                        <div
+                          id="overextended-anti-chase-guard"
+                          className="rounded-xl border border-amber-500/60 bg-amber-950/35 p-3 text-xs space-y-2"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-bold text-amber-200">
+                              反追價保護：{symbolDetail.symbol}{' '}
+                              {overextendedChaseWarning.errorMessage ||
+                                '目前價格已過度偏離 FVG/OB 結構錨點 (OVEREXTENDED)，直接市價追單勝率較低。'}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setOverextendedChaseWarning(null)}
+                              className="text-[11px] text-slate-400 hover:text-slate-200 cursor-pointer"
+                            >
+                              取消
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            {(() => {
+                              const ez = symbolDetail.entryZoneAnalysis;
+                              if (
+                                !ez ||
+                                ez.idealPullbackEntry === null ||
+                                ez.stopLossPrice === null ||
+                                ez.targetPrice === null ||
+                                (ez.direction !== 'LONG' &&
+                                  ez.direction !== 'SHORT')
+                              ) {
+                                return null;
+                              }
+                              const pullbackDir = ez.direction;
+                              const pullbackEntry = ez.idealPullbackEntry;
+                              const pullbackStop = ez.stopLossPrice;
+                              const pullbackTarget = ez.targetPrice;
+                              const pullbackLabel = ez.anchorLabel;
+                              return (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setOverextendedChaseWarning(null);
+                                    void recordPullbackLimitPaper({
+                                      side: pullbackDir,
+                                      entryPrice: pullbackEntry,
+                                      invalidationPrice: pullbackStop,
+                                      targetPrice: pullbackTarget,
+                                      anchorLabel: pullbackLabel,
+                                      ttlMinutes: pullbackTtlMinutes,
+                                    });
+                                  }}
+                                  className="rounded-lg border border-emerald-400/60 bg-emerald-500/20 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/30 cursor-pointer"
+                                >
+                                  改掛 FVG/OB 回踩限價單 (${pullbackEntry})
+                                </button>
+                              );
+                            })()}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const mode =
+                                  overextendedChaseWarning.conflictMode;
+                                setOverextendedChaseWarning(null);
+                                void submitPaperObservation(mode, true);
+                              }}
+                              className="rounded-lg border border-rose-500/50 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25 cursor-pointer"
+                            >
+                              仍承受追高風險以現價登記
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                    {/* Pre-Trade Duplicate & High-BTC Concentration Guard Banner */}
+                    {pendingPaperConflict &&
+                      pendingPaperConflict.symbol === symbolDetail.symbol && (
+                        <div
+                          id="paper-conflict-guard"
+                          className="rounded-xl border border-amber-500/60 bg-amber-950/35 p-3 text-xs space-y-2"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-bold text-amber-200 flex items-center gap-1.5">
+                              <ShieldAlert className="h-4 w-4 text-amber-400 shrink-0" />
+                              防呆攔截：{pendingPaperConflict.symbol} 同方向 (
+                              {pendingPaperConflict.side}) 已有進行中紙上單（
+                              {pendingPaperConflict.conflictingEntries
+                                .map(
+                                  (c) =>
+                                    `#${c.id} ${
+                                      c.fillStatus === 'WAITING_LIMIT'
+                                        ? '待觸價'
+                                        : '已成交'
+                                    } $${c.entryPrice}`
+                                )
+                                .join('、')}
+                              ）
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setPendingPaperConflict(null)}
+                              className="text-[11px] text-slate-400 hover:text-slate-200 cursor-pointer"
+                            >
+                              取消
+                            </button>
+                          </div>
+                          {pendingPaperConflict.highBtcSameSideCount >= 2 && (
+                            <div className="text-[11px] text-rose-200">
+                              組合風險提醒：帳本目前已有{' '}
+                              {pendingPaperConflict.highBtcSameSideCount}{' '}
+                              筆同向高 BTC 連動持倉 (r ≥ 0.70)，請留意整體大盤單邊曝險。
+                            </div>
+                          )}
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (pendingPaperConflict.kind === 'OBSERVATION') {
+                                  void submitPaperObservation('REPLACE');
+                                } else if (
+                                  pendingPaperConflict.kind === 'EARLY_IGNITION'
+                                ) {
+                                  void submitEarlyIgnitionPaper('REPLACE');
+                                } else if (pendingPaperConflict.pullbackParams) {
+                                  void submitPullbackLimitPaper(
+                                    pendingPaperConflict.pullbackParams,
+                                    'REPLACE'
+                                  );
+                                }
+                              }}
+                              className="rounded-lg border border-amber-400/60 bg-amber-500/20 px-2.5 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/30 cursor-pointer"
+                            >
+                              覆蓋舊單並開新單
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (pendingPaperConflict.kind === 'OBSERVATION') {
+                                  void submitPaperObservation('FORCE');
+                                } else if (
+                                  pendingPaperConflict.kind === 'EARLY_IGNITION'
+                                ) {
+                                  void submitEarlyIgnitionPaper('FORCE');
+                                } else if (pendingPaperConflict.pullbackParams) {
+                                  void submitPullbackLimitPaper(
+                                    pendingPaperConflict.pullbackParams,
+                                    'FORCE'
+                                  );
+                                }
+                              }}
+                              className="rounded-lg border border-emerald-500/50 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/25 cursor-pointer"
+                            >
+                              仍要並存加碼開單
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPendingPaperConflict(null);
+                                setActiveSection('paper_ledger');
+                              }}
+                              className="rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-slate-800 cursor-pointer"
+                            >
+                              前往帳本查看
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                    {!pendingPaperConflict &&
+                      activeSymbolOpenOrders.length > 0 && (
+                        <div className="rounded-xl border border-slate-800 bg-slate-950/90 px-3 py-1.5 text-[11px] text-amber-300/90 flex flex-wrap items-center justify-between gap-2">
+                          <span>
+                            目前已有 {activeSymbolOpenOrders.length} 筆{' '}
+                            {symbolDetail.symbol} 進行中紙上單（
+                            {activeSymbolOpenOrders
+                              .map(
+                                (o) =>
+                                  `#${o.id} ${o.side} ${
+                                    o.fillStatus === 'WAITING_LIMIT'
+                                      ? '待觸價'
+                                      : '已成交'
+                                  }`
+                              )
+                              .join('、')}
+                            ）
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setActiveSection('paper_ledger')}
+                            className="text-sky-300 hover:underline cursor-pointer"
+                          >
+                            查看帳本 →
+                          </button>
+                        </div>
+                      )}
+
+                    {/* Gemini AI Output Banner (shown immediately when triggered) */}
+                    {(geminiError || geminiResult) && (
+                      <div className="rounded-xl border border-amber-500/35 bg-slate-950 p-3 text-xs space-y-2">
+                        {geminiError && (
+                          <div className="text-rose-400 font-mono">{geminiError}</div>
+                        )}
+                        {geminiResult && (
+                          <>
+                            <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-slate-400">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span>
+                                  鎖定分類:{' '}
+                                  <strong className="text-slate-200">
+                                    {geminiResult.lockedCategory}
+                                  </strong>
+                                </span>
+                                <span>·</span>
+                                <span>
+                                  鎖定 SMC:{' '}
+                                  <strong className="text-amber-300">
+                                    {geminiResult.lockedActionState}
+                                  </strong>
+                                </span>
+                                <span>·</span>
+                                <span>
+                                  WAIT 閘門驗證:{' '}
+                                  {String(geminiResult.guardrails.waitGateEnforced)}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setGeminiResult(null)}
+                                className="text-slate-400 hover:text-slate-200 cursor-pointer"
+                              >
+                                收合解釋
+                              </button>
+                            </div>
+                            <p className="text-slate-200 leading-relaxed bg-slate-900/70 p-2.5 rounded-lg border border-slate-800">
+                              {geminiResult.explanationZh}
+                            </p>
+                            <ProvenanceLine
+                              provenance={geminiResult.provenance}
+                              prefixLabel="解釋層來源"
+                            />
+                          </>
                         )}
                       </div>
-                    );
-                  })()}
+                    )}
 
-                  {/* WAIT Gate Reasons Alert */}
-                  {symbolDetail.smcAnalysis.waitReasons.length > 0 && (
-                    <div className="border border-amber-500/40 bg-amber-950/25 p-3.5 text-xs text-amber-200 space-y-1.5">
-                      <div className="font-semibold text-amber-300 flex items-center gap-2">
-                        <Clock className="h-4 w-4 shrink-0" />
-                        <span>
-                          WAIT 安全閘門觸發原因（條件不足、OI 缺失或結構衝突時強制輸出 WAIT）：
-                        </span>
+                    {/* Collapsible Decision Trace & 6-Gate Inspector Bar */}
+                    {(() => {
+                      const trace =
+                        decisionTraceData ?? symbolDetail.candidate.decisionTrace;
+                      if (!trace) return null;
+                      const histGate = trace.gates.history;
+                      const madRatioPct =
+                        histGate.madToMedianRatio !== null &&
+                        histGate.madToMedianRatio !== undefined
+                          ? `${(histGate.madToMedianRatio * 100).toFixed(2)}%`
+                          : 'N/A';
+                      return (
+                        <details className="group border border-slate-700/80 bg-slate-950 rounded-xl text-xs overflow-hidden">
+                          <summary className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 cursor-pointer select-none">
+                            <span className="font-semibold text-amber-300 font-mono flex items-center gap-1.5 min-w-0">
+                              <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180 shrink-0" />
+                              <span className="truncate">
+                                Decision Trace 降級與安全閘門追蹤 (/api/symbol/
+                                {symbolDetail.symbol}/decision-trace)
+                              </span>
+                            </span>
+                            <span className="font-mono text-[10px] text-slate-300 truncate">
+                              marketRadar: <strong>{trace.marketRadarCategory}</strong> · SMCEval:{' '}
+                              <strong>{trace.smcEvaluationStatus}</strong> · SMC:{' '}
+                              <strong>{trace.smcActionState}</strong> → finalTradeSignal:{' '}
+                              <strong>{trace.finalTradeSignal}</strong>
+                            </span>
+                          </summary>
+
+                          <div className="border-t border-slate-800 p-3 space-y-2.5">
+                            <div className="grid grid-cols-2 gap-2 @xl:grid-cols-3 font-mono text-[11px]">
+                              <div className="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-slate-400 truncate">
+                                    1. history gate
+                                  </span>
+                                  <span
+                                    className={
+                                      histGate.passed
+                                        ? 'text-emerald-400 font-bold shrink-0'
+                                        : 'text-amber-400 font-bold shrink-0'
+                                    }
+                                  >
+                                    {histGate.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-slate-200 truncate">
+                                  {histGate.sampleCount}/
+                                  {histGate.minRequiredSamples} · {histGate.status}
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate">
+                                  TF: {histGate.volumeTimeframe ?? '15m'} · MAD/Med: {madRatioPct}
+                                </div>
+                              </div>
+
+                              <div className="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-slate-400 truncate">
+                                    2. liquidity gate
+                                  </span>
+                                  <span
+                                    className={
+                                      trace.gates.liquidity.passed
+                                        ? 'text-emerald-400 font-bold shrink-0'
+                                        : 'text-rose-400 font-bold shrink-0'
+                                    }
+                                  >
+                                    {trace.gates.liquidity.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-slate-200 truncate">
+                                  Vol ${formatUsdCompact(trace.gates.liquidity.quoteVolume24h)}
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate">
+                                  Spread:{' '}
+                                  {trace.gates.liquidity.spreadPercent !== null
+                                    ? `${trace.gates.liquidity.spreadPercent.toFixed(4)}%`
+                                    : 'null'}
+                                </div>
+                              </div>
+
+                              <div className="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-slate-400 truncate">
+                                    3. momentum gate
+                                  </span>
+                                  <span
+                                    className={
+                                      trace.gates.momentum.passed
+                                        ? 'text-emerald-400 font-bold shrink-0'
+                                        : 'text-amber-400 font-bold shrink-0'
+                                    }
+                                  >
+                                    {trace.gates.momentum.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-slate-200 truncate">
+                                  24h:{' '}
+                                  {trace.gates.momentum.change24h >= 0 ? '+' : ''}
+                                  {trace.gates.momentum.change24h.toFixed(2)}%
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate">
+                                  門檻: |change24h| ≥ 3.0%
+                                </div>
+                              </div>
+
+                              <div className="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-slate-400 truncate">
+                                    4. relativeBtc gate
+                                  </span>
+                                  <span
+                                    className={
+                                      trace.gates.relativeBtc.passed
+                                        ? 'text-emerald-400 font-bold shrink-0'
+                                        : 'text-amber-400 font-bold shrink-0'
+                                    }
+                                  >
+                                    {trace.gates.relativeBtc.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-slate-200 truncate">
+                                  vs BTC:{' '}
+                                  {trace.gates.relativeBtc.value >= 0 ? '+' : ''}
+                                  {trace.gates.relativeBtc.value.toFixed(2)}%
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate">
+                                  門檻: 同向 ≥ 1.2%
+                                </div>
+                              </div>
+
+                              <div className="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-slate-400 truncate">
+                                    5. funding gate
+                                  </span>
+                                  <span
+                                    className={
+                                      trace.gates.funding.passed
+                                        ? 'text-emerald-400 font-bold shrink-0'
+                                        : 'text-rose-400 font-bold shrink-0'
+                                    }
+                                  >
+                                    {trace.gates.funding.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-slate-200 truncate">
+                                  {trace.gates.funding.value !== null
+                                    ? `${(trace.gates.funding.value * 100).toFixed(4)}%`
+                                    : 'null'}
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate">
+                                  門檻: |Funding| &lt; 0.05%
+                                </div>
+                              </div>
+
+                              <div className="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-slate-400 truncate">
+                                    6. smc gate
+                                  </span>
+                                  <span
+                                    className={
+                                      trace.gates.smc.passed
+                                        ? 'text-emerald-400 font-bold shrink-0'
+                                        : 'text-amber-400 font-bold shrink-0'
+                                    }
+                                  >
+                                    {trace.gates.smc.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-slate-200 truncate">
+                                  {trace.gates.smc.actionState} ({trace.gates.smc.evaluationStatus})
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate">
+                                  第二層結構確認
+                                </div>
+                              </div>
+                            </div>
+
+                            {trace.downgradeReasons.length > 0 && (
+                              <div className="border-t border-slate-800 pt-2 space-y-1">
+                                <div className="font-semibold text-slate-300">
+                                  downgradeReasons (降級與分數封頂規則明細):
+                                </div>
+                                <ul className="list-disc pl-5 space-y-0.5 text-[11px] text-slate-300 font-mono">
+                                  {trace.downgradeReasons.map((reason, idx) => (
+                                    <li key={idx} className="break-words">{reason}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        </details>
+                      );
+                    })()}
+
+                    {/* WAIT Gate Reasons Alert */}
+                    {symbolDetail.smcAnalysis.waitReasons.length > 0 && (
+                      <div className="rounded-xl border border-amber-500/40 bg-amber-950/25 px-3.5 py-2.5 text-xs text-amber-200 space-y-1">
+                        <div className="font-semibold text-amber-300 flex items-center gap-2">
+                          <Clock className="h-3.5 w-3.5 shrink-0" />
+                          <span>
+                            WAIT 安全閘門觸發原因（條件不足、OI 缺失或結構衝突時強制輸出 WAIT）：
+                          </span>
+                        </div>
+                        <ul className="list-disc pl-5 space-y-0.5 text-[11px] text-amber-100/90">
+                          {symbolDetail.smcAnalysis.waitReasons.map((r, idx) => (
+                            <li key={idx} className="break-words">{r}</li>
+                          ))}
+                        </ul>
                       </div>
-                      <ul className="list-disc pl-5 space-y-1 text-amber-100/90">
-                        {symbolDetail.smcAnalysis.waitReasons.map((r, idx) => (
-                          <li key={idx}>{r}</li>
-                        ))}
-                      </ul>
+                    )}
+                  </div>
+
+                  {/* Workstation 4-Tab Segmented Navigation */}
+                  <div className="apple-segmented-track flex flex-wrap items-center gap-1 p-1 text-xs">
+                    {(
+                      [
+                        { key: 'chart_smc', label: '1. 結構看盤 & 關鍵位' },
+                        { key: 'micro_deriv', label: '2. 籌碼與微結構' },
+                        { key: 'btc_corr', label: '3. BTC 大盤連動' },
+                        { key: 'planner_diag', label: '4. 風控試算 & 診斷' },
+                      ] as const
+                    ).map((tab) => (
+                      <button
+                        key={tab.key}
+                        type="button"
+                        onClick={() => setDetailTab(tab.key)}
+                        className={`flex-1 min-w-[120px] px-3 py-1.5 text-center transition-all whitespace-nowrap cursor-pointer ${
+                          detailTab === tab.key
+                            ? 'apple-segmented-pill-active font-semibold text-amber-200'
+                            : 'text-slate-400 hover:text-slate-100'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* TAB 1: Interactive Chart + Multi-Timeframe + Key Levels + SMC Evidences */}
+                  {detailTab === 'chart_smc' && (
+                    <div className="space-y-4">
+                      {/* Early Ignition + Anti-Chase / Pullback Zone Strip */}
+                      {(symbolDetail.candidate.earlyIgnition?.status !== 'NONE' ||
+                        symbolDetail.entryZoneAnalysis) && (
+                        <div className="grid grid-cols-1 gap-2.5 @3xl:grid-cols-2">
+                          {symbolDetail.candidate.earlyIgnition &&
+                            symbolDetail.candidate.earlyIgnition.status !==
+                              'NONE' && (
+                              <div className="min-w-0 overflow-hidden rounded-xl border border-cyan-500/40 bg-cyan-950/20 px-3.5 py-2.5 text-xs space-y-1">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="font-bold text-cyan-300">
+                                    早鳥起漲偵測 (
+                                    {symbolDetail.candidate.earlyIgnition
+                                      .direction === 'LONG'
+                                      ? '多頭點火'
+                                      : '空頭點火'}{' '}
+                                    ·{' '}
+                                    {
+                                      symbolDetail.candidate.earlyIgnition
+                                        .ignitionScore
+                                    }
+                                    分)
+                                  </span>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    {symbolDetail.candidate.earlyIgnition
+                                      .invalidationPrice !== null && (
+                                      <span className="font-mono text-[10px] text-rose-300">
+                                        防守止損{' '}
+                                        {
+                                          symbolDetail.candidate.earlyIgnition
+                                            .invalidationPrice
+                                        }
+                                      </span>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={recordEarlyIgnitionPaper}
+                                      className="rounded-lg border border-cyan-400/50 bg-cyan-500/20 px-2 py-0.5 text-[10px] font-semibold text-cyan-200 hover:bg-cyan-500/30 cursor-pointer shrink-0 whitespace-nowrap"
+                                    >
+                                      登記早鳥紙上單
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="text-[11px] text-slate-200 break-words">
+                                  {
+                                    symbolDetail.candidate.earlyIgnition
+                                      .headlineZh
+                                  }
+                                </div>
+                                <div className="text-[10px] text-cyan-200/80 break-words">
+                                  {
+                                    symbolDetail.candidate.earlyIgnition
+                                      .riskWarningZh
+                                  }
+                                </div>
+                              </div>
+                            )}
+
+                          {symbolDetail.entryZoneAnalysis && (() => {
+                            const ez = symbolDetail.entryZoneAnalysis;
+                            const distPct =
+                              ez.distanceToZonePct !== null
+                                ? Math.abs(ez.distanceToZonePct)
+                                : ez.idealPullbackEntry !== null
+                                  ? Math.abs(
+                                      ((ez.idealPullbackEntry -
+                                        symbolDetail.candidate.lastPrice) /
+                                        Math.max(
+                                          1e-9,
+                                          symbolDetail.candidate.lastPrice
+                                        )) *
+                                        100
+                                    )
+                                  : null;
+                            const distAtr = ez.distanceToZoneAtr;
+                            const isFarPullback =
+                              (distPct !== null && distPct > 3.5) ||
+                              (distAtr !== null && distAtr > 2.5);
+                            return (
+                              <div
+                                id="entry-pullback-panel"
+                                className={`min-w-0 overflow-hidden rounded-xl border px-3.5 py-2.5 text-xs space-y-1.5 ${
+                                  symbolDetail.candidate.earlyIgnition?.status ===
+                                  'NONE'
+                                    ? '@3xl:col-span-2'
+                                    : ''
+                                } ${
+                                  ez.status === 'OVEREXTENDED'
+                                    ? 'border-amber-500/45 bg-amber-950/25 text-amber-100'
+                                    : ez.status === 'IN_DISCOUNT_ZONE'
+                                      ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-100'
+                                      : ez.status === 'NEAR_PULLBACK_ZONE'
+                                        ? 'border-sky-500/35 bg-sky-950/20 text-sky-100'
+                                        : 'border-slate-800 bg-slate-950 text-slate-300'
+                                }`}
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                                    <span className="font-bold">
+                                      {ez.headlineZh}
+                                    </span>
+                                    {distPct !== null && (
+                                      <span className="rounded bg-slate-900/90 px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
+                                        距現價 {distPct.toFixed(2)}%
+                                        {distAtr !== null
+                                          ? ` · ${distAtr.toFixed(1)} ATR`
+                                          : ''}
+                                      </span>
+                                    )}
+                                    {isFarPullback && (
+                                      <span className="rounded border border-rose-500/50 bg-rose-950/60 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-rose-200">
+                                        掛單偏遠・易踏空
+                                      </span>
+                                    )}
+                                  </div>
+                                  {ez.idealPullbackEntry !== null &&
+                                    (ez.direction === 'LONG' ||
+                                      ez.direction === 'SHORT') && (
+                                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            createPullbackAlertRule(
+                                              ez.idealPullbackEntry!,
+                                              ez.direction as 'LONG' | 'SHORT',
+                                              `${ez.anchorLabel} 回踩提醒`
+                                            )
+                                          }
+                                          className="rounded-lg border border-amber-400/50 bg-amber-500/20 px-2.5 py-0.5 text-[10px] font-semibold text-amber-200 hover:bg-amber-500/30 cursor-pointer whitespace-nowrap"
+                                        >
+                                          一鍵設回踩告警 ({ez.idealPullbackEntry})
+                                        </button>
+                                        {ez.stopLossPrice !== null &&
+                                          ez.targetPrice !== null && (
+                                            <>
+                                              <select
+                                                aria-label="回踩限價掛單 TTL"
+                                                value={pullbackTtlMinutes}
+                                                onChange={(e) =>
+                                                  setPullbackTtlMinutes(
+                                                    Number(e.target.value)
+                                                  )
+                                                }
+                                                className="rounded-lg border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[10px] text-slate-200 cursor-pointer"
+                                              >
+                                                <option value={120}>TTL 2h</option>
+                                                <option value={240}>TTL 4h</option>
+                                                <option value={720}>TTL 12h</option>
+                                                <option value={1440}>TTL 24h</option>
+                                              </select>
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  recordPullbackLimitPaper({
+                                                    side: ez.direction as
+                                                      | 'LONG'
+                                                      | 'SHORT',
+                                                    entryPrice:
+                                                      ez.idealPullbackEntry!,
+                                                    invalidationPrice:
+                                                      ez.stopLossPrice!,
+                                                    targetPrice: ez.targetPrice!,
+                                                    anchorLabel: ez.anchorLabel,
+                                                    ttlMinutes: pullbackTtlMinutes,
+                                                  })
+                                                }
+                                                className="rounded-lg border border-emerald-400/50 bg-emerald-500/20 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/30 cursor-pointer whitespace-nowrap"
+                                              >
+                                                掛回踩紙上限價單
+                                              </button>
+                                            </>
+                                          )}
+                                      </div>
+                                    )}
+                                </div>
+                                <div className="text-[11px] opacity-90 break-words">
+                                  {ez.actionAdviceZh}
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
+
+                      {/* Multi-Timeframe Direction Alignment Strip */}
+                      <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="font-semibold text-slate-200">
+                            多週期結構方向一致性 (5m / 15m / 1h / 4h)
+                          </span>
+                          <span className="font-mono text-[11px] text-slate-400">
+                            {symbolDetail.smcAnalysis.mtfAlignment.description}
+                          </span>
+                        </div>
+                        <div className="mt-2 grid grid-cols-2 @md:grid-cols-4 gap-2 font-mono text-xs">
+                          {(['5m', '15m', '1h', '4h'] as Timeframe[]).map((tf) => {
+                            const bias =
+                              symbolDetail.smcAnalysis.mtfAlignment.byTimeframe[tf];
+                            const tfMeta = symbolDetail.klinesByTimeframe[tf];
+                            return (
+                              <button
+                                key={tf}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedTimeframe(tf);
+                                  loadSymbolDetail(symbolDetail.symbol, tf);
+                                }}
+                                className={`min-w-0 overflow-hidden rounded-lg border p-2 text-left transition-colors cursor-pointer ${
+                                  selectedTimeframe === tf
+                                    ? 'border-amber-500/60 bg-slate-900'
+                                    : 'border-slate-800 bg-slate-950 hover:border-slate-700'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="font-bold text-slate-200">
+                                    {tf}
+                                  </span>
+                                  <span
+                                    className={
+                                      bias === 'BULL'
+                                        ? 'text-emerald-400 font-semibold'
+                                        : bias === 'BEAR'
+                                          ? 'text-rose-400 font-semibold'
+                                          : 'text-slate-400'
+                                    }
+                                  >
+                                    {bias}
+                                  </span>
+                                </div>
+                                <div className="mt-0.5 text-[10px] text-slate-400 truncate">
+                                  已收盤: {tfMeta?.confirmedCount ?? 0} 根
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Interactive Candlestick & SMC Structure Chart + Multi-Chart Split Toggle */}
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="font-semibold text-slate-200">
+                            互動式 K 線結構圖（支援滾輪縮放 / 拖曳平移 / 測距尺 / 關鍵位疊加）
+                          </span>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setAlertDrawerOpen(true)}
+                              className="inline-flex items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/20 cursor-pointer"
+                            >
+                              <Bell className="h-3 w-3" />
+                              <span>設為條件告警</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setMultiChartSplit((v) => !v)}
+                              className={`rounded-lg border px-3 py-1 text-[11px] font-medium cursor-pointer transition-colors ${
+                                multiChartSplit
+                                  ? 'border-amber-400/70 bg-amber-500/20 text-amber-200 font-semibold'
+                                  : 'border-slate-700 bg-slate-900 text-slate-300 hover:text-slate-100'
+                              }`}
+                            >
+                              {multiChartSplit
+                                ? '切換回單圖模式'
+                                : `多圖同框 (BTC + ${symbolDetail.symbol})`}
+                            </button>
+                          </div>
+                        </div>
+
+                        {multiChartSplit ? (
+                          <div className="grid grid-cols-1 gap-3 @3xl:grid-cols-2">
+                            <KlineSmcChart
+                              symbol={symbolDetail.symbol}
+                              timeframe={symbolDetail.primaryTimeframe}
+                              klines={
+                                symbolDetail.klinesByTimeframe[
+                                  symbolDetail.primaryTimeframe
+                                ]?.klines || []
+                              }
+                              smcAnalysis={symbolDetail.smcAnalysis}
+                              liquidityPools={
+                                symbolDetail.derivativesStructure
+                                  ?.liquidityClusters ?? []
+                              }
+                              keyLevels={symbolDetail.keyLevelsSession}
+                              compact
+                            />
+                            {symbolDetail.symbol !== 'BTCUSDT' &&
+                            (symbolDetail.btcKlinesByTimeframe?.[
+                              symbolDetail.primaryTimeframe
+                            ]?.length ||
+                              symbolDetail.btcKlinesByTimeframe?.['15m']?.length) ? (
+                              <KlineSmcChart
+                                symbol="BTCUSDT"
+                                timeframe={
+                                  symbolDetail.btcKlinesByTimeframe?.[
+                                    symbolDetail.primaryTimeframe
+                                  ]?.length
+                                    ? symbolDetail.primaryTimeframe
+                                    : '15m'
+                                }
+                                klines={
+                                  symbolDetail.btcKlinesByTimeframe?.[
+                                    symbolDetail.primaryTimeframe
+                                  ]?.length
+                                    ? symbolDetail.btcKlinesByTimeframe[
+                                        symbolDetail.primaryTimeframe
+                                      ]!
+                                    : symbolDetail.btcKlinesByTimeframe?.['15m'] ??
+                                      []
+                                }
+                                compact
+                                titleOverride={`BTCUSDT 大盤基準 (${
+                                  symbolDetail.btcKlinesByTimeframe?.[
+                                    symbolDetail.primaryTimeframe
+                                  ]?.length
+                                    ? symbolDetail.primaryTimeframe
+                                    : '15m'
+                                })`}
+                              />
+                            ) : (
+                              <KlineSmcChart
+                                symbol={symbolDetail.symbol}
+                                timeframe={
+                                  symbolDetail.primaryTimeframe === '1h'
+                                    ? '4h'
+                                    : '1h'
+                                }
+                                klines={
+                                  symbolDetail.klinesByTimeframe[
+                                    symbolDetail.primaryTimeframe === '1h'
+                                      ? '4h'
+                                      : '1h'
+                                  ]?.klines || []
+                                }
+                                compact
+                                titleOverride={`${symbolDetail.symbol} · ${
+                                  symbolDetail.primaryTimeframe === '1h'
+                                    ? '4h'
+                                    : '1h'
+                                } 高週期對照`}
+                              />
+                            )}
+                          </div>
+                        ) : (
+                          <KlineSmcChart
+                            symbol={symbolDetail.symbol}
+                            timeframe={symbolDetail.primaryTimeframe}
+                            klines={
+                              symbolDetail.klinesByTimeframe[
+                                symbolDetail.primaryTimeframe
+                              ]?.klines || []
+                            }
+                            smcAnalysis={symbolDetail.smcAnalysis}
+                            liquidityPools={
+                              symbolDetail.derivativesStructure
+                                ?.liquidityClusters ?? []
+                            }
+                            keyLevels={symbolDetail.keyLevelsSession}
+                          />
+                        )}
+                      </div>
+
+                      {/* Key Session Killzones, Funding Settlement Clock & PDH/PDL/DO/WO/VWAP Anchors */}
+                      <KeyLevelsSessionStrip data={symbolDetail.keyLevelsSession} />
+
+                      {/* SMC/ICT Evidences Table (computed strictly on closed K-lines) */}
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h4 className="text-xs font-semibold text-slate-200">
+                            SMC / ICT 已確認 K 線結構證據 ({symbolDetail.primaryTimeframe} · 基於已收盤 K 線 isClosed=true)
+                          </h4>
+                          <span className="text-[11px] font-mono text-slate-400">
+                            已收盤: {symbolDetail.smcAnalysis.confirmedKlineCount} 根 · 狀態:{' '}
+                            <strong
+                              className={getSmcStateColor(
+                                symbolDetail.smcAnalysis.actionState
+                              )}
+                            >
+                              {symbolDetail.smcAnalysis.actionState}
+                            </strong>
+                          </span>
+                        </div>
+                        <div className="divide-y divide-slate-800 rounded-xl border border-slate-800 bg-slate-950 text-xs overflow-hidden">
+                          {symbolDetail.smcAnalysis.evidences.map((ev) => (
+                            <div
+                              key={ev.code}
+                              className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-3.5 py-2.5"
+                            >
+                              <div className="space-y-0.5 min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span
+                                    className={`font-mono font-semibold shrink-0 ${
+                                      ev.passed
+                                        ? 'text-emerald-400'
+                                        : 'text-slate-500'
+                                    }`}
+                                  >
+                                    {ev.passed ? '[PASS]' : '[----]'}
+                                  </span>
+                                  <span className="font-medium text-slate-200">
+                                    {ev.label}
+                                  </span>
+                                  <span className="text-slate-500">·</span>
+                                  <span className="font-mono text-slate-300 break-words">
+                                    {ev.value}
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-slate-400 break-words">
+                                  {ev.detail}
+                                </p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     </div>
                   )}
 
-                  {/* Multi-Timeframe Direction Alignment Strip */}
-                  <div className="border border-slate-800 bg-slate-950 p-3.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                      <span className="font-semibold text-slate-200">
-                        多週期結構方向一致性 (5m / 15m / 1h / 4h)
-                      </span>
-                      <span className="font-mono text-slate-400">
-                        {symbolDetail.smcAnalysis.mtfAlignment.description}
-                      </span>
+                  {/* TAB 2: Spot-Perp Basis, Orderbook Depth OBI/Walls & Derivatives Structure */}
+                  {detailTab === 'micro_deriv' && (
+                    <div className="space-y-4">
+                      <MicrostructureCard data={symbolDetail.microstructure} />
+                      <DerivativesStructureCard
+                        symbol={symbolDetail.symbol}
+                        analysis={symbolDetail.derivativesStructure}
+                      />
                     </div>
-                    <div className="mt-2.5 grid grid-cols-4 gap-2 font-mono text-xs">
-                      {(['5m', '15m', '1h', '4h'] as Timeframe[]).map((tf) => {
-                        const bias =
-                          symbolDetail.smcAnalysis.mtfAlignment.byTimeframe[tf];
-                        const tfMeta = symbolDetail.klinesByTimeframe[tf];
-                        return (
-                          <button
-                            key={tf}
-                            type="button"
-                            onClick={() => {
-                              setSelectedTimeframe(tf);
-                              loadSymbolDetail(symbolDetail.symbol, tf);
-                            }}
-                            className={`border p-2 text-left transition-colors cursor-pointer ${
-                              selectedTimeframe === tf
-                                ? 'border-amber-500/60 bg-slate-900'
-                                : 'border-slate-800 bg-slate-950 hover:border-slate-700'
-                            }`}
-                          >
-                            <div className="flex items-center justify-between">
-                              <span className="font-bold text-slate-200">
-                                {tf}
-                              </span>
-                              <span
-                                className={
-                                  bias === 'BULL'
-                                    ? 'text-emerald-400 font-semibold'
-                                    : bias === 'BEAR'
-                                      ? 'text-rose-400 font-semibold'
-                                      : 'text-slate-400'
-                                }
-                              >
-                                {bias}
-                              </span>
-                            </div>
-                            <div className="mt-1 text-[10px] text-slate-400">
-                              已收盤: {tfMeta?.confirmedCount ?? 0} 根
-                            </div>
-                          </button>
+                  )}
+
+                  {/* TAB 3: BTCUSDT K-line Overlap & Coupling Risk Analysis */}
+                  {detailTab === 'btc_corr' && (
+                    <div className="space-y-4">
+                      <BtcCorrelationCard
+                        symbol={symbolDetail.symbol}
+                        primaryTimeframe={symbolDetail.primaryTimeframe}
+                        analysis={symbolDetail.btcCorrelation}
+                      />
+                    </div>
+                  )}
+
+                  {/* TAB 4: Position Risk Planner, 5-Step Details & Market Score Breakdown */}
+                  {detailTab === 'planner_diag' && (
+                    <div className="space-y-4">
+                      <PositionRiskPlannerCard
+                        symbol={symbolDetail.symbol}
+                        candidate={symbolDetail.candidate}
+                        smcAnalysis={symbolDetail.smcAnalysis}
+                        entryZoneAnalysis={symbolDetail.entryZoneAnalysis}
+                        btcCorrelation={symbolDetail.btcCorrelation}
+                        microstructure={symbolDetail.microstructure}
+                        existingOpenOrders={activeSymbolOpenOrders}
+                        highBtcLongCount={portfolioHighBtcStats.longCount}
+                        highBtcShortCount={portfolioHighBtcStats.shortCount}
+                        onCreatePullbackAlert={createPullbackAlertRule}
+                        onRecordPullbackPaper={recordPullbackLimitPaper}
+                      />
+
+                      {/* Full 5-Step Plain-Language Guide */}
+                      {(() => {
+                        const plainGuide = buildPlainLanguageSmcSteps(
+                          symbolDetail,
+                          decisionTraceData ?? symbolDetail.candidate.decisionTrace
                         );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Interactive Candlestick & SMC Structure Chart */}
-                  <KlineSmcChart
-                    symbol={symbolDetail.symbol}
-                    timeframe={symbolDetail.primaryTimeframe}
-                    klines={
-                      symbolDetail.klinesByTimeframe[
-                        symbolDetail.primaryTimeframe
-                      ]?.klines || []
-                    }
-                    smcAnalysis={symbolDetail.smcAnalysis}
-                  />
-
-                  {/* SMC/ICT Evidences Table (computed strictly on closed K-lines) */}
-                  <div className="space-y-2">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h4 className="text-xs font-semibold text-slate-200">
-                        SMC / ICT 已確認 K 線結構證據 ({symbolDetail.primaryTimeframe} · 基於已收盤 K 線 isClosed=true)
-                      </h4>
-                      <span className="text-[11px] font-mono text-slate-400">
-                        已收盤 K 線數: {symbolDetail.smcAnalysis.confirmedKlineCount} 根 (isClosed=true ≠ SMC 已確認) · 當前 SMC 狀態:{' '}
-                        <strong
-                          className={getSmcStateColor(
-                            symbolDetail.smcAnalysis.actionState
-                          )}
-                        >
-                          {symbolDetail.smcAnalysis.actionState}
-                        </strong>
-                      </span>
-                    </div>
-                    <div className="divide-y divide-slate-800 border border-slate-800 bg-slate-950 text-xs">
-                      {symbolDetail.smcAnalysis.evidences.map((ev) => (
-                        <div
-                          key={ev.code}
-                          className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-3.5 py-2.5"
-                        >
-                          <div className="space-y-0.5">
-                            <div className="flex items-center gap-2">
-                              <span
-                                className={`font-mono font-semibold ${
-                                  ev.passed
-                                    ? 'text-emerald-400'
-                                    : 'text-slate-500'
-                                }`}
-                              >
-                                {ev.passed ? '[PASS]' : '[----]'}
-                              </span>
-                              <span className="font-medium text-slate-200">
-                                {ev.label}
-                              </span>
-                              <span className="text-slate-500">·</span>
-                              <span className="font-mono text-slate-300">
-                                {ev.value}
-                              </span>
+                        return (
+                          <div className="rounded-xl border border-slate-800/80 bg-slate-950/90 p-4 space-y-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/70 pb-2.5">
+                              <div className="flex items-center gap-2.5">
+                                <span className="text-xs font-bold tracking-tight text-amber-300">
+                                  白話文 5 步闖關進度明細
+                                </span>
+                                <span className="text-slate-600">·</span>
+                                <span className="text-xs font-semibold text-slate-100">
+                                  已通過 {plainGuide.passedCount} / 5 關
+                                </span>
+                              </div>
                             </div>
-                            <p className="text-[11px] text-slate-400">
-                              {ev.detail}
-                            </p>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
 
-                  {/* Score Breakdown & Market Scan Evidences */}
-                  <div className="space-y-2">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h4 className="text-xs font-semibold text-slate-200">
-                        全市場評分拆解與證據 (總分: {symbolDetail.candidate.score}/96)
-                      </h4>
-                      <span className="text-[11px] font-mono text-slate-400">
-                        histVol:{symbolDetail.candidate.scoreBreakdown.volumeAnomaly} ·
-                        auxPR:{symbolDetail.candidate.scoreBreakdown.auxiliaryVolumeRank} ·
-                        mom:{symbolDetail.candidate.scoreBreakdown.momentum} ·
-                        rs:{symbolDetail.candidate.scoreBreakdown.relativeBtcStrength} ·
-                        fund:{symbolDetail.candidate.scoreBreakdown.fundingRisk} ·
-                        liq:{symbolDetail.candidate.scoreBreakdown.liquidityRisk} ·
-                        qual:{symbolDetail.candidate.scoreBreakdown.dataQuality}
-                      </span>
-                    </div>
-                    <div className="divide-y divide-slate-800 border border-slate-800 bg-slate-950 text-xs">
-                      {symbolDetail.candidate.evidences.map((ev) => (
-                        <div
-                          key={ev.code}
-                          className="flex items-center justify-between gap-3 px-3.5 py-2"
-                        >
-                          <div>
-                            <span
-                              className={`font-mono font-semibold mr-2 ${
-                                ev.passed
-                                  ? 'text-emerald-400'
-                                  : 'text-amber-400'
+                            <div
+                              className={`rounded-xl border p-3 text-xs space-y-1 ${
+                                plainGuide.recommendationTone === 'emerald'
+                                  ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-200'
+                                  : plainGuide.recommendationTone === 'rose'
+                                    ? 'border-rose-500/40 bg-rose-950/20 text-rose-200'
+                                    : plainGuide.recommendationTone === 'sky'
+                                      ? 'border-sky-500/40 bg-sky-950/20 text-sky-200'
+                                      : 'border-amber-500/35 bg-amber-950/15 text-amber-200'
                               }`}
                             >
-                              {ev.passed ? '[PASS]' : '[WARN]'}
-                            </span>
-                            <span className="text-slate-200 font-medium">
-                              {ev.label}
-                            </span>
-                            <span className="mx-1.5 text-slate-500">·</span>
-                            <span className="text-slate-400">{ev.detail}</span>
+                              <div className="font-bold text-sm tracking-tight">
+                                {plainGuide.recommendationTitle}
+                              </div>
+                              <p className="text-xs text-slate-300 leading-relaxed">
+                                {plainGuide.recommendationBody}
+                              </p>
+                            </div>
+
+                            <div className="grid grid-cols-1 gap-2.5 @md:grid-cols-2 @3xl:grid-cols-3 text-xs">
+                              {plainGuide.steps.map((st, idx) => (
+                                <div
+                                  key={idx}
+                                  className={`min-w-0 overflow-hidden rounded-xl border p-3 space-y-1.5 ${
+                                    st.passed
+                                      ? 'border-emerald-500/35 bg-emerald-950/15'
+                                      : 'border-slate-800/80 bg-slate-900/50'
+                                  }`}
+                                >
+                                  <div className="flex flex-wrap items-center justify-between gap-1 font-mono text-[10px]">
+                                    <span className="shrink-0 text-slate-400">
+                                      第 {st.stepNumber} 關
+                                    </span>
+                                    <span
+                                      className={`max-w-full break-words rounded-md font-bold px-1.5 py-0.5 leading-tight ${
+                                        st.passed
+                                          ? 'bg-emerald-500/20 text-emerald-300'
+                                          : 'bg-slate-800 text-slate-400'
+                                      }`}
+                                    >
+                                      {st.statusLabel}
+                                    </span>
+                                  </div>
+                                  <div className="font-semibold text-slate-100">
+                                    {st.title}
+                                  </div>
+                                  <div className="text-[11px] text-slate-300 leading-snug break-words">
+                                    {st.plainDesc}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
                           </div>
-                          <span className="font-mono text-slate-200 whitespace-nowrap">
-                            {ev.value} ({ev.weight >= 0 ? `+${ev.weight}` : ev.weight})
+                        );
+                      })()}
+
+                      {/* Score Breakdown & Market Scan Evidences (Collapsible) */}
+                      <details className="group rounded-xl border border-slate-800 bg-slate-950/90 text-xs overflow-hidden">
+                        <summary className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 cursor-pointer select-none">
+                          <h4 className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                            <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                            <span>
+                              全市場評分拆解與證據 (總分: {symbolDetail.candidate.score}/96)
+                            </span>
+                          </h4>
+                          <span className="text-[11px] font-mono text-slate-400 truncate">
+                            histVol:{symbolDetail.candidate.scoreBreakdown.volumeAnomaly} ·
+                            auxPR:{symbolDetail.candidate.scoreBreakdown.auxiliaryVolumeRank} ·
+                            mom:{symbolDetail.candidate.scoreBreakdown.momentum} ·
+                            rs:{symbolDetail.candidate.scoreBreakdown.relativeBtcStrength}
                           </span>
+                        </summary>
+                        <div className="divide-y divide-slate-800 border-t border-slate-800 bg-slate-950 text-xs">
+                          {symbolDetail.candidate.evidences.map((ev) => (
+                            <div
+                              key={ev.code}
+                              className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2"
+                            >
+                              <div className="min-w-0">
+                                <span
+                                  className={`font-mono font-semibold mr-2 ${
+                                    ev.passed
+                                      ? 'text-emerald-400'
+                                      : 'text-amber-400'
+                                  }`}
+                                >
+                                  {ev.passed ? '[PASS]' : '[WARN]'}
+                                </span>
+                                <span className="text-slate-200 font-medium">
+                                  {ev.label}
+                                </span>
+                                <span className="mx-1.5 text-slate-500">·</span>
+                                <span className="text-slate-400 break-words">{ev.detail}</span>
+                              </div>
+                              <span className="font-mono text-slate-200 whitespace-nowrap shrink-0">
+                                {ev.value} ({ev.weight >= 0 ? `+${ev.weight}` : ev.weight})
+                              </span>
+                            </div>
+                          ))}
                         </div>
-                      ))}
+                      </details>
                     </div>
-                  </div>
-
-                  {/* Gemini AI Explanation + Paper Ledger + Backtest Actions */}
-                  <div className="border border-slate-800 bg-slate-950 p-4 space-y-3">
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <h4 className="text-xs font-semibold text-slate-100 flex items-center gap-1.5">
-                          <Sparkles className="h-3.5 w-3.5 text-amber-400" />
-                          <span>
-                            Gemini 解釋層與紙上觀察操作 (PAPER ONLY)
-                          </span>
-                        </h4>
-                        <p className="text-[11px] text-slate-400">
-                          鎖定分類與 WAIT 狀態，可將此結構登記至 SQLite 紙上交易帳本追蹤
-                        </p>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={requestGeminiExplanation}
-                          disabled={geminiLoading}
-                          className="rounded bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-50 cursor-pointer whitespace-nowrap"
-                        >
-                          {geminiLoading
-                            ? '正在生成解釋...'
-                            : '產生 Gemini 證據解釋'}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={recordPaperObservation}
-                          className="rounded border border-emerald-500/40 bg-emerald-950/30 px-2.5 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-950/50 cursor-pointer whitespace-nowrap"
-                        >
-                          登記紙上觀察帳本
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            executeBacktest(
-                              symbolDetail.symbol,
-                              symbolDetail.primaryTimeframe
-                            );
-                            setActiveSection('backtest');
-                          }}
-                          className="rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-slate-800 cursor-pointer whitespace-nowrap"
-                        >
-                          執行回測並存檔
-                        </button>
-                      </div>
-                    </div>
-
-                    {geminiError && (
-                      <div className="text-xs text-rose-400 font-mono">
-                        {geminiError}
-                      </div>
-                    )}
-
-                    {geminiResult && (
-                      <div className="border-t border-slate-800 pt-3 space-y-3 text-xs">
-                        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-slate-400">
-                          <span>
-                            鎖定分類:{' '}
-                            <strong className="text-slate-200">
-                              {geminiResult.lockedCategory}
-                            </strong>
-                          </span>
-                          <span>·</span>
-                          <span>
-                            鎖定 SMC 狀態:{' '}
-                            <strong className="text-amber-300">
-                              {geminiResult.lockedActionState}
-                            </strong>
-                          </span>
-                          <span>·</span>
-                          <span>
-                            WAIT 閘門驗證:{' '}
-                            {String(geminiResult.guardrails.waitGateEnforced)}
-                          </span>
-                        </div>
-
-                        <p className="text-slate-200 leading-relaxed bg-slate-900/70 p-3 border border-slate-800">
-                          {geminiResult.explanationZh}
-                        </p>
-
-                        <ProvenanceLine
-                          provenance={geminiResult.provenance}
-                          prefixLabel="解釋層來源"
-                        />
-                      </div>
-                    )}
-                  </div>
+                  )}
                 </div>
               ) : null}
             </div>
+          </div>
           </div>
         )}
 
@@ -6555,6 +7324,580 @@ export default function App() {
               </div>
             </div>
 
+            {/* Net Cost Config, Extended Bar Limit & Portfolio Benchmark Bar */}
+            <div className="border border-slate-800 bg-slate-950/90 p-3.5 text-xs font-mono space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-400 font-sans font-semibold">
+                    歷史回測 K 線數 (Bar Limit):
+                  </span>
+                  {([120, 240, 500, 1000] as const).map((bl) => (
+                    <button
+                      key={bl}
+                      type="button"
+                      onClick={() => setBacktestBarLimit(bl)}
+                      className={`px-2 py-1 border cursor-pointer ${
+                        backtestBarLimit === bl
+                          ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200 font-bold'
+                          : 'border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {bl} 根
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span className="text-slate-400 font-sans font-semibold">
+                    淨損益交易成本模型:
+                  </span>
+                  <label className="inline-flex items-center gap-1 text-slate-300">
+                    <span>Maker(bps)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.5}
+                      value={costConfigState.makerFeeBps}
+                      onChange={(e) =>
+                        setCostConfigState((prev) => ({
+                          ...prev,
+                          makerFeeBps: Math.max(0, Number(e.target.value) || 0),
+                        }))
+                      }
+                      className="w-14 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-right text-slate-100"
+                    />
+                  </label>
+                  <label className="inline-flex items-center gap-1 text-slate-300">
+                    <span>Taker(bps)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.5}
+                      value={costConfigState.takerFeeBps}
+                      onChange={(e) =>
+                        setCostConfigState((prev) => ({
+                          ...prev,
+                          takerFeeBps: Math.max(0, Number(e.target.value) || 0),
+                        }))
+                      }
+                      className="w-14 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-right text-slate-100"
+                    />
+                  </label>
+                  <label className="inline-flex items-center gap-1 text-slate-300">
+                    <span>滑價(bps)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.5}
+                      value={costConfigState.slippageBps}
+                      onChange={(e) =>
+                        setCostConfigState((prev) => ({
+                          ...prev,
+                          slippageBps: Math.max(0, Number(e.target.value) || 0),
+                        }))
+                      }
+                      className="w-14 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-right text-slate-100"
+                    />
+                  </label>
+                  <select
+                    value={costConfigState.entryOrderType ?? 'MARKET'}
+                    onChange={(e) =>
+                      setCostConfigState((prev) => ({
+                        ...prev,
+                        entryOrderType:
+                          e.target.value === 'LIMIT' ? 'LIMIT' : 'MARKET',
+                      }))
+                    }
+                    className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-100"
+                  >
+                    <option value="MARKET">市價進場 (Taker + 滑價)</option>
+                    <option value="LIMIT">限價回踩進場 (Maker / 0滑價)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-2.5 text-[11px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-400 font-sans font-semibold">
+                    多幣種組合標的:
+                  </span>
+                  <input
+                    type="text"
+                    value={portfolioSymbolsInput}
+                    onChange={(e) => setPortfolioSymbolsInput(e.target.value)}
+                    className="w-64 border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
+                    placeholder="BTCUSDT,ETHUSDT,SOLUSDT"
+                  />
+                  <label className="inline-flex items-center gap-1 text-slate-300">
+                    <span>總倉上限</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={portfolioRiskConfig.maxOpenPositions}
+                      onChange={(e) =>
+                        setPortfolioRiskConfig((prev) => ({
+                          ...prev,
+                          maxOpenPositions: Math.max(
+                            1,
+                            Number(e.target.value) || 3
+                          ),
+                        }))
+                      }
+                      className="w-12 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-right"
+                    />
+                  </label>
+                  <label className="inline-flex items-center gap-1 text-slate-300">
+                    <span>同向上限</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={portfolioRiskConfig.maxSameDirectionPositions}
+                      onChange={(e) =>
+                        setPortfolioRiskConfig((prev) => ({
+                          ...prev,
+                          maxSameDirectionPositions: Math.max(
+                            1,
+                            Number(e.target.value) || 2
+                          ),
+                        }))
+                      }
+                      className="w-12 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-right"
+                    />
+                  </label>
+                  <label className="inline-flex items-center gap-1 text-slate-300">
+                    <span>單日熔斷(R)</span>
+                    <input
+                      type="number"
+                      min={0.5}
+                      max={20}
+                      step={0.5}
+                      value={portfolioRiskConfig.dailyMaxDrawdownR}
+                      onChange={(e) =>
+                        setPortfolioRiskConfig((prev) => ({
+                          ...prev,
+                          dailyMaxDrawdownR: Math.max(
+                            0.5,
+                            Number(e.target.value) || 3
+                          ),
+                        }))
+                      }
+                      className="w-14 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-right"
+                    />
+                  </label>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-300">
+                    <span className="text-slate-400 font-sans font-semibold">
+                      SMC 規則配置:
+                    </span>
+                    <select
+                      value={smcRuleProfile}
+                      onChange={(e) =>
+                        setSmcRuleProfile(e.target.value as SmcRuleProfile)
+                      }
+                      className="border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
+                    >
+                      <option value="STRICT_PRODUCTION">
+                        STRICT_PRODUCTION (原版嚴格正式規則)
+                      </option>
+                      <option value="RELAXED_MTF_DISP">
+                        RELAXED_MTF_DISP (放寬MTF/雙K位移 · 保留Sweep)
+                      </option>
+                      <option value="TREND_NO_SWEEP">
+                        TREND_NO_SWEEP (放寬MTF/位移 · 免除Sweep)
+                      </option>
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void executePortfolioBacktest()}
+                    disabled={portfolioLoading}
+                    className="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/25 disabled:opacity-50 cursor-pointer"
+                  >
+                    {portfolioLoading
+                      ? '組合回測中...'
+                      : '執行多幣種組合回測 (Portfolio Benchmark)'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void executeSmcAbComparison()}
+                    disabled={abCompareLoading}
+                    className="rounded border border-emerald-500/50 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50 cursor-pointer"
+                  >
+                    {abCompareLoading
+                      ? '3 規則 A/B 對比計算中...'
+                      : '執行 3 規則 A/B 扣成本對比'}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {abCompareError && (
+              <div className="border border-rose-500/40 bg-rose-950/30 p-3 text-xs text-rose-200 font-mono">
+                {abCompareError}
+              </div>
+            )}
+
+            {abCompareResult && (
+              <div
+                id="smc-ab-comparison-panel"
+                className="border border-emerald-500/40 bg-slate-950 p-4 space-y-3 text-xs font-mono"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-sans text-xs font-bold text-emerald-300">
+                      SMC 規則 A/B 扣成本對比回測 ({abCompareResult.comparisonId})
+                    </span>
+                    <span className="px-2 py-0.5 border border-emerald-500/40 bg-emerald-950/30 text-emerald-200 text-[10px]">
+                      {abCompareResult.dataClassification} · Lookahead-Free=
+                      {String(abCompareResult.lookaheadFree)} ·{' '}
+                      {abCompareResult.barLimit} 根 {abCompareResult.timeframe}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-400">
+                    標的: {abCompareResult.symbolsRequested.join(', ')} (成功{' '}
+                    {abCompareResult.symbolsSucceeded}/
+                    {abCompareResult.symbolsRequested.length})
+                  </div>
+                </div>
+
+                <div className="border border-slate-800 bg-slate-900/60 p-2.5 text-[11px] font-sans text-slate-200">
+                  <strong className="text-emerald-300">對比結論：</strong>
+                  {abCompareResult.recommendationReasonZh}
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-[11px] tabular-nums">
+                    <thead className="border-b border-slate-800 text-slate-400">
+                      <tr>
+                        <th className="py-1.5 px-2">規則版本</th>
+                        <th className="py-1.5 px-2 text-right">接受 / 原始筆數</th>
+                        <th className="py-1.5 px-2 text-right">多 / 空</th>
+                        <th className="py-1.5 px-2 text-right">淨勝率 (毛勝率)</th>
+                        <th className="py-1.5 px-2 text-right">淨 Expectancy</th>
+                        <th className="py-1.5 px-2 text-right">淨 PF (毛 PF)</th>
+                        <th className="py-1.5 px-2 text-right">淨 MDD</th>
+                        <th className="py-1.5 px-2 text-right">累計淨 R (成本拖累)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {abCompareResult.profiles.map((row) => {
+                        const isWinner =
+                          abCompareResult.recommendedProfile === row.profile;
+                        return (
+                          <tr
+                            key={row.profile}
+                            className={
+                              isWinner ? 'bg-emerald-950/20' : undefined
+                            }
+                          >
+                            <td className="py-2 px-2">
+                              <div className="font-bold text-slate-100">
+                                {row.profile}{' '}
+                                {isWinner && (
+                                  <span className="ml-1 px-1.5 py-0.5 text-[10px] border border-emerald-500/50 text-emerald-300">
+                                    較優
+                                  </span>
+                                )}
+                              </div>
+                              <div className="font-sans text-[10px] text-slate-400">
+                                {row.profileLabelZh}
+                              </div>
+                            </td>
+                            <td className="py-2 px-2 text-right text-slate-200">
+                              {row.acceptedTradesCount} / {row.rawTotalTrades}
+                            </td>
+                            <td className="py-2 px-2 text-right text-slate-300">
+                              {row.longCount} / {row.shortCount}
+                            </td>
+                            <td className="py-2 px-2 text-right">
+                              {row.netWinRate !== null
+                                ? `${row.netWinRate}%`
+                                : '--'}{' '}
+                              <span className="text-slate-400">
+                                ({row.winRate !== null ? `${row.winRate}%` : '--'})
+                              </span>
+                            </td>
+                            <td
+                              className={`py-2 px-2 text-right font-bold ${
+                                (row.netExpectancyR ?? 0) > 0
+                                  ? 'text-emerald-400'
+                                  : 'text-rose-400'
+                              }`}
+                            >
+                              {row.netExpectancyR !== null
+                                ? `${row.netExpectancyR}R`
+                                : '--'}
+                            </td>
+                            <td className="py-2 px-2 text-right text-amber-300">
+                              {row.netProfitFactor ?? '--'}{' '}
+                              <span className="text-slate-400">
+                                ({row.profitFactor ?? '--'})
+                              </span>
+                            </td>
+                            <td className="py-2 px-2 text-right text-rose-400">
+                              {row.netMaxDrawdownR !== null
+                                ? `${row.netMaxDrawdownR}R`
+                                : '--'}
+                            </td>
+                            <td className="py-2 px-2 text-right text-sky-300">
+                              {row.totalNetR !== null ? `${row.totalNetR}R` : '--'}{' '}
+                              <span className="text-slate-400">
+                                (成本 -{row.totalCostDragR ?? 0}R)
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* 5-Point Validation Readiness Scorecard */}
+            {validationReadiness && (
+              <div
+                id="validation-readiness-scorecard"
+                className="border border-slate-800 bg-slate-950 p-4 space-y-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-xs font-bold text-emerald-300">
+                      5 項實戰驗證就緒計分卡 (Validation Readiness Scorecard)
+                    </h3>
+                    <span
+                      className={`px-2 py-0.5 border text-[10px] font-mono font-bold ${
+                        validationReadiness.overallStatus === 'VALIDATED'
+                          ? 'border-emerald-500/50 bg-emerald-950/30 text-emerald-300'
+                          : validationReadiness.overallStatus === 'IN_PROGRESS'
+                            ? 'border-amber-500/50 bg-amber-950/30 text-amber-300'
+                            : 'border-slate-700 bg-slate-900 text-slate-300'
+                      }`}
+                    >
+                      {validationReadiness.overallStatus} (
+                      {validationReadiness.passedCount}/
+                      {validationReadiness.totalCount} ·{' '}
+                      {validationReadiness.readinessScorePercent}%)
+                    </span>
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-400">
+                    Live Capture:{' '}
+                    <strong className="text-cyan-300">
+                      {validationReadiness.livePaperStats.captureRatePercent !==
+                      null
+                        ? `${validationReadiness.livePaperStats.captureRatePercent}%`
+                        : 'N/A'}
+                    </strong>{' '}
+                    · Live 已結算:{' '}
+                    <strong className="text-slate-200">
+                      {validationReadiness.livePaperStats.settledPaperTradesCount}{' '}
+                      筆
+                    </strong>{' '}
+                    · 歷史回測樣本:{' '}
+                    <strong className="text-slate-200">
+                      {validationReadiness.backtestStats.latestRealTradeCount}{' '}
+                      筆
+                    </strong>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5 text-[11px]">
+                  {validationReadiness.criteria.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`border p-2.5 space-y-1 ${
+                        c.status === 'PASSED'
+                          ? 'border-emerald-500/40 bg-emerald-950/15'
+                          : c.status === 'PARTIAL'
+                            ? 'border-amber-500/40 bg-amber-950/15'
+                            : c.status === 'FAILED'
+                              ? 'border-rose-500/40 bg-rose-950/15'
+                              : 'border-slate-800 bg-slate-900/40'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="font-semibold text-slate-200">
+                          {c.titleZh}
+                        </span>
+                        <span
+                          className={`font-mono text-[10px] font-bold ${
+                            c.status === 'PASSED'
+                              ? 'text-emerald-300'
+                              : c.status === 'PARTIAL'
+                                ? 'text-amber-300'
+                                : c.status === 'FAILED'
+                                  ? 'text-rose-300'
+                                  : 'text-slate-400'
+                          }`}
+                        >
+                          {c.status}
+                        </span>
+                      </div>
+                      <div className="font-mono text-xs font-bold text-slate-100">
+                        {c.currentValueLabel}
+                      </div>
+                      <div className="font-mono text-[10px] text-slate-400">
+                        目標: {c.targetThresholdLabel}
+                      </div>
+                      <div className="text-[10px] text-slate-400 leading-snug">
+                        {c.detailZh}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {portfolioError && (
+              <div className="border border-rose-500/40 bg-rose-950/30 p-3 text-xs text-rose-200 font-mono">
+                {portfolioError}
+              </div>
+            )}
+
+            {portfolioBacktestResult && (
+              <div
+                id="portfolio-benchmark-panel"
+                className="border border-cyan-500/35 bg-slate-950 p-4 space-y-3 text-xs font-mono"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-sans text-xs font-bold text-cyan-300">
+                      多幣種組合風控回測報告 ({portfolioBacktestResult.portfolioRunId})
+                    </span>
+                    <span className="px-2 py-0.5 border border-emerald-500/40 bg-emerald-950/30 text-emerald-300 text-[10px]">
+                      {portfolioBacktestResult.dataClassification} ·{' '}
+                      {portfolioBacktestResult.sampleSufficiency}
+                    </span>
+                    <span className="text-slate-400 text-[11px]">
+                      MTF 歷史共振標的使用:{' '}
+                      {portfolioBacktestResult.mtfHistoricalAlignedCount}/
+                      {portfolioBacktestResult.symbolsSucceeded}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-300">
+                    接受 {portfolioBacktestResult.acceptedTradesCount} / 原始{' '}
+                    {portfolioBacktestResult.rawTotalTrades} 筆 · 風控攔截{' '}
+                    <strong className="text-amber-300">
+                      {portfolioBacktestResult.blockedByRiskCapCount} 筆
+                    </strong>{' '}
+                    (總倉 {portfolioBacktestResult.blockedBreakdown.maxOpenPositions} · 同向{' '}
+                    {portfolioBacktestResult.blockedBreakdown.sameDirectionCap} · 熔斷{' '}
+                    {portfolioBacktestResult.blockedBreakdown.dailyDrawdownCircuitBreaker} · 冷卻{' '}
+                    {portfolioBacktestResult.blockedBreakdown.consecutiveLossCooldown})
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-5 tabular-nums">
+                  <div className="border border-slate-800 bg-slate-900/50 p-2.5">
+                    <div className="text-[10px] font-sans text-slate-400">
+                      組合淨勝率 / 毛勝率
+                    </div>
+                    <div className="mt-0.5 text-sm font-bold text-slate-100">
+                      {portfolioBacktestResult.netWinRate ?? '--'}% /{' '}
+                      <span className="text-slate-400">
+                        {portfolioBacktestResult.winRate ?? '--'}%
+                      </span>
+                    </div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-900/50 p-2.5">
+                    <div className="text-[10px] font-sans text-slate-400">
+                      組合淨 Expectancy R
+                    </div>
+                    <div
+                      className={`mt-0.5 text-sm font-bold ${
+                        (portfolioBacktestResult.netExpectancyR ?? 0) > 0
+                          ? 'text-emerald-400'
+                          : 'text-rose-400'
+                      }`}
+                    >
+                      {portfolioBacktestResult.netExpectancyR ?? '--'}R (毛{' '}
+                      {portfolioBacktestResult.expectancyR ?? '--'}R)
+                    </div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-900/50 p-2.5">
+                    <div className="text-[10px] font-sans text-slate-400">
+                      組合淨 Profit Factor
+                    </div>
+                    <div className="mt-0.5 text-sm font-bold text-amber-300">
+                      {portfolioBacktestResult.netProfitFactor ?? '--'} (毛{' '}
+                      {portfolioBacktestResult.profitFactor ?? '--'})
+                    </div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-900/50 p-2.5">
+                    <div className="text-[10px] font-sans text-slate-400">
+                      組合淨最大回撤 (Net MDD)
+                    </div>
+                    <div className="mt-0.5 text-sm font-bold text-rose-400">
+                      {portfolioBacktestResult.netMaxDrawdownR ?? '--'}R (毛{' '}
+                      {portfolioBacktestResult.maxDrawdownR ?? '--'}R)
+                    </div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-900/50 p-2.5">
+                    <div className="text-[10px] font-sans text-slate-400">
+                      組合累計淨 R / 總成本拖累
+                    </div>
+                    <div className="mt-0.5 text-sm font-bold text-sky-300">
+                      {portfolioBacktestResult.totalNetR ?? '--'}R (成本 -
+                      {portfolioBacktestResult.totalCostDragR ?? 0}R)
+                    </div>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-[11px] tabular-nums">
+                    <thead className="border-b border-slate-800 text-slate-400">
+                      <tr>
+                        <th className="py-1.5 px-2">標的</th>
+                        <th className="py-1.5 px-2">狀態</th>
+                        <th className="py-1.5 px-2 text-right">接受 / 攔截</th>
+                        <th className="py-1.5 px-2 text-right">淨勝率</th>
+                        <th className="py-1.5 px-2 text-right">淨均 R (毛均 R)</th>
+                        <th className="py-1.5 px-2 text-right">淨 PF</th>
+                        <th className="py-1.5 px-2 text-right">淨 MDD</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {portfolioBacktestResult.symbolSummaries.map((sym) => (
+                        <tr key={sym.symbol}>
+                          <td className="py-1.5 px-2 font-semibold text-slate-100">
+                            {sym.symbol}
+                          </td>
+                          <td className="py-1.5 px-2 text-slate-300">
+                            {sym.status} · MTF=
+                            {sym.mtfHistoricalAligned ? 'ON' : 'OFF'}
+                          </td>
+                          <td className="py-1.5 px-2 text-right">
+                            {sym.acceptedTradesCount} / {sym.blockedTradesCount}
+                          </td>
+                          <td className="py-1.5 px-2 text-right">
+                            {sym.netWinRate !== null ? `${sym.netWinRate}%` : '--'}
+                          </td>
+                          <td className="py-1.5 px-2 text-right text-sky-300">
+                            {sym.netAverageR !== null
+                              ? `${sym.netAverageR}R`
+                              : '--'}{' '}
+                            (
+                            {sym.averageR !== null ? `${sym.averageR}R` : '--'})
+                          </td>
+                          <td className="py-1.5 px-2 text-right text-amber-300">
+                            {sym.netProfitFactor ?? '--'}
+                          </td>
+                          <td className="py-1.5 px-2 text-right text-rose-400">
+                            {sym.netMaxDrawdownR !== null
+                              ? `${sym.netMaxDrawdownR}R`
+                              : '--'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             {backtestError && (
               <div className="border border-rose-500/40 bg-rose-950/30 p-4 text-xs text-rose-200 font-mono">
                 {backtestError}
@@ -6594,6 +7937,17 @@ export default function App() {
                       >
                         Lookahead-Free:{' '}
                         {backtestResult.lookaheadFree ? 'VERIFIED (TRUE)' : 'FALSE'}
+                      </span>
+                      <span>·</span>
+                      <span
+                        className={
+                          backtestResult.mtfHistoricalAligned
+                            ? 'text-cyan-300 font-semibold'
+                            : 'text-slate-400'
+                        }
+                      >
+                        1h/4h 歷史共振:{' '}
+                        {backtestResult.mtfHistoricalAligned ? 'ON (無未來洩漏)' : 'OFF'}
                       </span>
                       <span>·</span>
                       <span className="text-sky-300">
@@ -6740,54 +8094,89 @@ export default function App() {
                     </div>
                     <div className="border border-slate-800 bg-slate-950 p-3.5">
                       <div className="font-sans text-xs text-slate-400">
-                        歷史紙上勝率 (winRate)
+                        歷史紙上勝率 (淨 / 毛)
                       </div>
                       <div className="mt-1 text-lg font-bold text-slate-100">
+                        {(backtestResult.netWinRate ??
+                          backtestResult.winRate ??
+                          backtestResult.winRatePercent) !== null
+                          ? `${backtestResult.netWinRate ?? backtestResult.winRate ?? backtestResult.winRatePercent}%`
+                          : 'null (NO_TRADES)'}
+                      </div>
+                      <div className="mt-1 text-[10px] font-sans text-slate-400">
+                        毛勝率:{' '}
                         {(backtestResult.winRate ??
                           backtestResult.winRatePercent) !== null
                           ? `${backtestResult.winRate ?? backtestResult.winRatePercent}%`
-                          : 'null (NO_TRADES)'}
-                      </div>
-                      <div className="mt-1 text-[10px] font-sans text-slate-500">
-                        僅歷史統計，非未來表現承諾
-                      </div>
-                    </div>
-                    <div className="border border-slate-800 bg-slate-950 p-3.5">
-                      <div className="font-sans text-xs text-slate-400">
-                        平均 R / 期望值 (expectancyR)
-                      </div>
-                      <div className="mt-1 text-lg font-bold text-sky-300">
-                        {backtestResult.averageR !== null &&
-                        backtestResult.averageR !== undefined
-                          ? `${backtestResult.averageR}R`
-                          : 'null (NO_TRADES)'}
-                      </div>
-                      <div className="mt-1 text-[11px] text-slate-400">
-                        Expectancy:{' '}
-                        {backtestResult.expectancyR !== null &&
-                        backtestResult.expectancyR !== undefined
-                          ? `${backtestResult.expectancyR}R`
                           : 'null'}
                       </div>
                     </div>
                     <div className="border border-slate-800 bg-slate-950 p-3.5">
                       <div className="font-sans text-xs text-slate-400">
-                        最大回撤 (maxDrawdownR)
+                        淨期望值 / 成本拖累
                       </div>
-                      <div className="mt-1 text-lg font-bold text-rose-400">
-                        {backtestResult.maxDrawdownR !== null
-                          ? `${backtestResult.maxDrawdownR} R`
-                          : 'null (NO_TRADES)'}
+                      <div
+                        className={`mt-1 text-lg font-bold ${
+                          (backtestResult.netExpectancyR ??
+                            backtestResult.expectancyR ??
+                            0) > 0
+                            ? 'text-emerald-400'
+                            : 'text-sky-300'
+                        }`}
+                      >
+                        {backtestResult.netExpectancyR !== null &&
+                        backtestResult.netExpectancyR !== undefined
+                          ? `${backtestResult.netExpectancyR}R`
+                          : backtestResult.averageR !== null &&
+                              backtestResult.averageR !== undefined
+                            ? `${backtestResult.averageR}R`
+                            : 'null (NO_TRADES)'}
+                      </div>
+                      <div className="mt-1 text-[11px] text-slate-400">
+                        毛 Expectancy:{' '}
+                        {backtestResult.expectancyR !== null &&
+                        backtestResult.expectancyR !== undefined
+                          ? `${backtestResult.expectancyR}R`
+                          : 'null'}
+                        {backtestResult.totalCostDragR !== null &&
+                        backtestResult.totalCostDragR !== undefined
+                          ? ` · 成本 -${backtestResult.totalCostDragR}R`
+                          : ''}
                       </div>
                     </div>
                     <div className="border border-slate-800 bg-slate-950 p-3.5">
                       <div className="font-sans text-xs text-slate-400">
-                        盈虧因子 (profitFactor)
+                        最大回撤 (淨 / 毛)
+                      </div>
+                      <div className="mt-1 text-lg font-bold text-rose-400">
+                        {backtestResult.netMaxDrawdownR !== null &&
+                        backtestResult.netMaxDrawdownR !== undefined
+                          ? `${backtestResult.netMaxDrawdownR} R`
+                          : backtestResult.maxDrawdownR !== null
+                            ? `${backtestResult.maxDrawdownR} R`
+                            : 'null (NO_TRADES)'}
+                      </div>
+                      <div className="mt-1 text-[10px] text-slate-400">
+                        毛 MDD:{' '}
+                        {backtestResult.maxDrawdownR !== null
+                          ? `${backtestResult.maxDrawdownR}R`
+                          : 'null'}
+                      </div>
+                    </div>
+                    <div className="border border-slate-800 bg-slate-950 p-3.5">
+                      <div className="font-sans text-xs text-slate-400">
+                        盈虧因子 (淨 PF / 毛 PF)
                       </div>
                       <div className="mt-1 text-lg font-bold text-amber-300">
-                        {backtestResult.profitFactor !== null
-                          ? backtestResult.profitFactor
-                          : 'null (NO_TRADES)'}
+                        {backtestResult.netProfitFactor !== null &&
+                        backtestResult.netProfitFactor !== undefined
+                          ? backtestResult.netProfitFactor
+                          : backtestResult.profitFactor !== null
+                            ? backtestResult.profitFactor
+                            : 'null (NO_TRADES)'}
+                      </div>
+                      <div className="mt-1 text-[10px] text-slate-400">
+                        毛 PF: {backtestResult.profitFactor ?? 'null'}
                       </div>
                     </div>
                     <div className="border border-slate-800 bg-slate-950 p-3.5">
@@ -6870,18 +8259,41 @@ export default function App() {
                                 {w.longCount ?? 0}/{w.shortCount ?? 0})
                               </td>
                               <td className="py-2 px-2.5 text-right">
-                                {w.winRate !== null ? `${w.winRate}%` : 'null'}
+                                {w.netWinRate !== null &&
+                                w.netWinRate !== undefined
+                                  ? `${w.netWinRate}%`
+                                  : w.winRate !== null
+                                    ? `${w.winRate}%`
+                                    : 'null'}
+                                {w.winRate !== null && (
+                                  <div className="text-[10px] text-slate-500">
+                                    毛 {w.winRate}%
+                                  </div>
+                                )}
                               </td>
                               <td className="py-2 px-2.5 text-right text-sky-300">
-                                {w.averageR !== null ? `${w.averageR}R` : 'null'}
+                                {w.netAverageR !== null &&
+                                w.netAverageR !== undefined
+                                  ? `${w.netAverageR}R`
+                                  : w.averageR !== null
+                                    ? `${w.averageR}R`
+                                    : 'null'}
+                                {w.averageR !== null && (
+                                  <div className="text-[10px] text-slate-500">
+                                    毛 {w.averageR}R
+                                  </div>
+                                )}
                               </td>
                               <td className="py-2 px-2.5 text-right text-rose-400">
-                                {w.maxDrawdownR !== null
-                                  ? `${w.maxDrawdownR}R`
-                                  : 'null'}
+                                {w.netMaxDrawdownR !== null &&
+                                w.netMaxDrawdownR !== undefined
+                                  ? `${w.netMaxDrawdownR}R`
+                                  : w.maxDrawdownR !== null
+                                    ? `${w.maxDrawdownR}R`
+                                    : 'null'}
                               </td>
                               <td className="py-2 px-2.5 text-right text-amber-300">
-                                {w.profitFactor ?? 'null'}
+                                {w.netProfitFactor ?? w.profitFactor ?? 'null'}
                               </td>
                               <td className="py-2 px-2.5 text-[11px] text-slate-300">
                                 {w.averageHoldingTime ?? 'null'}
@@ -6927,15 +8339,22 @@ export default function App() {
                             <div className="flex items-center gap-3">
                               <span
                                 className={
-                                  tr.rMultiple > 0
+                                  (tr.netRMultiple ?? tr.rMultiple) > 0
                                     ? 'text-emerald-400 font-bold'
-                                    : tr.rMultiple < 0
+                                    : (tr.netRMultiple ?? tr.rMultiple) < 0
                                       ? 'text-rose-400 font-bold'
                                       : 'text-slate-300'
                                 }
                               >
-                                {tr.outcome} ({tr.rMultiple > 0 ? '+' : ''}
-                                {tr.rMultiple}R)
+                                {tr.outcome} (淨{' '}
+                                {(tr.netRMultiple ?? tr.rMultiple) > 0 ? '+' : ''}
+                                {tr.netRMultiple ?? tr.rMultiple}R · 毛{' '}
+                                {tr.rMultiple > 0 ? '+' : ''}
+                                {tr.rMultiple}R
+                                {typeof tr.totalCostR === 'number'
+                                  ? ` · 成本 -${tr.totalCostR}R`
+                                  : ''}
+                                )
                               </span>
                               <span className="text-slate-400 text-[11px]">
                                 點擊展開 Decision Trace & Point-in-Time Evidence
@@ -7000,109 +8419,169 @@ export default function App() {
               </div>
             )}
 
-            {/* Persisted SQLite Backtest Reports Table */}
-            <div className="space-y-2 pt-2">
-              <h3 className="text-sm font-semibold text-slate-200">
-                SQLite 持久化歷史回測報表庫 ({backtestReports.length} 筆)
-              </h3>
-              <div className="border border-slate-800 bg-slate-950 overflow-x-auto">
-                <table className="w-full text-left text-xs font-mono tabular-nums">
-                  <thead className="border-b border-slate-800 text-slate-400">
-                    <tr>
-                      <th className="py-2.5 px-3">ID / RunID</th>
-                      <th className="py-2.5 px-3">建立時間</th>
-                      <th className="py-2.5 px-3">標的 / 交易所 / 週期</th>
-                      <th className="py-2.5 px-3">資料分類 / 狀態</th>
-                      <th className="py-2.5 px-3 text-right">驗證 K 線數</th>
-                      <th className="py-2.5 px-3 text-right">交易數 (多/空)</th>
-                      <th className="py-2.5 px-3 text-right">紙上勝率</th>
-                      <th className="py-2.5 px-3 text-right">Expectancy R</th>
-                      <th className="py-2.5 px-3 text-right">Max DD</th>
-                      <th className="py-2.5 px-3 text-right">Profit Factor</th>
-                      <th className="py-2.5 px-3">共用規則版本</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/70">
-                    {backtestReports.length === 0 ? (
-                      <tr>
-                        <td
-                          colSpan={11}
-                          className="py-6 text-center font-sans text-slate-500"
-                        >
-                          尚無歷史回測報表紀錄
-                        </td>
-                      </tr>
-                    ) : (
-                      backtestReports.map((rep) => (
-                        <tr key={rep.id ?? rep.backtestRunId}>
-                          <td className="py-2 px-3 text-slate-400">
-                            #{rep.id ?? '-'}{' '}
-                            {rep.backtestRunId
-                              ? `(${rep.backtestRunId.slice(0, 16)})`
-                              : ''}
-                          </td>
-                          <td className="py-2 px-3 text-slate-300">
-                            {rep.createdAt
-                              ? new Date(rep.createdAt).toLocaleTimeString(
-                                  'zh-TW',
-                                  { hour12: false }
-                                )
-                              : ''}
-                          </td>
-                          <td className="py-2 px-3 font-semibold text-slate-100">
-                            {rep.symbol} · {rep.exchange} · {rep.timeframe}
-                          </td>
-                          <td className="py-2 px-3">
-                            <span className="text-amber-300 mr-1.5">
-                              [{rep.dataClassification ?? (rep.provenance.isDemo ? 'DEMO' : 'REAL')}]
-                            </span>
-                            <span
-                              className={
-                                rep.status === 'COMPLETED'
-                                  ? 'text-emerald-400'
-                                  : 'text-amber-300'
-                              }
-                            >
-                              {rep.status}
-                            </span>
-                          </td>
-                          <td className="py-2 px-3 text-right">
-                            {rep.confirmedBarsTested}
-                          </td>
-                          <td className="py-2 px-3 text-right">
-                            {rep.tradeCount ?? rep.totalTrades ?? 'N/A'}
-                            {rep.longCount !== undefined && rep.longCount !== null
-                              ? ` (${rep.longCount}/${rep.shortCount ?? 0})`
-                              : ''}
-                          </td>
-                          <td className="py-2 px-3 text-right">
-                            {(rep.winRate ?? rep.winRatePercent) !== null
-                              ? `${rep.winRate ?? rep.winRatePercent}%`
-                              : 'N/A'}
-                          </td>
-                          <td className="py-2 px-3 text-right text-sky-300">
-                            {rep.expectancyR !== null &&
-                            rep.expectancyR !== undefined
-                              ? `${rep.expectancyR}R`
-                              : 'N/A'}
-                          </td>
-                          <td className="py-2 px-3 text-right text-rose-400">
-                            {rep.maxDrawdownR !== null
-                              ? `${rep.maxDrawdownR}R`
-                              : 'N/A'}
-                          </td>
-                          <td className="py-2 px-3 text-right text-amber-300">
-                            {rep.profitFactor ?? 'N/A'}
-                          </td>
-                          <td className="py-2 px-3 text-[11px] text-slate-400">
-                            {rep.ruleVersion}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
+            {/* Auto-Backtest Scheduler & Persisted SQLite Backtest Reports Table */}
+            <div className="space-y-4 pt-2">
+              <AutoBacktestControlPanel
+                status={autoBacktestStatus}
+                loading={autoBacktestLoading}
+                watchlistCount={watchlist.length}
+                dataMode={dataMode}
+                selectedExchange={selectedExchange}
+                sourceFilter={backtestSourceFilter}
+                searchQuery={backtestSearchQuery}
+                onChangeSourceFilter={setBacktestSourceFilter}
+                onChangeSearchQuery={setBacktestSearchQuery}
+                onUpdateConfig={updateAutoBacktestConfig}
+                onRunNow={runAutoBacktestNow}
+              />
+
+              {(() => {
+                const cleanQuery = backtestSearchQuery.trim().toUpperCase();
+                const visibleReports = backtestReports.filter((rep) => {
+                  const src = rep.triggerSource ?? 'MANUAL';
+                  if (
+                    backtestSourceFilter !== 'ALL' &&
+                    src !== backtestSourceFilter
+                  ) {
+                    return false;
+                  }
+                  if (cleanQuery && !rep.symbol.toUpperCase().includes(cleanQuery)) {
+                    return false;
+                  }
+                  return true;
+                });
+
+                return (
+                  <div className="space-y-2">
+                    <h3 className="text-sm font-semibold text-slate-200">
+                      SQLite 持久化歷史回測報表庫 (顯示 {visibleReports.length} /{' '}
+                      {backtestReports.length} 筆)
+                    </h3>
+                    <div className="border border-slate-800 bg-slate-950 overflow-x-auto">
+                      <table className="w-full text-left text-xs font-mono tabular-nums">
+                        <thead className="border-b border-slate-800 text-slate-400">
+                          <tr>
+                            <th className="py-2.5 px-3">ID / RunID</th>
+                            <th className="py-2.5 px-3">來源</th>
+                            <th className="py-2.5 px-3">建立時間</th>
+                            <th className="py-2.5 px-3">標的 / 交易所 / 週期</th>
+                            <th className="py-2.5 px-3">資料分類 / 狀態</th>
+                            <th className="py-2.5 px-3 text-right">驗證 K 線數</th>
+                            <th className="py-2.5 px-3 text-right">交易數 (多/空)</th>
+                            <th className="py-2.5 px-3 text-right">紙上勝率</th>
+                            <th className="py-2.5 px-3 text-right">Expectancy R</th>
+                            <th className="py-2.5 px-3 text-right">Max DD</th>
+                            <th className="py-2.5 px-3 text-right">Profit Factor</th>
+                            <th className="py-2.5 px-3">共用規則版本</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {visibleReports.length === 0 ? (
+                            <tr>
+                              <td
+                                colSpan={12}
+                                className="py-6 text-center font-sans text-slate-500"
+                              >
+                                {backtestReports.length === 0
+                                  ? '尚無歷史回測報表紀錄'
+                                  : '目前篩選條件下無相符回測報表紀錄'}
+                              </td>
+                            </tr>
+                          ) : (
+                            visibleReports.map((rep) => {
+                              const isAuto =
+                                rep.triggerSource === 'AUTO_SCHEDULED';
+                              return (
+                                <tr key={rep.id ?? rep.backtestRunId}>
+                                  <td className="py-2 px-3 text-slate-400">
+                                    #{rep.id ?? '-'}{' '}
+                                    {rep.backtestRunId
+                                      ? `(${rep.backtestRunId.slice(0, 16)})`
+                                      : ''}
+                                  </td>
+                                  <td className="py-2 px-3 whitespace-nowrap">
+                                    <span
+                                      className={
+                                        isAuto
+                                          ? 'text-sky-300 font-semibold'
+                                          : 'text-slate-400'
+                                      }
+                                    >
+                                      {isAuto ? '自動排程' : '手動'}
+                                    </span>
+                                  </td>
+                                  <td className="py-2 px-3 text-slate-300">
+                                    {rep.createdAt
+                                      ? new Date(
+                                          rep.createdAt
+                                        ).toLocaleTimeString('zh-TW', {
+                                          hour12: false,
+                                        })
+                                      : ''}
+                                  </td>
+                                  <td className="py-2 px-3 font-semibold text-slate-100">
+                                    {rep.symbol} · {rep.exchange} ·{' '}
+                                    {rep.timeframe}
+                                  </td>
+                                  <td className="py-2 px-3">
+                                    <span className="text-amber-300 mr-1.5">
+                                      [
+                                      {rep.dataClassification ??
+                                        (rep.provenance.isDemo ? 'DEMO' : 'REAL')}
+                                      ]
+                                    </span>
+                                    <span
+                                      className={
+                                        rep.status === 'COMPLETED'
+                                          ? 'text-emerald-400'
+                                          : 'text-amber-300'
+                                      }
+                                    >
+                                      {rep.status}
+                                    </span>
+                                  </td>
+                                  <td className="py-2 px-3 text-right">
+                                    {rep.confirmedBarsTested}
+                                  </td>
+                                  <td className="py-2 px-3 text-right">
+                                    {rep.tradeCount ?? rep.totalTrades ?? 'N/A'}
+                                    {rep.longCount !== undefined &&
+                                    rep.longCount !== null
+                                      ? ` (${rep.longCount}/${rep.shortCount ?? 0})`
+                                      : ''}
+                                  </td>
+                                  <td className="py-2 px-3 text-right">
+                                    {(rep.winRate ?? rep.winRatePercent) !== null
+                                      ? `${rep.winRate ?? rep.winRatePercent}%`
+                                      : 'N/A'}
+                                  </td>
+                                  <td className="py-2 px-3 text-right text-sky-300">
+                                    {rep.expectancyR !== null &&
+                                    rep.expectancyR !== undefined
+                                      ? `${rep.expectancyR}R`
+                                      : 'N/A'}
+                                  </td>
+                                  <td className="py-2 px-3 text-right text-rose-400">
+                                    {rep.maxDrawdownR !== null
+                                      ? `${rep.maxDrawdownR}R`
+                                      : 'N/A'}
+                                  </td>
+                                  <td className="py-2 px-3 text-right text-amber-300">
+                                    {rep.profitFactor ?? 'N/A'}
+                                  </td>
+                                  <td className="py-2 px-3 text-[11px] text-slate-400">
+                                    {rep.ruleVersion}
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </section>
         )}
@@ -7143,124 +8622,666 @@ export default function App() {
               </div>
             </div>
 
-            <div className="border border-slate-800 bg-slate-950 overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono tabular-nums">
-                <thead className="border-b border-slate-800 text-slate-400">
-                  <tr>
-                    <th className="py-2.5 px-3">ID</th>
-                    <th className="py-2.5 px-3">標的 / 交易所</th>
-                    <th className="py-2.5 px-3">方向 / 狀態</th>
-                    <th className="py-2.5 px-3 text-right">紙上記錄價</th>
-                    <th className="py-2.5 px-3 text-right">結構失效參考</th>
-                    <th className="py-2.5 px-3 text-right">結構目標參考</th>
-                    <th className="py-2.5 px-3 text-right">目前/結算價</th>
-                    <th className="py-2.5 px-3 text-right">紙上 R 值</th>
-                    <th className="py-2.5 px-3">資料來源與時間</th>
-                    <th className="py-2.5 px-3 text-right">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/70">
-                  {paperLedger.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={10}
-                        className="py-8 text-center font-sans text-slate-500"
-                      >
-                        目前尚無紙上交易觀察紀錄。請在雷達選取幣種後點擊「登記紙上觀察帳本」。
-                      </td>
-                    </tr>
-                  ) : (
-                    paperLedger.map((entry) => (
-                      <tr key={entry.id}>
-                        <td className="py-2.5 px-3 text-slate-400">
-                          #{entry.id}
-                        </td>
-                        <td className="py-2.5 px-3 font-semibold text-slate-100">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span>{entry.symbol}</span>
-                            {(entry.isDemo ||
-                              entry.provenance.isDemo ||
-                              entry.exchange === 'demo_synthetic') && (
-                              <span className="rounded border border-amber-500/50 bg-amber-950/60 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
-                                {entry.demoIsolationLabel ??
-                                  'DEMO · 非即時資料 · 不計入 Live Paper 績效'}
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[10px] text-slate-400">
-                            {entry.exchange} · {entry.timeframe}
-                          </div>
-                        </td>
-                        <td className="py-2.5 px-3">
-                          <span
-                            className={
-                              entry.side === 'LONG'
-                                ? 'text-emerald-400 font-semibold'
-                                : 'text-rose-400 font-semibold'
-                            }
-                          >
-                            {entry.side}
-                          </span>{' '}
-                          ·{' '}
-                          <span className="text-slate-300">{entry.status}</span>
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          ${formatPriceDynamic(entry.entryPrice)}
-                        </td>
-                        <td className="py-2.5 px-3 text-right text-slate-400">
-                          ${formatPriceDynamic(entry.invalidationPrice)}
-                        </td>
-                        <td className="py-2.5 px-3 text-right text-slate-400">
-                          ${formatPriceDynamic(entry.targetPrice)}
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          $
-                          {formatPriceDynamic(
-                            entry.exitPrice ?? entry.currentPrice
+            {/* Paper Portfolio Net BTC Exposure & Directional Concentration */}
+            {(() => {
+              const allOpenEntries = paperLedger.filter(
+                (e) => e.status === 'OPEN'
+              );
+              const waitingLimitCount = allOpenEntries.filter(
+                (e) => e.fillStatus === 'WAITING_LIMIT'
+              ).length;
+              const openEntries = allOpenEntries.filter(
+                (e) => (e.fillStatus ?? 'FILLED') === 'FILLED'
+              );
+              const longCount = openEntries.filter(
+                (e) => e.side === 'LONG'
+              ).length;
+              const shortCount = openEntries.filter(
+                (e) => e.side === 'SHORT'
+              ).length;
+              const netDirectionScore = longCount - shortCount;
+              const corrBySymbol = new Map(
+                (scanData?.candidates ?? []).map((c) => [
+                  c.symbol,
+                  c.btcCorrelation,
+                ])
+              );
+              let highCoupledOpenCount = 0;
+              const betaSamples: number[] = [];
+              for (const e of openEntries) {
+                const corr = corrBySymbol.get(e.symbol);
+                if (corr && corr.status === 'READY' && !corr.isBenchmark) {
+                  if (
+                    corr.tier === 'HIGH_COUPLED' ||
+                    (corr.pearson15m ?? 0) >= 0.7
+                  ) {
+                    highCoupledOpenCount++;
+                  }
+                  if (typeof corr.beta15m === 'number') {
+                    betaSamples.push(
+                      e.side === 'LONG' ? corr.beta15m : -corr.beta15m
+                    );
+                  }
+                } else if (e.symbol === 'BTCUSDT') {
+                  betaSamples.push(e.side === 'LONG' ? 1 : -1);
+                }
+              }
+              const netBtcBeta =
+                betaSamples.length > 0
+                  ? betaSamples.reduce((a, b) => a + b, 0) /
+                    Math.max(1, openEntries.length)
+                  : null;
+              return (
+                <div
+                  id="paper-portfolio-btc-exposure"
+                  className="grid grid-cols-2 gap-3 sm:grid-cols-4 font-mono tabular-nums text-xs"
+                >
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/90 p-3">
+                    <div className="font-sans text-[11px] text-slate-400">
+                      已成交持倉 / 待觸價限價單
+                    </div>
+                    <div className="mt-1 text-sm font-bold text-slate-100">
+                      {openEntries.length} 筆 (多 {longCount} / 空 {shortCount})
+                      {waitingLimitCount > 0 && (
+                        <span className="ml-1.5 text-[11px] text-amber-300">
+                          · 待觸價 {waitingLimitCount}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/90 p-3">
+                    <div className="font-sans text-[11px] text-slate-400">
+                      組合淨方向傾向 (已成交)
+                    </div>
+                    <div
+                      className={`mt-1 text-sm font-bold ${
+                        netDirectionScore > 0
+                          ? 'text-emerald-400'
+                          : netDirectionScore < 0
+                            ? 'text-rose-400'
+                            : 'text-slate-200'
+                      }`}
+                    >
+                      {netDirectionScore > 0
+                        ? `淨偏多 (+${netDirectionScore})`
+                        : netDirectionScore < 0
+                          ? `淨偏空 (${netDirectionScore})`
+                          : '多空均衡 (0)'}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/90 p-3">
+                    <div className="font-sans text-[11px] text-slate-400">
+                      高 BTC 連動持倉 (r ≥ 0.70)
+                    </div>
+                    <div
+                      className={`mt-1 text-sm font-bold ${
+                        highCoupledOpenCount >= 2
+                          ? 'text-amber-300'
+                          : 'text-slate-100'
+                      }`}
+                    >
+                      {highCoupledOpenCount} 筆
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/90 p-3">
+                    <div className="font-sans text-[11px] text-slate-400">
+                      等效 BTC 淨曝險 Beta
+                    </div>
+                    <div className="mt-1 text-sm font-bold text-sky-300">
+                      {netBtcBeta !== null
+                        ? `${netBtcBeta >= 0 ? '+' : ''}${netBtcBeta.toFixed(2)}x`
+                        : openEntries.length === 0
+                          ? '無持倉 (0.00x)'
+                          : '待累積對齊'}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Multi-Track Paper Strategy & Pullback Effectiveness Comparison Panel */}
+            {(() => {
+              const activeComparison =
+                paperTrackScope === 'ALL_INCLUDING_DEMO'
+                  ? trackComparisonAll
+                  : trackComparisonLive;
+              const tracks = activeComparison?.tracks ?? [];
+              const trackColors: Record<
+                PaperStrategyTrack,
+                { border: string; title: string; badge: string }
+              > = {
+                EARLY_IGNITION: {
+                  border: 'border-cyan-500/30 bg-cyan-950/15',
+                  title: 'text-cyan-300',
+                  badge: 'bg-cyan-500/15 text-cyan-200',
+                },
+                FORMAL_SMC_MARKET: {
+                  border: 'border-emerald-500/30 bg-emerald-950/15',
+                  title: 'text-emerald-300',
+                  badge: 'bg-emerald-500/15 text-emerald-200',
+                },
+                SMC_PULLBACK_LIMIT: {
+                  border: 'border-amber-500/35 bg-amber-950/15',
+                  title: 'text-amber-300',
+                  badge: 'bg-amber-500/15 text-amber-200',
+                },
+                MANUAL_OBSERVATION: {
+                  border: 'border-slate-800 bg-slate-950/80',
+                  title: 'text-slate-300',
+                  badge: 'bg-slate-800 text-slate-300',
+                },
+              };
+
+              const waitingCount = paperLedger.filter(
+                (e) => e.status === 'OPEN' && e.fillStatus === 'WAITING_LIMIT'
+              ).length;
+              const expiredCount = paperLedger.filter(
+                (e) => e.status === 'CLOSED_EXPIRED'
+              ).length;
+
+              const visibleEntries = paperLedger.filter((e) => {
+                if (paperTrackFilter === 'ALL') return true;
+                if (paperTrackFilter === 'WAITING_LIMIT') {
+                  return e.status === 'OPEN' && e.fillStatus === 'WAITING_LIMIT';
+                }
+                if (paperTrackFilter === 'EXPIRED_LIMIT') {
+                  return e.status === 'CLOSED_EXPIRED';
+                }
+                return (e.strategyTrack ?? 'MANUAL_OBSERVATION') === paperTrackFilter;
+              });
+
+              const trackBadgeLabel = (t?: PaperStrategyTrack) => {
+                if (t === 'EARLY_IGNITION') return '早鳥起漲';
+                if (t === 'FORMAL_SMC_MARKET') return '正式 SMC 現價';
+                if (t === 'SMC_PULLBACK_LIMIT') return 'FVG/OB 回踩限價';
+                return '一般觀察';
+              };
+
+              const formatExpiredReasonZh = (
+                reason?: PaperLedgerEntry['expiredReason']
+              ) => {
+                if (reason === 'TARGET_MISSED') return '未回踩即達標作廢';
+                if (reason === 'INVALIDATED_BEFORE_FILL') return '結構提前失效作廢';
+                if (reason === 'TTL_TIMEOUT') return 'TTL 逾時過期作廢';
+                if (reason === 'MANUAL_CANCEL') return '手動撤銷掛單';
+                return '已過期作廢';
+              };
+
+              const formatTtlRemaining = (expiresAt?: string | null) => {
+                if (!expiresAt) return null;
+                const remMs = Date.parse(expiresAt) - Date.now();
+                if (!Number.isFinite(remMs)) return null;
+                if (remMs <= 0) return { label: '待掃描清理 (已到期)', urgent: true };
+                const totalMins = Math.floor(remMs / 60_000);
+                const hrs = Math.floor(totalMins / 60);
+                const mins = totalMins % 60;
+                return {
+                  label: hrs > 0 ? `TTL 剩 ${hrs}h ${mins}m` : `TTL 剩 ${mins}m`,
+                  urgent: totalMins <= 30,
+                };
+              };
+
+              return (
+                <>
+                  <div
+                    id="paper-track-comparison-panel"
+                    className="rounded-xl border border-slate-800 bg-slate-950/80 p-4 space-y-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-bold text-slate-100">
+                          分軌勝率與回踩成效統計 (早鳥 vs 正式 SMC 現價 vs FVG/OB 回踩限價)
+                        </span>
+                        {activeComparison?.pullbackVsChaseDeltaR !== null &&
+                          activeComparison?.pullbackVsChaseDeltaR !== undefined && (
+                            <span
+                              className={`rounded px-2 py-0.5 font-mono text-[10px] font-semibold ${
+                                (activeComparison.netPullbackVsChaseDeltaR ??
+                                  activeComparison.pullbackVsChaseDeltaR) >= 0
+                                  ? 'bg-emerald-500/15 text-emerald-300'
+                                  : 'bg-rose-500/15 text-rose-300'
+                              }`}
+                            >
+                              回踩 vs 現價追單 Delta: 淨{' '}
+                              {activeComparison.netPullbackVsChaseDeltaR !==
+                              null &&
+                              activeComparison.netPullbackVsChaseDeltaR !==
+                                undefined
+                                ? `${activeComparison.netPullbackVsChaseDeltaR >= 0 ? '+' : ''}${activeComparison.netPullbackVsChaseDeltaR}R`
+                                : '--'}{' '}
+                              (毛{' '}
+                              {activeComparison.pullbackVsChaseDeltaR >= 0
+                                ? '+'
+                                : ''}
+                              {activeComparison.pullbackVsChaseDeltaR}R)
+                            </span>
                           )}
-                        </td>
-                        <td
-                          className={`py-2.5 px-3 text-right font-semibold ${
-                            entry.pnlR > 0
-                              ? 'text-emerald-400'
-                              : entry.pnlR < 0
-                                ? 'text-rose-400'
-                                : 'text-slate-300'
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() => setPaperTrackScope('LIVE_ONLY')}
+                          className={`rounded-lg border px-2.5 py-1 cursor-pointer ${
+                            paperTrackScope === 'LIVE_ONLY'
+                              ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-200 font-semibold'
+                              : 'border-slate-700 bg-slate-900 text-slate-400'
                           }`}
                         >
-                          {entry.pnlR > 0 ? '+' : ''}
-                          {entry.pnlR}R ({entry.pnlPercent > 0 ? '+' : ''}
-                          {entry.pnlPercent}%)
-                        </td>
-                        <td className="py-2.5 px-3 text-[10px] text-slate-400">
-                          <div>{entry.provenance.source.slice(0, 38)}</div>
-                          <div>
-                            {new Date(entry.openedAt).toLocaleString('zh-TW', {
-                              hour12: false,
-                            })}
+                          僅統計 Live 真實紀錄
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPaperTrackScope('ALL_INCLUDING_DEMO')}
+                          className={`rounded-lg border px-2.5 py-1 cursor-pointer ${
+                            paperTrackScope === 'ALL_INCLUDING_DEMO'
+                              ? 'border-amber-500/60 bg-amber-500/15 text-amber-200 font-semibold'
+                              : 'border-slate-700 bg-slate-900 text-slate-400'
+                          }`}
+                        >
+                          含 Demo 模擬對照
+                        </button>
+                      </div>
+                    </div>
+
+                    {activeComparison &&
+                      paperTrackScope === 'LIVE_ONLY' &&
+                      activeComparison.totalDemoExcluded > 0 && (
+                        <div className="text-[11px] text-amber-300/90">
+                          已嚴格隔離排除 {activeComparison.totalDemoExcluded} 筆 Demo 模擬紀錄（可切換右側「含 Demo 模擬對照」檢視模擬統計）。
+                        </div>
+                      )}
+
+                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4 font-mono tabular-nums text-xs">
+                      {tracks.map((tr) => {
+                        const style = trackColors[tr.track];
+                        const isLeader = activeComparison?.leaderTrack === tr.track;
+                        return (
+                          <div
+                            key={tr.track}
+                            className={`rounded-xl border p-3 space-y-1.5 ${style.border}`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span className={`font-sans text-xs font-bold ${style.title}`}>
+                                {tr.labelZh}
+                              </span>
+                              {isLeader && (
+                                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-bold text-amber-300">
+                                  平均 R 領先
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-baseline justify-between gap-2">
+                              <span className="text-lg font-bold text-slate-100">
+                                {tr.netWinRatePercent !== null &&
+                                tr.netWinRatePercent !== undefined
+                                  ? `${tr.netWinRatePercent}%`
+                                  : tr.winRatePercent !== null
+                                    ? `${tr.winRatePercent}%`
+                                    : '尚無結算'}
+                              </span>
+                              <span
+                                className={`text-xs font-bold ${
+                                  (tr.netAvgPnlR ?? tr.avgPnlR ?? 0) > 0
+                                    ? 'text-emerald-400'
+                                    : (tr.netAvgPnlR ?? tr.avgPnlR ?? 0) < 0
+                                      ? 'text-rose-400'
+                                      : 'text-slate-400'
+                                }`}
+                              >
+                                {(tr.netAvgPnlR ?? tr.avgPnlR) !== null
+                                  ? `淨均 ${(tr.netAvgPnlR ?? tr.avgPnlR)! > 0 ? '+' : ''}${tr.netAvgPnlR ?? tr.avgPnlR}R`
+                                  : '淨均 --'}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 flex flex-wrap items-center justify-between gap-1">
+                              <span>
+                                總 {tr.totalEntries} · 待觸價 {tr.waitingLimitCount} · 已結 {tr.closedCount}
+                              </span>
+                              <span>
+                                淨累計{' '}
+                                {(tr.netTotalPnlR ?? tr.totalPnlR) > 0 ? '+' : ''}
+                                {tr.netTotalPnlR ?? tr.totalPnlR}R (毛{' '}
+                                {tr.totalPnlR > 0 ? '+' : ''}
+                                {tr.totalPnlR}R)
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 flex flex-wrap items-center justify-between gap-1">
+                              <span>
+                                勝/敗 {tr.winCount}/{tr.lossCount}
+                                {tr.expiredLimitCount > 0
+                                  ? ` · 過期 ${tr.expiredLimitCount}`
+                                  : ''}
+                              </span>
+                              <span>
+                                {tr.track === 'SMC_PULLBACK_LIMIT' &&
+                                tr.fillRatePercent !== null
+                                  ? `觸價率 ${tr.fillRatePercent}% · `
+                                  : ''}
+                                淨PF{' '}
+                                {(tr.netProfitFactor ?? tr.profitFactor) !== null
+                                  ? tr.netProfitFactor ?? tr.profitFactor
+                                  : '--'}
+                                {tr.avgCostDragR !== null &&
+                                tr.avgCostDragR !== undefined
+                                  ? ` · 成本 -${tr.avgCostDragR}R`
+                                  : ''}
+                              </span>
+                            </div>
                           </div>
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          {entry.status === 'OPEN' ? (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                closePaperPosition(entry.id, entry.currentPrice)
-                              }
-                              className="rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-800 cursor-pointer"
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Ledger Track Filter Bar */}
+                  <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                    {(
+                      [
+                        { key: 'ALL', label: `全部紀錄 (${paperLedger.length})` },
+                        { key: 'EARLY_IGNITION', label: '早鳥起漲' },
+                        { key: 'FORMAL_SMC_MARKET', label: '正式 SMC 現價' },
+                        { key: 'SMC_PULLBACK_LIMIT', label: 'FVG/OB 回踩限價' },
+                        {
+                          key: 'WAITING_LIMIT',
+                          label: `待觸價掛單 (${waitingCount})`,
+                        },
+                        {
+                          key: 'EXPIRED_LIMIT',
+                          label: `已過期/撤銷 (${expiredCount})`,
+                        },
+                      ] as const
+                    ).map((f) => (
+                      <button
+                        key={f.key}
+                        type="button"
+                        onClick={() => setPaperTrackFilter(f.key)}
+                        className={`rounded-lg border px-2.5 py-1 cursor-pointer ${
+                          paperTrackFilter === f.key
+                            ? 'border-amber-500/60 bg-amber-500/15 text-amber-200 font-semibold'
+                            : 'border-slate-800 bg-slate-950 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="border border-slate-800 bg-slate-950 overflow-x-auto">
+                    <table className="w-full text-left text-xs font-mono tabular-nums">
+                      <thead className="border-b border-slate-800 text-slate-400">
+                        <tr>
+                          <th className="py-2.5 px-3">ID</th>
+                          <th className="py-2.5 px-3">標的 / 軌道</th>
+                          <th className="py-2.5 px-3">方向 / 成交與效期</th>
+                          <th className="py-2.5 px-3 text-right">進場/掛單價</th>
+                          <th className="py-2.5 px-3 text-right">結構失效參考</th>
+                          <th className="py-2.5 px-3 text-right">結構目標參考</th>
+                          <th className="py-2.5 px-3 text-right">目前/結算價</th>
+                          <th className="py-2.5 px-3 text-right">紙上 R 值</th>
+                          <th className="py-2.5 px-3">資料來源與時間</th>
+                          <th className="py-2.5 px-3 text-right">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {visibleEntries.length === 0 ? (
+                          <tr>
+                            <td
+                              colSpan={10}
+                              className="py-8 text-center font-sans text-slate-500"
                             >
-                              紙上平倉結算
-                            </button>
-                          ) : (
-                            <span className="text-slate-500">已結算</span>
-                          )}
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
+                              目前此篩選條件下尚無紙上交易觀察紀錄。請在雷達選取幣種後點擊「登記紙上觀察帳本」、「登記早鳥紙上單」或「掛回踩紙上限價單」。
+                            </td>
+                          </tr>
+                        ) : (
+                          visibleEntries.map((entry) => {
+                            const isWaitingLimit =
+                              entry.status === 'OPEN' &&
+                              entry.fillStatus === 'WAITING_LIMIT';
+                            const isExpiredLimit =
+                              entry.status === 'CLOSED_EXPIRED';
+                            const limitDistPct =
+                              entry.currentPrice > 0
+                                ? ((entry.entryPrice - entry.currentPrice) /
+                                    entry.currentPrice) *
+                                  100
+                                : null;
+                            const isFarWaitingLimit =
+                              isWaitingLimit &&
+                              limitDistPct !== null &&
+                              Math.abs(limitDistPct) > 3.5;
+                            const ttlInfo = isWaitingLimit
+                              ? formatTtlRemaining(entry.expiresAt)
+                              : null;
+
+                            return (
+                              <tr key={entry.id}>
+                                <td className="py-2.5 px-3 text-slate-400">
+                                  #{entry.id}
+                                </td>
+                                <td className="py-2.5 px-3 font-semibold text-slate-100">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span>{entry.symbol}</span>
+                                    <span
+                                      className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                                        entry.strategyTrack === 'EARLY_IGNITION'
+                                          ? 'bg-cyan-500/15 text-cyan-300'
+                                          : entry.strategyTrack ===
+                                              'SMC_PULLBACK_LIMIT'
+                                            ? 'bg-amber-500/15 text-amber-300'
+                                            : entry.strategyTrack ===
+                                                'FORMAL_SMC_MARKET'
+                                              ? 'bg-emerald-500/15 text-emerald-300'
+                                              : 'bg-slate-800 text-slate-300'
+                                      }`}
+                                    >
+                                      {trackBadgeLabel(entry.strategyTrack)}
+                                    </span>
+                                    {(entry.isDemo ||
+                                      entry.provenance.isDemo ||
+                                      entry.exchange === 'demo_synthetic') && (
+                                      <span className="rounded border border-amber-500/50 bg-amber-950/60 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                                        {entry.demoIsolationLabel ??
+                                          'DEMO · 非即時資料 · 不計入 Live Paper 績效'}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[10px] text-slate-400">
+                                    {entry.exchange} · {entry.timeframe}
+                                    {entry.entryAnchorLabel
+                                      ? ` · ${entry.entryAnchorLabel}`
+                                      : ''}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div>
+                                    <span
+                                      className={
+                                        entry.side === 'LONG'
+                                          ? 'text-emerald-400 font-semibold'
+                                          : 'text-rose-400 font-semibold'
+                                      }
+                                    >
+                                      {entry.side}
+                                    </span>{' '}
+                                    ·{' '}
+                                    <span className="text-slate-300">
+                                      {entry.status}
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] mt-0.5 space-y-0.5">
+                                    {isWaitingLimit ? (
+                                      <>
+                                        <div className="flex flex-wrap items-center gap-1 text-amber-300">
+                                          <span>待觸價 (WAITING_LIMIT)</span>
+                                          {limitDistPct !== null && (
+                                            <span
+                                              className={
+                                                isFarWaitingLimit
+                                                  ? 'text-rose-300 font-semibold'
+                                                  : 'text-sky-300'
+                                              }
+                                            >
+                                              · 距觸價{' '}
+                                              {limitDistPct >= 0 ? '+' : ''}
+                                              {limitDistPct.toFixed(2)}%
+                                              {isFarWaitingLimit ? ' (偏遠)' : ''}
+                                            </span>
+                                          )}
+                                        </div>
+                                        {ttlInfo && (
+                                          <div
+                                            className={
+                                              ttlInfo.urgent
+                                                ? 'text-rose-300 font-semibold'
+                                                : 'text-slate-400'
+                                            }
+                                          >
+                                            {ttlInfo.label}
+                                          </div>
+                                        )}
+                                      </>
+                                    ) : isExpiredLimit ? (
+                                      <span className="text-slate-400">
+                                        {formatExpiredReasonZh(entry.expiredReason)}
+                                      </span>
+                                    ) : (
+                                      <span className="text-slate-400">
+                                        已成交 (FILLED)
+                                      </span>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  ${formatPriceDynamic(entry.entryPrice)}
+                                </td>
+                                <td className="py-2.5 px-3 text-right text-slate-400 tabular-nums">
+                                  <div>${formatPriceDynamic(entry.invalidationPrice)}</div>
+                                  {entry.breakevenArmed &&
+                                    entry.trailingStopPrice && (
+                                      <div className="text-[10px] text-emerald-400">
+                                        +1R 保本 $
+                                        {formatPriceDynamic(
+                                          entry.trailingStopPrice
+                                        )}
+                                      </div>
+                                    )}
+                                </td>
+                                <td className="py-2.5 px-3 text-right text-slate-400">
+                                  ${formatPriceDynamic(entry.targetPrice)}
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  $
+                                  {formatPriceDynamic(
+                                    entry.exitPrice ?? entry.currentPrice
+                                  )}
+                                </td>
+                                <td
+                                  className={`py-2.5 px-3 text-right font-semibold ${
+                                    isWaitingLimit
+                                      ? 'text-amber-300'
+                                      : isExpiredLimit
+                                        ? 'text-slate-400'
+                                        : (entry.netPnlR ?? entry.pnlR) > 0
+                                          ? 'text-emerald-400'
+                                          : (entry.netPnlR ?? entry.pnlR) < 0
+                                            ? 'text-rose-400'
+                                            : 'text-slate-300'
+                                  }`}
+                                >
+                                  {isWaitingLimit ? (
+                                    '待回踩觸發'
+                                  ) : isExpiredLimit ? (
+                                    '0R (已作廢)'
+                                  ) : (
+                                    <>
+                                      <div>
+                                        淨 {(entry.netPnlR ?? entry.pnlR) > 0 ? '+' : ''}
+                                        {entry.netPnlR ?? entry.pnlR}R ({entry.pnlPercent > 0 ? '+' : ''}
+                                        {entry.pnlPercent}%)
+                                      </div>
+                                      <div className="text-[10px] text-slate-400 font-normal">
+                                        毛 {entry.pnlR > 0 ? '+' : ''}
+                                        {entry.pnlR}R
+                                        {typeof entry.totalCostR === 'number'
+                                          ? ` · 成本 -${entry.totalCostR}R`
+                                          : ''}
+                                      </div>
+                                    </>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 text-[10px] text-slate-400">
+                                  <div>{entry.provenance.source.slice(0, 38)}</div>
+                                  <div>
+                                    {new Date(entry.openedAt).toLocaleString(
+                                      'zh-TW',
+                                      {
+                                        hour12: false,
+                                      }
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  {entry.status === 'OPEN' ? (
+                                    <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
+                                      {isWaitingLimit && (
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            extendPaperLimitPosition(entry.id, 120)
+                                          }
+                                          className="rounded border border-sky-500/40 bg-sky-500/15 px-2 py-1 text-[11px] text-sky-200 hover:bg-sky-500/25 cursor-pointer whitespace-nowrap"
+                                        >
+                                          延長 +2h
+                                        </button>
+                                      )}
+                                      {!isWaitingLimit && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            void importPaperToPositionSentinel();
+                                            setActiveSection('position_sentinel');
+                                          }}
+                                          className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[11px] text-emerald-200 hover:bg-emerald-500/25 cursor-pointer whitespace-nowrap"
+                                        >
+                                          哨兵守護
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          closePaperPosition(
+                                            entry.id,
+                                            entry.currentPrice
+                                          )
+                                        }
+                                        className="rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+                                      >
+                                        {isWaitingLimit
+                                          ? '撤銷待觸價單'
+                                          : '紙上平倉結算'}
+                                      </button>
+                                    </div>
+                                  ) : isExpiredLimit ? (
+                                    <span className="text-slate-500">
+                                      已作廢
+                                    </span>
+                                  ) : (
+                                    <span className="text-slate-500">
+                                      已結算
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              );
+            })()}
           </section>
         )}
 
@@ -7268,6 +9289,17 @@ export default function App() {
         {activeSection === 'notifications' && (
           <div className="order-3 grid grid-cols-1 gap-6 lg:grid-cols-12">
             <section className="lg:col-span-7 border border-slate-800 bg-slate-900/30 p-5 space-y-5">
+              {/* External Notification Channels Control (Telegram Bot & Discord Webhook) */}
+              <ExternalNotificationPanel
+                status={externalNotifyStatus}
+                loading={externalNotifyLoading}
+                testingChannel={externalTestingChannel}
+                testFeedback={externalTestFeedback}
+                selectedSymbol={selectedSymbol}
+                onUpdateConfig={updateExternalNotifyConfig}
+                onSendTest={sendExternalTestNotification}
+              />
+
               {/* Background Scheduler Control */}
               <div className="border border-slate-800 bg-slate-950 p-4 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -8638,6 +10670,29 @@ export default function App() {
             </section>
           </div>
         )}
+
+        {/* SECTION: Position Sentinel (Active Trade Live Trend & Reversal Guardian) */}
+        {activeSection === 'position_sentinel' && (
+          <PositionSentinelPanel
+            status={positionSentinelStatus}
+            loading={positionSentinelLoading}
+            selectedExchange={selectedExchange}
+            availableSymbols={(scanData?.candidates ?? []).map((c) => c.symbol)}
+            defaultSymbol={symbolDetail?.symbol ?? selectedSymbol}
+            defaultPrice={symbolDetail?.candidate.lastPrice ?? null}
+            onRefreshCheck={refreshPositionSentinelCheck}
+            onImportPaper={importPaperToPositionSentinel}
+            onAddPosition={addPositionToSentinel}
+            onUpdatePosition={updatePositionInSentinel}
+            onDeletePosition={deletePositionFromSentinel}
+            onUpdateConfig={updatePositionSentinelConfig}
+            onSelectSymbol={(sym) => {
+              setSelectedSymbol(sym);
+              setActiveSection('radar');
+              loadSymbolDetail(sym, selectedTimeframe);
+            }}
+          />
+        )}
       </main>
 
       {/* Quiet Footer */}
@@ -8651,6 +10706,69 @@ export default function App() {
           </span>
         </div>
       </footer>
+
+      <SettingsFormulasModal
+        open={settingsModalOpen}
+        onClose={() => setSettingsModalOpen(false)}
+        activeTab={settingsHubTab}
+        onChangeTab={setSettingsHubTab}
+        dataMode={dataMode}
+        selectedExchange={selectedExchange}
+        onSwitchLiveExchange={switchToLiveExchange}
+        onSwitchDemoMode={switchToExplicitDemoMode}
+        minQuoteVolume24h={minQuoteVolume24h}
+        onChangeMinQuoteVolume24h={setMinQuoteVolume24h}
+        selectedTimeframe={selectedTimeframe}
+        onChangeTimeframe={(tf) => {
+          setSelectedTimeframe(tf);
+          if (selectedSymbol && !scanError) {
+            loadSymbolDetail(selectedSymbol, tf);
+          }
+        }}
+        themeMode={themeMode}
+        onChangeThemeMode={setThemeMode}
+        scanData={scanData}
+        smcScanStatus={smcScanStatus}
+        smcQueueLoading={smcQueueLoading}
+        onControlSmcQueue={controlSmcQueue}
+        onRetryStuckSmcJobs={retryStuckSmcJobs}
+        onRefreshSingleSmcSymbol={refreshSingleSmcSymbol}
+        selectedSymbol={selectedSymbol}
+        schedulerStatus={schedulerStatus}
+        schedulerLoading={schedulerLoading}
+        onControlScheduler={controlScheduler}
+        paperMonitorStatus={paperMonitorStatus}
+        paperMonitorLoading={paperMonitorLoading}
+        onControlPaperMonitor={controlPaperMonitor}
+        systemDbHealth={systemDbHealth}
+        dbCheckLoading={dbCheckLoading}
+        onRunSystemDbCheck={runSystemDbCheck}
+        onRefreshScan={() => executeMarketScan()}
+        onSelectSymbolDetail={(sym) => {
+          setActiveSection('radar');
+          void loadSymbolDetail(sym, selectedTimeframe);
+        }}
+      />
+
+      <PriceAlertDrawer
+        open={alertDrawerOpen}
+        onClose={() => setAlertDrawerOpen(false)}
+        rules={priceAlerts}
+        events={alertEvents}
+        soundEnabled={alertSoundEnabled}
+        onToggleSound={() => setAlertSoundEnabled((v) => !v)}
+        browserNotifyEnabled={browserNotifyEnabled}
+        onToggleBrowserNotify={() => {
+          void handleToggleBrowserNotify();
+        }}
+        onAddRule={addPriceAlertRule}
+        onDeleteRule={deletePriceAlertRule}
+        onToggleRule={togglePriceAlertRule}
+        onRearmRule={rearmPriceAlertRule}
+        onClearEvents={() => setAlertEvents([])}
+        activeSymbolDetail={symbolDetail}
+        availableSymbols={(scanData?.candidates ?? []).map((c) => c.symbol)}
+      />
     </div>
   );
 }

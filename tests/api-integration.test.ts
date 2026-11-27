@@ -197,14 +197,23 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
       assert.equal(body.symbol, 'BTCUSDT');
       assert.equal(body.candidate.historicalVolume.sampleCount, 30);
       assert.equal(body.candidate.historicalVolume.minRequiredSamples, 30);
-      assert.equal(body.candidate.historicalVolume.status, 'READY');
+      assert.ok(
+        body.candidate.historicalVolume.status === 'READY' ||
+          body.candidate.historicalVolume.status === 'BASELINE_UNSTABLE'
+      );
       assert.ok(
         body.candidate.historicalVolume.rollingMedian !== null &&
           body.candidate.historicalVolume.rollingMedian > 0
       );
       assert.ok(body.candidate.historicalVolume.mad !== null);
-      assert.ok(body.candidate.historicalVolume.robustZScore !== null);
-      assert.ok(body.candidate.historicalVolume.rvol !== null);
+      if (body.candidate.historicalVolume.status === 'READY') {
+        assert.ok(body.candidate.historicalVolume.robustZScore !== null);
+        assert.ok(body.candidate.historicalVolume.rvol !== null);
+      } else {
+        assert.equal(body.candidate.historicalVolume.baselineUnstable, true);
+        assert.equal(body.candidate.historicalVolume.robustZScore, null);
+        assert.equal(body.candidate.historicalVolume.rvol, null);
+      }
       assert.ok(body.smcAnalysis.confirmedKlineCount >= 30);
     } else {
       assert.equal(res.status, 503);
@@ -644,6 +653,104 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
       );
     }
   });
+
+  it('10. BTC 過去 K 線重合性分析整合測試：驗證 /api/scan 與 /api/symbol/:symbol 均回傳真實 btcCorrelation 指標與重疊圖表序列', async () => {
+    const scanRes = await fetch(`${baseUrl}/api/scan?mode=demo`);
+    assert.equal(scanRes.status, 200);
+    const scanBody = (await scanRes.json()) as MarketScanResponse;
+    const solCandidate = scanBody.candidates.find((c) => c.symbol === 'SOLUSDT');
+    const btcCandidate = scanBody.candidates.find((c) => c.symbol === 'BTCUSDT');
+
+    assert.ok(solCandidate?.btcCorrelation, 'SOLUSDT 必須包含 btcCorrelation 摘要');
+    assert.equal(solCandidate?.btcCorrelation?.status, 'READY');
+    assert.equal(typeof solCandidate?.btcCorrelation?.pearson15m, 'number');
+    assert.equal(typeof solCandidate?.btcCorrelation?.directionalOverlap15m, 'number');
+    assert.ok(btcCandidate?.btcCorrelation?.isBenchmark);
+
+    const detailRes = await fetch(
+      `${baseUrl}/api/symbol/SOLUSDT?mode=demo&timeframe=15m`
+    );
+    assert.equal(detailRes.status, 200);
+    const detailBody = (await detailRes.json()) as SymbolDetailResponse;
+    assert.ok(detailBody.btcCorrelation, '單幣種詳情必須回傳完整 btcCorrelation');
+    assert.equal(detailBody.btcCorrelation?.status, 'READY');
+    assert.ok(detailBody.btcCorrelation?.summaryZh.length > 0);
+    assert.ok(detailBody.btcCorrelation?.tradingHintZh.length > 0);
+    const tf15 = detailBody.btcCorrelation?.byTimeframe['15m'];
+    assert.equal(tf15?.status, 'READY');
+    assert.ok((tf15?.series?.length ?? 0) >= 15);
+  });
+
+  it('11. 衍生品結構、多圖 BTC K 線切片、板塊輪動與市場廣度整合測試', async () => {
+    const scanRes = await fetch(`${baseUrl}/api/scan?mode=demo`);
+    assert.equal(scanRes.status, 200);
+    const scanBody = (await scanRes.json()) as MarketScanResponse;
+
+    assert.ok(scanBody.marketBreadth, '全市場掃描必須包含 marketBreadth');
+    assert.ok((scanBody.sectorRotation?.length ?? 0) >= 3, '必須回傳板塊輪動清單');
+    assert.ok(
+      scanBody.candidates.every((c) => Boolean(c.sector?.key)),
+      '每檔合約必須附上 sector 分類'
+    );
+
+    const detailRes = await fetch(
+      `${baseUrl}/api/symbol/SOLUSDT?mode=demo&timeframe=15m`
+    );
+    assert.equal(detailRes.status, 200);
+    const detailBody = (await detailRes.json()) as SymbolDetailResponse;
+    assert.ok(detailBody.derivativesStructure, '必須回傳 derivativesStructure');
+    assert.equal(detailBody.derivativesStructure?.oiRegime.status, 'READY');
+    assert.equal(detailBody.derivativesStructure?.cvd.status, 'READY');
+    assert.equal(detailBody.derivativesStructure?.funding.status, 'READY');
+    assert.ok((detailBody.derivativesStructure?.series.length ?? 0) >= 15);
+    assert.ok(
+      (detailBody.btcKlinesByTimeframe?.['15m']?.length ?? 0) >= 15,
+      '必須附帶 BTCUSDT K 線供多圖同框對照'
+    );
+  });
+
+  it('12. 期現基差、盤口深度滑點與關鍵時間錨點整合測試 (Microstructure + KeyLevelsSession)', async () => {
+    const detailRes = await fetch(
+      `${baseUrl}/api/symbol/SOLUSDT?mode=demo&timeframe=15m`
+    );
+    assert.equal(detailRes.status, 200);
+    const detailBody = (await detailRes.json()) as SymbolDetailResponse;
+
+    assert.ok(detailBody.microstructure, '必須回傳 microstructure 分析');
+    assert.equal(detailBody.microstructure?.spotPerpBasis.status, 'READY');
+    assert.equal(
+      typeof detailBody.microstructure?.spotPerpBasis.basisPct,
+      'number'
+    );
+    assert.equal(
+      typeof detailBody.microstructure?.spotPerpBasis.perpToSpotVolumeRatio,
+      'number'
+    );
+    assert.equal(detailBody.microstructure?.orderbook.status, 'READY');
+    assert.equal(detailBody.microstructure?.orderbook.slippageTiers.length, 3);
+    assert.ok(
+      (detailBody.microstructure?.orderbook.compactBids.length ?? 0) >= 10
+    );
+    assert.ok(
+      (detailBody.microstructure?.orderbook.compactAsks.length ?? 0) >= 10
+    );
+
+    assert.ok(detailBody.keyLevelsSession, '必須回傳 keyLevelsSession 分析');
+    assert.ok(
+      detailBody.keyLevelsSession?.vwap !== null &&
+        (detailBody.keyLevelsSession?.vwap ?? 0) > 0
+    );
+    assert.ok(
+      detailBody.keyLevelsSession?.anchors.length >= 1,
+      '必須回傳至少 1 組關鍵價格錨點'
+    );
+    assert.ok(detailBody.keyLevelsSession?.session.sessionLabelZh.length > 0);
+    assert.ok(
+      detailBody.keyLevelsSession?.session.fundingCountdownMs !== null &&
+        detailBody.keyLevelsSession.session.fundingCountdownMs > 0
+    );
+  });
 });
+
 
 

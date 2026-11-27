@@ -21,6 +21,7 @@ import {
   Timeframe,
 } from '../../src/types/market.ts';
 import { RadarDatabase } from './RadarDatabase.ts';
+import { resolveCandidateEvidenceType } from '../utils/provenanceQuarantine.ts';
 
 interface MonitoringCheckpointFile {
   runs: PaperMonitorRunRecord[];
@@ -32,18 +33,21 @@ interface MonitoringCheckpointFile {
 
 export class PaperMonitorDatabase {
   public readonly radarDb: RadarDatabase;
-  private readonly rawDb: DatabaseSync;
   private readonly checkpointPath: string | null;
   private isRestoringCheckpoint = false;
 
+  private get rawDb(): DatabaseSync {
+    return this.radarDb.getRawDb();
+  }
+
   constructor(radarDb: RadarDatabase) {
     this.radarDb = radarDb;
-    this.rawDb = radarDb.getRawDb();
     this.checkpointPath =
       radarDb.dbPath && radarDb.dbPath !== ':memory:'
         ? `${radarDb.dbPath}.window-checkpoint.json`
         : null;
     this.initSchema();
+    radarDb.registerSchemaInitHook(() => this.initSchema());
     this.restoreFromCheckpointIfEmpty();
     this.normalizeHistoricalFixtureSignalIfPresent();
   }
@@ -1231,7 +1235,9 @@ export class PaperMonitorDatabase {
       LIMIT ?
     `);
     const rows = stmt.all(...args, limit) as Array<Record<string, unknown>>;
-    const mapped = rows.map((r) => this.mapTrackedSignalRow(r));
+    const mapped = rows
+      .map((r) => this.mapTrackedSignalRow(r))
+      .filter((sig) => sig.evidenceType === 'LIVE_PRODUCTION');
 
     const sinceMs = params.sinceIso ? Date.parse(params.sinceIso) : NaN;
     const untilMs = params.untilIso ? Date.parse(params.untilIso) : NaN;
@@ -1467,6 +1473,16 @@ export class PaperMonitorDatabase {
       evidences: JSON.parse(String(row.evidences_json || '[]')),
       decisionTrace: parsedDecisionTrace,
       isDemo: Number(row.is_demo) === 1,
+      evidenceType: resolveCandidateEvidenceType({
+        exchange: String(row.exchange),
+        isDemo: Number(row.is_demo) === 1,
+        source: String(row.source),
+        evidenceType:
+          parsedDecisionTrace &&
+          typeof parsedDecisionTrace.evidenceType === 'string'
+            ? String(parsedDecisionTrace.evidenceType)
+            : null,
+      }),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
@@ -1638,6 +1654,32 @@ export class PaperMonitorDatabase {
       | undefined;
     if (!row) return null;
     return this.mapOutboxRow(row);
+  }
+
+  public listOpenTrackedSignalsForSymbol(
+    exchange: ExchangeId,
+    symbol: string,
+    options?: { includeDeferredMissed?: boolean }
+  ): PaperTrackedSignalRecord[] {
+    const includeDeferred = options?.includeDeferredMissed === true;
+    const statusClause = includeDeferred
+      ? `(status IN ('CREATED', 'PENDING_NEXT_ENTRY', 'PAPER_OPENED') OR (status = 'ENTRY_WINDOW_MISSED' AND datetime(COALESCE(signal_detected_at, evaluated_at)) >= datetime('now', '-60 minutes')))`
+      : `status IN ('CREATED', 'PENDING_NEXT_ENTRY', 'PAPER_OPENED')`;
+    const queryStmt = this.rawDb.prepare(`
+      SELECT * FROM paper_tracked_signals
+      WHERE is_demo = 0
+        AND exchange = ?
+        AND symbol = ?
+        AND ${statusClause}
+      ORDER BY COALESCE(signal_detected_at, evaluated_at) DESC, rowid DESC
+      LIMIT 20
+    `);
+    const rows = queryStmt.all(exchange, symbol.trim().toUpperCase()) as Array<
+      Record<string, unknown>
+    >;
+    return rows
+      .map((r) => this.mapTrackedSignalRow(r))
+      .filter((sig) => sig.evidenceType === 'LIVE_PRODUCTION');
   }
 
   private mapOutboxRow(

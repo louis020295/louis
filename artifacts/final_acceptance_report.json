@@ -1,0 +1,173 @@
+{
+  "engineeringAcceptance": "ACCEPTED",
+  "safetyAcceptance": "ACCEPTED",
+  "liveCaptureValidation": "PENDING_REAL_LIVE_CANDIDATE",
+  "strategyValidation": "INSUFFICIENT_SAMPLE",
+  "generatedAt": "2026-11-12T12:33:38.000Z",
+  "safety": {
+    "mode": "PAPER ONLY",
+    "liveOrders": "LIVE ORDERS DISABLED",
+    "executionPolicy": "NEVER AUTO-PLACE ORDERS",
+    "orderEndpointsHttp404": true,
+    "privateTradingApiAbsent": true,
+    "externalNotificationCount": 0,
+    "externalTelegramRequestsCount": 0,
+    "externalTradingViewRequestsCount": 0,
+    "telegramAndTradingViewDryRunOnly": true,
+    "liveApiFailureReturnsHttp503": true,
+    "autoDemoFallbackDisabled": true,
+    "evidenceTypeIsolation": {
+      "LIVE_PRODUCTION": "ISOLATED_REAL_PUBLIC_REST_ONLY",
+      "CONTROLLED_LIVE_FIXTURE": "EXCLUDED_FROM_LIVE_PRODUCTION_COUNTS_AND_PAPER",
+      "DEMO_LATENCY_FIXTURE": "EXCLUDED_FROM_LIVE_PRODUCTION_COUNTS_AND_PAPER"
+    }
+  },
+  "testExecution": {
+    "typecheck": "PASS (tsc --noEmit, exit code 0)",
+    "build": "PASS (vite build, exit code 0)",
+    "unitAndIntegrationTests": {
+      "command": "npm test",
+      "isFullSuite": true,
+      "subsetOnly": false,
+      "testFilesCount": 22,
+      "testSuitesCount": 26,
+      "totalTests": 182,
+      "pass": 182,
+      "fail": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "todo": 0,
+      "durationMs": 105734.41
+    },
+    "browserE2eTests": {
+      "command": "npm run test:e2e",
+      "isFullSuite": true,
+      "testSuitesCount": 1,
+      "totalTests": 1,
+      "pass": 1,
+      "fail": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "durationMs": 71030.34,
+      "screenshots": [
+        "live_mode.png",
+        "api_failure_503.png",
+        "demo_mode.png"
+      ]
+    }
+  },
+  "formalSignalLogic": {
+    "strictProductionGatesUnchanged": true,
+    "allowedCandidateStates": [
+      "LONG CANDIDATE",
+      "SHORT CANDIDATE",
+      "多頭交易候選",
+      "空頭交易候選"
+    ],
+    "forbiddenStatesBlockedFromPaper": [
+      "PENDING",
+      "WAIT",
+      "WATCH",
+      "HIGH RISK",
+      "NEAR_MISS",
+      "OBSERVATION_SHADOW",
+      "stale",
+      "fallback",
+      "missingData",
+      "isDemo=true",
+      "isTestFixture=true"
+    ],
+    "waitWatchFinalTradeSignalIsNone": true,
+    "nearMissNeverWritesPaperLedger": true,
+    "shadowNeverWritesPaperLedger": true,
+    "nearMissNeverNotifies": true,
+    "shadowNeverNotifies": true,
+    "radarLongShortSeparatedFromSmcCandidate": true
+  },
+  "liveCaptureObservation": {
+    "LIVE_FORMAL_CANDIDATE_COUNT": 0,
+    "LIVE_FAST_LANE_COUNT": 0,
+    "LIVE_BULK_COUNT": 0,
+    "LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT": 0,
+    "LIVE_ENTRY_WINDOW_MISSED_COUNT": 0,
+    "LIVE_DETECTION_LATENCY_P50": null,
+    "LIVE_DETECTION_LATENCY_P95": null,
+    "LIVE_ENTRY_WINDOW_MISSED_RATE": null,
+    "liveValidationStatus": "NO_LIVE_FORMAL_CANDIDATE",
+    "liveSampleValidationStatus": "LIVE_VALIDATION_INSUFFICIENT_SAMPLE",
+    "isLiveValidated": false,
+    "uiBannerText": "目前尚無真實 Live 正式候選，Live 捕捉 SLA 尚未驗證。",
+    "liveValidationMessage": "尚無真實 Live 候選，無法評估實盤捕捉延遲"
+  },
+  "confirmed15mCloseFastLane": {
+    "recordedCloseEventsCount": 11,
+    "latestCloseEvent": {
+      "closeEventId": "evt15m_binance_usdm_1794486599999_cycle_binance_usdm_priority_1794485994174_partial_v1.0.0-smc-ict-deterministic_g4ovuc",
+      "closeEventAt": "2026-11-12T12:29:59.999Z",
+      "cycleId": "cycle_binance_usdm_priority_1794485994174_partial_v1.0.0-smc-ict-deterministic_g4ovuc",
+      "triggeredFastLaneCount": 90,
+      "completedFastLaneCount": 90,
+      "formalCandidateCount": 0,
+      "nearMissCount": 35,
+      "candidateDetectedBeforeEntryCount": 0,
+      "entryWindowMissedCount": 0,
+      "queueWaitP50": 24225,
+      "queueWaitP95": 29175,
+      "evidenceType": "LIVE_PRODUCTION",
+      "isDemo": false,
+      "isTestFixture": false
+    }
+  },
+  "signalImmutabilityAndEntryWindow": {
+    "signalIdFormula": "symbol + exchange + timeframe + direction + signalBarOpenTime + ruleVersion",
+    "immutableFieldsVerified": [
+      "direction",
+      "signalBarOpenTime",
+      "smcActionState",
+      "entryWindowStatus",
+      "entryReferencePrice"
+    ],
+    "oppositeDirectionCreatesNewSignalId": true,
+    "detectedBeforeNextBarOpen": "signalDetectedAt < nextBarOpenTime => DETECTED_BEFORE_NEXT_BAR_OPEN",
+    "entryWindowMissedRule": "signalDetectedAt >= nextBarOpenTime => ENTRY_WINDOW_MISSED & entryReferencePrice = null & no historical nextBar.open backfill"
+  },
+  "statisticalConsistencyAcrossEndpoints": {
+    "cycleId": "cycle_binance_usdm_priority_1794485994174_partial_v1.0.0-smc-ict-deterministic_g4ovuc",
+    "snapshotAt": "2026-11-12T12:30:16.177Z",
+    "statsVersion": 7874,
+    "statsConsistency": "VALID",
+    "consistencyErrors": [],
+    "independentEndpointsTag": "INDEPENDENT_ENDPOINT_SNAPSHOT",
+    "atomicEndpointTag": "SHARED_ATOMIC_SNAPSHOT",
+    "identities": {
+      "totalSymbols": 522,
+      "evaluatedCount": 522,
+      "pendingCount": 0,
+      "waitCount": 419,
+      "watchCount": 98,
+      "highRiskCount": 5,
+      "longCandidateCount": 0,
+      "shortCandidateCount": 0,
+      "nearMissOneGate": 6,
+      "nearMissTwoGates": 29,
+      "nearMissCount": 35,
+      "candidateDetected": 0,
+      "currentCyclePaperEligibleCount": 0
+    }
+  },
+  "strategySampleThresholdAndShadowCalibration": {
+    "paperClosedCount": 0,
+    "minimumRequiredSettledSamples": 30,
+    "strategyValidity": "INSUFFICIENT_SAMPLE",
+    "gateAdjustmentAllowed": false,
+    "winRate": null,
+    "averageR": null,
+    "profitFactor": null,
+    "maxDrawdownR": null,
+    "expectancyR": null,
+    "strictProductionCandidates": 0,
+    "shadowOneGateMissingCandidates": 5,
+    "shadowTwoGatesMissingCandidates": 15,
+    "recommendation": "不得因候選太少就直接放寬條件。目前 STRICT_PRODUCTION 與 Shadow 觀察模式之已結算樣本數小於 30 (strategyValidity = INSUFFICIENT_SAMPLE)，尚未累積至少 30 筆已結算樣本且尚未完成多市場狀態 Walk-Forward 驗證，維持全部 9 項嚴格 SMC/ICT Gate 不變。"
+  }
+}

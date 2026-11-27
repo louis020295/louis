@@ -6,6 +6,9 @@ import {
   HistoricalOpenInterestPoint,
   Kline,
   MarketTicker,
+  OrderBookLevel,
+  OrderBookSnapshot,
+  SpotTickerSnapshot,
   Timeframe,
 } from '../../src/types/market.ts';
 
@@ -170,7 +173,42 @@ export async function fetchWithResilience<T>(
           break;
         }
 
-        const data = (await res.json()) as T;
+        const rawText = await res.text();
+        if (!rawText || !rawText.trim()) {
+          lastError = new ExchangeApiUnavailableError(
+            `${sourceLabel} returned empty response body`,
+            base,
+            res.status || 502,
+            {
+              retryAttempts: totalRetries,
+              isRateLimited: false,
+              isTimeout: false,
+            }
+          );
+          if (attempt < maxRetriesPerEndpoint) {
+            continue;
+          }
+          break;
+        }
+        let data: T;
+        try {
+          data = JSON.parse(rawText) as T;
+        } catch (parseErr) {
+          lastError = new ExchangeApiUnavailableError(
+            `${sourceLabel} invalid/truncated JSON response: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+            base,
+            res.status || 502,
+            {
+              retryAttempts: totalRetries,
+              isRateLimited: false,
+              isTimeout: false,
+            }
+          );
+          if (attempt < maxRetriesPerEndpoint) {
+            continue;
+          }
+          break;
+        }
         return {
           data,
           endpointUsed: base,
@@ -240,6 +278,14 @@ export interface ExchangeAdapter {
     provenance: DataProvenance;
   }>;
 
+  fetchKlines1m?(
+    symbol: string,
+    limit?: number
+  ): Promise<{
+    klines: Kline[];
+    provenance: DataProvenance;
+  }>;
+
   fetchHistoricalOpenInterest?(
     symbol: string,
     timeframe: Timeframe,
@@ -257,7 +303,33 @@ export interface ExchangeAdapter {
     series: HistoricalFundingRatePoint[];
     provenance: DataProvenance;
   }>;
+
+  fetchOrderBookDepth?(
+    symbol: string,
+    limit?: number
+  ): Promise<OrderBookSnapshot>;
+
+  fetchSpotTicker?(symbol: string): Promise<SpotTickerSnapshot>;
 }
+
+function resolveSpotSymbolMultiplier(symbol: string): {
+  spotSymbol: string;
+  multiplier: number;
+} {
+  const upper = symbol.toUpperCase();
+  if (upper.startsWith('1000000') && upper.endsWith('USDT') && upper.length > 11) {
+    return { spotSymbol: upper.slice(7), multiplier: 1_000_000 };
+  }
+  if (upper.startsWith('1000') && upper.endsWith('USDT') && upper.length > 8) {
+    return { spotSymbol: upper.slice(4), multiplier: 1000 };
+  }
+  return { spotSymbol: upper, multiplier: 1 };
+}
+
+const DEFAULT_BINANCE_SPOT_ENDPOINTS = [
+  process.env.BINANCE_SPOT_BASE_URL || 'https://api.binance.com',
+  'https://api1.binance.com',
+];
 
 export interface AdapterClientConfig {
   endpoints?: string[];
@@ -268,7 +340,8 @@ export interface AdapterClientConfig {
   customFetch?: typeof fetch;
 }
 
-const INTERVAL_MS_MAP: Record<Timeframe, number> = {
+const INTERVAL_MS_MAP: Record<Timeframe | '1m', number> = {
+  '1m': 60 * 1000,
   '5m': 5 * 60 * 1000,
   '15m': 15 * 60 * 1000,
   '1h': 60 * 60 * 1000,
@@ -361,8 +434,8 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
       endpoints: this.config.endpoints ?? DEFAULT_BINANCE_ENDPOINTS,
       path,
       sourceLabel: 'Binance USDⓈ-M Futures REST',
-      timeoutMs: this.config.timeoutMs ?? 7000,
-      maxRetriesPerEndpoint: this.config.maxRetriesPerEndpoint ?? 2,
+      timeoutMs: this.config.timeoutMs ?? 4500,
+      maxRetriesPerEndpoint: this.config.maxRetriesPerEndpoint ?? 1,
       retryBaseDelayMs: this.config.retryBaseDelayMs ?? 60,
       rateLimiter: this.config.rateLimiter,
       customFetch: this.config.customFetch,
@@ -599,6 +672,16 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
     }
   }
 
+  public async fetchKlines1m(
+    symbol: string,
+    limit = 20
+  ): Promise<{
+    klines: Kline[];
+    provenance: DataProvenance;
+  }> {
+    return this.fetchKlines(symbol, '1m' as unknown as Timeframe, limit);
+  }
+
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
@@ -620,6 +703,8 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
     const klines: Kline[] = (data || []).map((tuple) => {
       const openTime = Number(tuple[0]);
       const closeTime = Number(tuple[6]);
+      const parsedTakerBuyBase = Number.parseFloat(tuple[9]);
+      const parsedTakerBuyQuote = Number.parseFloat(tuple[10]);
       return {
         openTime,
         open: Number.parseFloat(tuple[1]),
@@ -629,6 +714,12 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
         volume: Number.parseFloat(tuple[5]),
         closeTime,
         quoteVolume: Number.parseFloat(tuple[7]),
+        takerBuyVolume: Number.isFinite(parsedTakerBuyBase)
+          ? parsedTakerBuyBase
+          : null,
+        takerBuyQuoteVolume: Number.isFinite(parsedTakerBuyQuote)
+          ? parsedTakerBuyQuote
+          : null,
         isClosed: closeTime <= nowMs,
       };
     });
@@ -794,6 +885,126 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
       };
     }
   }
+
+  public async fetchOrderBookDepth(
+    symbol: string,
+    limit = 50
+  ): Promise<OrderBookSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const safeLimit = limit <= 20 ? 20 : limit <= 50 ? 50 : 100;
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } = await this.request<{
+        bids: Array<[string, string]>;
+        asks: Array<[string, string]>;
+      }>(`/fapi/v1/depth?symbol=${encodeURIComponent(symbol)}&limit=${safeLimit}`);
+
+      const bids: OrderBookLevel[] = (Array.isArray(data?.bids) ? data.bids : [])
+        .map(([p, q]) => ({
+          price: Number.parseFloat(p),
+          quantity: Number.parseFloat(q),
+        }))
+        .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.quantity) && l.quantity > 0);
+      const asks: OrderBookLevel[] = (Array.isArray(data?.asks) ? data.asks : [])
+        .map(([p, q]) => ({
+          price: Number.parseFloat(p),
+          quantity: Number.parseFloat(q),
+        }))
+        .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.quantity) && l.quantity > 0);
+
+      return {
+        symbol,
+        bids,
+        asks,
+        provenance: {
+          source: `Binance USDⓈ-M Futures REST (${endpointUsed}/fapi/v1/depth)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: bids.length === 0 || asks.length === 0 ? ['orderbook'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        symbol,
+        bids: [],
+        asks: [],
+        provenance: {
+          source: 'Binance USDⓈ-M Futures REST (/fapi/v1/depth)',
+          fetchedAt,
+          stale: false,
+          fallback: false,
+          missingData: ['orderbook'],
+          isDemo: false,
+        },
+      };
+    }
+  }
+
+  public async fetchSpotTicker(symbol: string): Promise<SpotTickerSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const { spotSymbol, multiplier } = resolveSpotSymbolMultiplier(symbol);
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } =
+        await fetchWithResilience<{
+          symbol: string;
+          lastPrice: string;
+          quoteVolume: string;
+          priceChangePercent: string;
+        }>({
+          endpoints: DEFAULT_BINANCE_SPOT_ENDPOINTS,
+          path: `/api/v3/ticker/24hr?symbol=${encodeURIComponent(spotSymbol)}`,
+          sourceLabel: 'Binance Spot REST',
+          timeoutMs: 3800,
+          maxRetriesPerEndpoint: 0,
+          retryBaseDelayMs: 50,
+          customFetch: this.config.customFetch,
+        });
+
+      const rawPrice = Number.parseFloat(data?.lastPrice ?? '');
+      const rawQuoteVol = Number.parseFloat(data?.quoteVolume ?? '');
+      const rawChg = Number.parseFloat(data?.priceChangePercent ?? '');
+      const spotPrice =
+        Number.isFinite(rawPrice) && rawPrice > 0
+          ? rawPrice * multiplier
+          : null;
+
+      return {
+        symbol,
+        spotSymbol,
+        priceMultiplier: multiplier,
+        spotPrice,
+        spotQuoteVolume24h:
+          Number.isFinite(rawQuoteVol) && rawQuoteVol >= 0 ? rawQuoteVol : null,
+        spotPriceChangePercent24h: Number.isFinite(rawChg) ? rawChg : null,
+        provenance: {
+          source: `Binance Spot REST (${endpointUsed}/api/v3/ticker/24hr)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: spotPrice === null ? ['spotTicker'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        symbol,
+        spotSymbol,
+        priceMultiplier: multiplier,
+        spotPrice: null,
+        spotQuoteVolume24h: null,
+        spotPriceChangePercent24h: null,
+        provenance: {
+          source: 'Binance Spot REST (/api/v3/ticker/24hr)',
+          fetchedAt,
+          stale: false,
+          fallback: false,
+          missingData: ['spotTicker'],
+          isDemo: false,
+        },
+      };
+    }
+  }
 }
 
 // ============================================================================
@@ -837,7 +1048,8 @@ type BybitKlineTuple = [
   string  // 6: turnover (quoteVolume)
 ];
 
-const BYBIT_INTERVAL_MAP: Record<Timeframe, string> = {
+const BYBIT_INTERVAL_MAP: Record<Timeframe | '1m', string> = {
+  '1m': '1',
   '5m': '5',
   '15m': '15',
   '1h': '60',
@@ -1037,6 +1249,16 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
         },
       };
     }
+  }
+
+  public async fetchKlines1m(
+    symbol: string,
+    limit = 20
+  ): Promise<{
+    klines: Kline[];
+    provenance: DataProvenance;
+  }> {
+    return this.fetchKlines(symbol, '1m' as unknown as Timeframe, limit);
   }
 
   public async fetchKlines(
@@ -1241,6 +1463,124 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
           stale: false,
           fallback: false,
           missingData: ['historicalFundingRate'],
+          isDemo: false,
+        },
+      };
+    }
+  }
+
+  public async fetchOrderBookDepth(
+    symbol: string,
+    limit = 50
+  ): Promise<OrderBookSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const safeLimit = Math.min(200, Math.max(10, limit));
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } = await this.request<{
+        s: string;
+        b: Array<[string, string]>;
+        a: Array<[string, string]>;
+      }>(
+        `/v5/market/orderbook?category=linear&symbol=${encodeURIComponent(
+          symbol
+        )}&limit=${safeLimit}`
+      );
+      const bids: OrderBookLevel[] = (Array.isArray(data?.result?.b) ? data.result.b : [])
+        .map(([p, q]) => ({
+          price: Number.parseFloat(p),
+          quantity: Number.parseFloat(q),
+        }))
+        .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.quantity) && l.quantity > 0);
+      const asks: OrderBookLevel[] = (Array.isArray(data?.result?.a) ? data.result.a : [])
+        .map(([p, q]) => ({
+          price: Number.parseFloat(p),
+          quantity: Number.parseFloat(q),
+        }))
+        .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.quantity) && l.quantity > 0);
+
+      return {
+        symbol,
+        bids,
+        asks,
+        provenance: {
+          source: `Bybit V5 Linear REST (${endpointUsed}/v5/market/orderbook)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: bids.length === 0 || asks.length === 0 ? ['orderbook'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        symbol,
+        bids: [],
+        asks: [],
+        provenance: {
+          source: 'Bybit V5 Linear REST (/v5/market/orderbook)',
+          fetchedAt,
+          stale: false,
+          fallback: false,
+          missingData: ['orderbook'],
+          isDemo: false,
+        },
+      };
+    }
+  }
+
+  public async fetchSpotTicker(symbol: string): Promise<SpotTickerSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const { spotSymbol, multiplier } = resolveSpotSymbolMultiplier(symbol);
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } = await this.request<{
+        category: string;
+        list: Array<{
+          symbol: string;
+          lastPrice: string;
+          turnover24h: string;
+          price24hPcnt: string;
+        }>;
+      }>(`/v5/market/tickers?category=spot&symbol=${encodeURIComponent(spotSymbol)}`);
+      const row = data?.result?.list?.[0];
+      const rawPrice = Number.parseFloat(row?.lastPrice ?? '');
+      const rawTurnover = Number.parseFloat(row?.turnover24h ?? '');
+      const rawPcnt = Number.parseFloat(row?.price24hPcnt ?? '');
+      const spotPrice =
+        Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice * multiplier : null;
+
+      return {
+        symbol,
+        spotSymbol,
+        priceMultiplier: multiplier,
+        spotPrice,
+        spotQuoteVolume24h:
+          Number.isFinite(rawTurnover) && rawTurnover >= 0 ? rawTurnover : null,
+        spotPriceChangePercent24h: Number.isFinite(rawPcnt)
+          ? rawPcnt * 100
+          : null,
+        provenance: {
+          source: `Bybit V5 Spot REST (${endpointUsed}/v5/market/tickers)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: spotPrice === null ? ['spotTicker'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        symbol,
+        spotSymbol,
+        priceMultiplier: multiplier,
+        spotPrice: null,
+        spotQuoteVolume24h: null,
+        spotPriceChangePercent24h: null,
+        provenance: {
+          source: 'Bybit V5 Spot REST (/v5/market/tickers)',
+          fetchedAt,
+          stale: false,
+          fallback: false,
+          missingData: ['spotTicker'],
           isDemo: false,
         },
       };
@@ -1514,6 +1854,16 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
     }
   }
 
+  public async fetchKlines1m(
+    symbol: string,
+    limit = 20
+  ): Promise<{
+    klines: Kline[];
+    provenance: DataProvenance;
+  }> {
+    return this.fetchKlines(symbol, '1m' as unknown as Timeframe, limit);
+  }
+
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
@@ -1578,6 +1928,124 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
         isDemo: false,
       },
     };
+  }
+
+  public async fetchOrderBookDepth(
+    symbol: string,
+    limit = 50
+  ): Promise<OrderBookSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const bingxSymbol = toBingXSymbol(symbol);
+    const safeLimit = Math.min(100, Math.max(10, limit));
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } = await this.request<{
+        bids: Array<[string | number, string | number]>;
+        asks: Array<[string | number, string | number]>;
+      }>(
+        `/openApi/swap/v2/quote/depth?symbol=${encodeURIComponent(
+          bingxSymbol
+        )}&limit=${safeLimit}`
+      );
+      const bids: OrderBookLevel[] = (Array.isArray(data?.data?.bids) ? data.data.bids : [])
+        .map(([p, q]) => ({
+          price: Number(p),
+          quantity: Number(q),
+        }))
+        .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.quantity) && l.quantity > 0);
+      const asks: OrderBookLevel[] = (Array.isArray(data?.data?.asks) ? data.data.asks : [])
+        .map(([p, q]) => ({
+          price: Number(p),
+          quantity: Number(q),
+        }))
+        .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.quantity) && l.quantity > 0);
+
+      return {
+        symbol,
+        bids,
+        asks,
+        provenance: {
+          source: `BingX Swap V2 REST (${endpointUsed}/openApi/swap/v2/quote/depth)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: bids.length === 0 || asks.length === 0 ? ['orderbook'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        symbol,
+        bids: [],
+        asks: [],
+        provenance: {
+          source: 'BingX Swap V2 REST (/openApi/swap/v2/quote/depth)',
+          fetchedAt,
+          stale: false,
+          fallback: false,
+          missingData: ['orderbook'],
+          isDemo: false,
+        },
+      };
+    }
+  }
+
+  public async fetchSpotTicker(symbol: string): Promise<SpotTickerSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const { spotSymbol, multiplier } = resolveSpotSymbolMultiplier(symbol);
+    const bingxSpotSymbol = toBingXSymbol(spotSymbol);
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } = await this.request<
+        Array<{
+          symbol: string;
+          lastPrice: string;
+          quoteVolume: string;
+          priceChangePercent: string;
+        }>
+      >(`/openApi/spot/v1/ticker/24hr?symbol=${encodeURIComponent(bingxSpotSymbol)}`);
+      const row = Array.isArray(data?.data) ? data.data[0] : undefined;
+      const rawPrice = Number.parseFloat(row?.lastPrice ?? '');
+      const rawQuoteVol = Number.parseFloat(row?.quoteVolume ?? '');
+      const rawChg = Number.parseFloat(
+        String(row?.priceChangePercent ?? '').replace('%', '')
+      );
+      const spotPrice =
+        Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice * multiplier : null;
+
+      return {
+        symbol,
+        spotSymbol,
+        priceMultiplier: multiplier,
+        spotPrice,
+        spotQuoteVolume24h:
+          Number.isFinite(rawQuoteVol) && rawQuoteVol >= 0 ? rawQuoteVol : null,
+        spotPriceChangePercent24h: Number.isFinite(rawChg) ? rawChg : null,
+        provenance: {
+          source: `BingX Spot V1 REST (${endpointUsed}/openApi/spot/v1/ticker/24hr)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: spotPrice === null ? ['spotTicker'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        symbol,
+        spotSymbol,
+        priceMultiplier: multiplier,
+        spotPrice: null,
+        spotQuoteVolume24h: null,
+        spotPriceChangePercent24h: null,
+        provenance: {
+          source: 'BingX Spot V1 REST (/openApi/spot/v1/ticker/24hr)',
+          fetchedAt,
+          stale: false,
+          fallback: false,
+          missingData: ['spotTicker'],
+          isDemo: false,
+        },
+      };
+    }
   }
 }
 
@@ -1978,6 +2446,16 @@ export class DemoExchangeAdapter implements ExchangeAdapter {
     };
   }
 
+  public async fetchKlines1m(
+    symbol: string,
+    limit = 20
+  ): Promise<{
+    klines: Kline[];
+    provenance: DataProvenance;
+  }> {
+    return this.fetchKlines(symbol, '1m' as unknown as Timeframe, limit);
+  }
+
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
@@ -2135,6 +2613,112 @@ export class DemoExchangeAdapter implements ExchangeAdapter {
       },
     };
   }
+
+  public async fetchOrderBookDepth(
+    symbol: string,
+    limit = 50
+  ): Promise<OrderBookSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const seed =
+      DEMO_SYMBOLS.find((s) => s.symbol === symbol) || DEMO_SYMBOLS[0];
+    const mid = seed.lastPrice;
+    const baseLevelNotional = Math.max(
+      12_000,
+      Math.min(380_000, seed.quoteVolume24h * 0.000035)
+    );
+    const levelsCount = Math.min(50, Math.max(20, limit));
+    const isBullBias =
+      seed.pattern === 'BULL_SMC' || seed.pattern === 'WATCH_BULL';
+    const isBearBias =
+      seed.pattern === 'BEAR_SMC' || seed.pattern === 'WATCH_BEAR';
+
+    const bids: OrderBookLevel[] = [];
+    const asks: OrderBookLevel[] = [];
+
+    for (let i = 0; i < levelsCount; i++) {
+      const stepBps = 1.5 + i * 2.8;
+      const bidPrice = Number((mid * (1 - stepBps / 10_000)).toPrecision(6));
+      const askPrice = Number((mid * (1 + stepBps / 10_000)).toPrecision(6));
+
+      const bidBias = isBullBias ? 1.32 : isBearBias ? 0.78 : 1.02;
+      const askBias = isBearBias ? 1.35 : isBullBias ? 0.8 : 0.98;
+      const bidWallMult = i === 6 ? 4.4 : i === 15 ? 3.2 : 1 + (i % 4) * 0.14;
+      const askWallMult = i === 8 ? 4.1 : i === 17 ? 3.0 : 1 + ((i + 2) % 4) * 0.14;
+
+      const bidNotional = baseLevelNotional * bidBias * bidWallMult;
+      const askNotional = baseLevelNotional * askBias * askWallMult;
+
+      bids.push({
+        price: bidPrice,
+        quantity: Number((bidNotional / bidPrice).toFixed(4)),
+      });
+      asks.push({
+        price: askPrice,
+        quantity: Number((askNotional / askPrice).toFixed(4)),
+      });
+    }
+
+    return {
+      symbol,
+      bids,
+      asks,
+      provenance: {
+        source: 'DEMO_SYNTHETIC_DATASET',
+        fetchedAt,
+        stale: false,
+        fallback: false,
+        missingData: [],
+        isDemo: true,
+      },
+    };
+  }
+
+  public async fetchSpotTicker(symbol: string): Promise<SpotTickerSnapshot> {
+    const fetchedAt = new Date().toISOString();
+    const seed =
+      DEMO_SYMBOLS.find((s) => s.symbol === symbol) || DEMO_SYMBOLS[0];
+    const { spotSymbol, multiplier } = resolveSpotSymbolMultiplier(symbol);
+
+    let basisPct = 0.025;
+    let perpToSpotRatio = 2.6;
+    if (seed.pattern === 'HIGH_RISK_SQUEEZE') {
+      basisPct = 0.19;
+      perpToSpotRatio = 7.4;
+    } else if (seed.pattern === 'BULL_SMC') {
+      basisPct = 0.035;
+      perpToSpotRatio = 1.75;
+    } else if (seed.pattern === 'BEAR_SMC') {
+      basisPct = -0.135;
+      perpToSpotRatio = 3.8;
+    } else if (seed.pattern === 'WATCH_BULL') {
+      basisPct = 0.045;
+      perpToSpotRatio = 2.05;
+    }
+
+    const spotPrice = Number(
+      (seed.lastPrice / (1 + basisPct / 100)).toPrecision(6)
+    );
+    const spotQuoteVolume24h = Math.round(seed.quoteVolume24h / perpToSpotRatio);
+
+    return {
+      symbol,
+      spotSymbol,
+      priceMultiplier: multiplier,
+      spotPrice,
+      spotQuoteVolume24h,
+      spotPriceChangePercent24h: Number(
+        (seed.priceChangePercent24h - basisPct * 0.5).toFixed(2)
+      ),
+      provenance: {
+        source: 'DEMO_SYNTHETIC_DATASET',
+        fetchedAt,
+        stale: false,
+        fallback: false,
+        missingData: [],
+        isDemo: true,
+      },
+    };
+  }
 }
 
 export function generateDeterministicHistoricalOiAndFunding(params: {
@@ -2236,6 +2820,8 @@ export function generateDeterministicSmcKlines(params: {
       const high = basePrice + step * (relFromEnd > 14 ? 1.4 : 0.45);
       const low = basePrice - step * (relFromEnd > 14 ? 1.4 : 0.45);
       const volume = 12000 + (i % 7) * 2500;
+      const quoteVol = Number((volume * close).toFixed(2));
+      const buyRatio = close >= open ? 0.53 : 0.47;
       klines.push({
         openTime,
         open: Number(open.toPrecision(6)),
@@ -2244,7 +2830,9 @@ export function generateDeterministicSmcKlines(params: {
         close: Number(close.toPrecision(6)),
         volume,
         closeTime,
-        quoteVolume: Number((volume * close).toFixed(2)),
+        quoteVolume: quoteVol,
+        takerBuyVolume: Number((volume * buyRatio).toFixed(2)),
+        takerBuyQuoteVolume: Number((quoteVol * buyRatio).toFixed(2)),
         isClosed: !isLastUnclosed,
       });
       continue;
@@ -2268,6 +2856,8 @@ export function generateDeterministicSmcKlines(params: {
       const low = Math.min(open, close) - step * 0.12;
       price = close;
       const volume = 12000 + (i % 7) * 2500;
+      const quoteVol = Number((volume * close).toFixed(2));
+      const buyRatio = close >= open ? 0.58 : 0.42;
       klines.push({
         openTime,
         open: Number(open.toPrecision(6)),
@@ -2276,7 +2866,9 @@ export function generateDeterministicSmcKlines(params: {
         close: Number(close.toPrecision(6)),
         volume,
         closeTime,
-        quoteVolume: Number((volume * close).toFixed(2)),
+        quoteVolume: quoteVol,
+        takerBuyVolume: Number((volume * buyRatio).toFixed(2)),
+        takerBuyQuoteVolume: Number((quoteVol * buyRatio).toFixed(2)),
         isClosed: !isLastUnclosed,
       });
       continue;
@@ -2368,6 +2960,15 @@ export function generateDeterministicSmcKlines(params: {
 
     price = close;
     const volume = 12000 + (i % 7) * 2500 + (relFromEnd <= 4 ? 18000 : 0);
+    const quoteVol = Number((volume * close).toFixed(2));
+    const buyRatio =
+      close >= open
+        ? relFromEnd <= 3
+          ? 0.72
+          : 0.61
+        : relFromEnd <= 3
+          ? 0.28
+          : 0.39;
 
     klines.push({
       openTime,
@@ -2377,7 +2978,9 @@ export function generateDeterministicSmcKlines(params: {
       close: Number(close.toPrecision(6)),
       volume,
       closeTime,
-      quoteVolume: Number((volume * close).toFixed(2)),
+      quoteVolume: quoteVol,
+      takerBuyVolume: Number((volume * buyRatio).toFixed(2)),
+      takerBuyQuoteVolume: Number((quoteVol * buyRatio).toFixed(2)),
       isClosed: !isLastUnclosed,
     });
   }

@@ -1,12 +1,15 @@
 import {
+  BtcMarketRegime,
   CandidateScarcityRootCauseVerdict,
   CycleCandidateFunnel,
   DataProvenance,
   DataQualityReport,
+  EarlyIgnitionSignal,
   EvidenceItem,
   ExchangeId,
   FinalTradeSignal,
   FullMarketGateStatistics,
+  Kline,
   MarketRadarCategory,
   MarketScannerConfig,
   MarketScanResponse,
@@ -42,6 +45,8 @@ import {
   enforceProvenanceIntegrity,
   isVerifiedLivePublicApiSource,
 } from '../utils/provenanceQuarantine.ts';
+import { classifyTradeHorizon } from './TradeHorizonClassifier.ts';
+import { evaluateBtcMarketRegime } from './BtcCorrelationEngine.ts';
 import {
   buildSmcGateDiagnosticsSummary,
   deriveSymbolSmcGateEvaluationFromAnalysis,
@@ -70,6 +75,9 @@ export interface MarketScanOptions {
   historicalVolumeTimeframe?: VolumeTimeframe;
   currentVolume15mMap?: Map<string, number>;
   historicalVolumeMap?: Map<string, number[]>;
+  btcMarketRegime?: BtcMarketRegime | null;
+  btcKlines15m?: Kline[];
+  btcKlines1h?: Kline[];
   smcMap?: Map<
     string,
     Pick<SmcAnalysisResult, 'actionState' | 'waitReasons'> &
@@ -166,9 +174,16 @@ export function runMarketScan(
       return true;
     });
 
-  // Find BTCUSDT 24h change as market benchmark
+  // Find BTCUSDT 24h change as market benchmark & evaluate BTC Market Regime
   const btcTicker = eligibleTickers.find((t) => t.symbol === 'BTCUSDT');
   const btcChange24h = btcTicker ? btcTicker.priceChangePercent24h : null;
+  const resolvedBtcRegime =
+    options.btcMarketRegime ??
+    evaluateBtcMarketRegime({
+      btcChange24h,
+      btcKlines15m: options.btcKlines15m,
+      btcKlines1h: options.btcKlines1h,
+    });
 
   // Compute cross-sectional 24h quoteVolume rank strictly as an AUXILIARY metric (never pretending to be historical volume anomaly)
   const sortedByVolume = [...eligibleTickers].sort(
@@ -527,6 +542,23 @@ export function runMarketScan(
           blockedAfterSmcCandidateCount++;
           blockedAfterSmcCandidateReasons.RADAR_DIRECTION_CONFLICT =
             (blockedAfterSmcCandidateReasons.RADAR_DIRECTION_CONFLICT ?? 0) + 1;
+        } else if (
+          ticker.symbol !== 'BTCUSDT' &&
+          ((smcActionState === 'LONG CANDIDATE' &&
+            resolvedBtcRegime.blocksLongAlts) ||
+            (smcActionState === 'SHORT CANDIDATE' &&
+              resolvedBtcRegime.blocksShortAlts))
+        ) {
+          const blockedSideZh =
+            smcActionState === 'LONG CANDIDATE' ? '多單' : '空單';
+          smcActionState = 'WATCH';
+          const reason = `BTC 大盤趨勢濾網攔截（${resolvedBtcRegime.state}）：暫停逆勢或高波動下山寨幣${blockedSideZh}升格`;
+          if (!smcWaitReasons.includes(reason)) {
+            smcWaitReasons.push(reason);
+          }
+          blockedAfterSmcCandidateCount++;
+          blockedAfterSmcCandidateReasons.BTC_REGIME_FILTER =
+            (blockedAfterSmcCandidateReasons.BTC_REGIME_FILTER ?? 0) + 1;
         } else if (
           smcActionState === 'LONG CANDIDATE' &&
           marketRadarCategory !== '雷達多頭觀察'
@@ -1327,6 +1359,127 @@ export function runMarketScan(
       },
     ];
 
+    const earlyInflection = cachedSmc?.smcAnalysis?.earlyInflection;
+    const rvol15m =
+      historicalVolume.status === 'READY' ? historicalVolume.rvol : null;
+    const zScore15m =
+      historicalVolume.status === 'READY' ? historicalVolume.zScore : null;
+
+    let earlyIgnition: EarlyIgnitionSignal = {
+      status: 'NONE',
+      tier: 'NONE',
+      direction: 'NEUTRAL',
+      ignitionScore: 0,
+      change24hPct: Number(ticker.priceChangePercent24h.toFixed(2)),
+      rvol15m,
+      zScore15m,
+      triggerTimeframe: null,
+      sweepDetected: false,
+      mssOrBreakDetected: false,
+      displacementDetected: false,
+      invalidationPrice: null,
+      invalidationLabel: null,
+      headlineZh: '未觸發早鳥起漲條件',
+      riskWarningZh:
+        '早鳥試單觀察：尚未獲高週期確認，嚴格守前低／掃單極值止損，不計入正式 SMC 候選',
+    };
+
+    const safeForEarlyIgnition =
+      !isLowLiquidity &&
+      !extremeFunding &&
+      !lowLiquidityHighVolatility &&
+      !hasCoreMissingOrStale;
+
+    if (safeForEarlyIgnition && absChange <= 7.5) {
+      const hasStructuralInflection =
+        earlyInflection !== undefined &&
+        earlyInflection.direction !== 'NEUTRAL' &&
+        (rvol15m === null || rvol15m >= 1.15);
+      const hasVolumeIgnition =
+        historyGatePassed &&
+        absChange >= 1.0 &&
+        absChange <= 6.5 &&
+        ((rvol15m !== null && rvol15m >= 1.75) ||
+          (zScore15m !== null && zScore15m >= 1.65)) &&
+        Math.abs(relativeBtcStrength) >= 1.0;
+
+      if (hasStructuralInflection || hasVolumeIgnition) {
+        const dir: 'LONG' | 'SHORT' = hasStructuralInflection
+          ? (earlyInflection!.direction as 'LONG' | 'SHORT')
+          : ticker.priceChangePercent24h >= 0
+            ? 'LONG'
+            : 'SHORT';
+
+        const btcOpposesEarly =
+          ticker.symbol !== 'BTCUSDT' &&
+          ((dir === 'LONG' && resolvedBtcRegime.blocksLongAlts) ||
+            (dir === 'SHORT' && resolvedBtcRegime.blocksShortAlts));
+
+        if (!btcOpposesEarly) {
+          // Sweet spot for early entry: 1.0% - 5.0% 24h move
+          const earlyMovePts =
+            absChange <= 5.0
+              ? Math.round(10 + Math.min(absChange, 5) * 3)
+              : Math.max(4, Math.round(25 - (absChange - 5.0) * 5));
+          const rvolPts =
+            rvol15m !== null
+              ? Math.min(35, Math.max(0, Math.round((rvol15m - 0.9) * 20)))
+              : 12;
+          const structPts = hasStructuralInflection
+            ? (earlyInflection!.sweepDetected ? 18 : 0) +
+              (earlyInflection!.mssOrBreakDetected ? 15 : 0) +
+              (earlyInflection!.displacementDetected ? 12 : 0)
+            : 0;
+          const ignitionScore = Math.min(99, earlyMovePts + rvolPts + structPts);
+
+          const volTag =
+            rvol15m !== null ? `15m RVOL ${rvol15m}x` : '15m 量能累積中';
+          const moveTag = `24h ${ticker.priceChangePercent24h >= 0 ? '+' : ''}${ticker.priceChangePercent24h.toFixed(2)}%`;
+
+          earlyIgnition = {
+            status: dir === 'LONG' ? 'IGNITION_LONG' : 'IGNITION_SHORT',
+          tier: hasStructuralInflection
+            ? 'STRUCTURAL_IGNITION'
+            : 'VOLUME_IGNITION',
+          direction: dir,
+          ignitionScore,
+          change24hPct: Number(ticker.priceChangePercent24h.toFixed(2)),
+          rvol15m,
+          zScore15m,
+          triggerTimeframe: hasStructuralInflection
+            ? earlyInflection!.timeframe
+            : '15m',
+          sweepDetected: hasStructuralInflection
+            ? earlyInflection!.sweepDetected
+            : false,
+          mssOrBreakDetected: hasStructuralInflection
+            ? earlyInflection!.mssOrBreakDetected
+            : false,
+          displacementDetected: hasStructuralInflection
+            ? earlyInflection!.displacementDetected
+            : false,
+          invalidationPrice: hasStructuralInflection
+            ? earlyInflection!.invalidationPrice
+            : null,
+          invalidationLabel: hasStructuralInflection
+            ? earlyInflection!.invalidationLabel
+            : null,
+            headlineZh: hasStructuralInflection
+              ? `${earlyInflection!.descriptionZh} · ${volTag} · ${moveTag}`
+              : `15m 剛放量點火 (${volTag} / Z=${zScore15m ?? 'N/A'}) · ${moveTag}（尚在啟動初段）`,
+            riskWarningZh:
+              '早鳥試單觀察：尚未獲高週期確認，嚴格守前低／掃單極值止損，不計入正式 SMC 候選',
+          };
+        } else {
+          earlyIgnition = {
+            ...earlyIgnition,
+            headlineZh: `早鳥訊號已由 BTC 大盤濾網攔截 (${resolvedBtcRegime.state})`,
+            riskWarningZh: resolvedBtcRegime.warningZh,
+          };
+        }
+      }
+    }
+
     allCandidates.push({
       symbol: ticker.symbol,
       baseAsset: ticker.baseAsset,
@@ -1391,6 +1544,31 @@ export function runMarketScan(
       nextBarOpenTime,
       entryWindowDelayMs,
       intendedDirection,
+      earlyIgnition,
+      entryZoneSummary: cachedSmc?.smcAnalysis?.entryZoneAnalysis ?? null,
+      tradeHorizon:
+        smcEvaluationStatus !== 'PENDING' || earlyIgnition.status !== 'NONE'
+          ? classifyTradeHorizon({
+              smcActionState,
+              intendedDirection,
+              mtfAlignment: cachedSmc?.smcAnalysis?.mtfAlignment ?? null,
+              atrPercent: cachedSmc?.smcAnalysis?.atrPercent ?? null,
+              priceChangePercent24h: ticker.priceChangePercent24h,
+              quoteVolume24h: ticker.quoteVolume24h,
+              fundingRate: ticker.fundingRate,
+              entryZoneAnalysis:
+                cachedSmc?.smcAnalysis?.entryZoneAnalysis ?? null,
+              earlyIgnition,
+              bosOrMssDetected:
+                cachedSmc?.smcAnalysis?.bosOrMss?.detected ?? false,
+              displacementDetected:
+                cachedSmc?.smcAnalysis?.displacement?.detected ?? false,
+              rvol:
+                historicalVolume.status === 'READY'
+                  ? historicalVolume.rvol
+                  : null,
+            })
+          : null,
     });
   }
 
@@ -1680,6 +1858,7 @@ export function runMarketScan(
     missingData: finalProvenance.missingData,
     ruleVersion: MARKET_SCAN_RULE_VERSION,
     btcBenchmarkChange24h: btcChange24h,
+    btcMarketRegime: resolvedBtcRegime,
     candidates: allCandidates,
     summaryCounts,
     marketRadarCounts,

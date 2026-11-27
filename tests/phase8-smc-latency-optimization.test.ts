@@ -800,7 +800,7 @@ describe('Phase 8: SMC Candidate Detection Latency Optimization & Fast Lane Veri
       smcQueueConfig: {
         maxJobConcurrency: 4,
         maxHttpConcurrency: 8,
-        maxRequestsPerMinute: 1200,
+        maxRequestsPerMinute: 4000,
         batchSize: 60,
       },
     });
@@ -1264,7 +1264,7 @@ describe('Phase 8: SMC Candidate Detection Latency Optimization & Fast Lane Veri
       config: {
         maxJobConcurrency: 2,
         maxHttpConcurrency: 8,
-        maxRequestsPerMinute: 4000,
+        maxRequestsPerMinute: 20000,
         batchSize: 60,
         baseBackoffMs: 15,
         priorityAgeMs: 10_000,
@@ -1313,7 +1313,7 @@ describe('Phase 8: SMC Candidate Detection Latency Optimization & Fast Lane Veri
     assert.ok(prewarm1.prewarmDurationMs >= 0);
 
     // Drain all 523 jobs in Cycle 1 with maxJobConcurrency = 2
-    while (service.getStatus('binance_usdm', 'live').queuedCount > 0) {
+    while (db.getSmcScanQueueStats('binance_usdm').queuedCount > 0) {
       await service.processNextBatch('binance_usdm', 'live', 60);
     }
 
@@ -1397,7 +1397,7 @@ describe('Phase 8: SMC Candidate Detection Latency Optimization & Fast Lane Veri
     assert.equal(prewarm2.isColdStart, false, 'Cycle 2 with populated cache must be Warm Cache');
     assert.equal(prewarm2.prewarmCacheHitRate, 100);
 
-    while (service.getStatus('binance_usdm', 'live').queuedCount > 0) {
+    while (db.getSmcScanQueueStats('binance_usdm').queuedCount > 0) {
       await service.processNextBatch('binance_usdm', 'live', 60);
     }
     const statusCycle2 = service.getStatus('binance_usdm', 'live');
@@ -1427,7 +1427,7 @@ describe('Phase 8: SMC Candidate Detection Latency Optimization & Fast Lane Veri
     assert.equal(prewarm3.isColdStart, false, 'Cycle 3 must be Warm Cache');
     assert.equal(prewarm3.prewarmCacheHitRate, 100);
 
-    while (service.getStatus('binance_usdm', 'live').queuedCount > 0) {
+    while (db.getSmcScanQueueStats('binance_usdm').queuedCount > 0) {
       await service.processNextBatch('binance_usdm', 'live', 60);
     }
     const statusCycle3 = service.getStatus('binance_usdm', 'live');

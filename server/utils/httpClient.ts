@@ -185,7 +185,44 @@ export async function fetchWithResilience<T>(
           );
         }
 
-        const data = (await res.json()) as T;
+        const rawText = await res.text();
+        if (!rawText || !rawText.trim()) {
+          lastStatusCode = res.status || 502;
+          const emptyErr = new ExchangeApiUnavailableError(
+            `${exchangeLabel} returned empty response body`,
+            base,
+            {
+              statusCode: lastStatusCode,
+              attempts: totalAttempts,
+            }
+          );
+          lastError = emptyErr;
+          if (retry < maxRetriesPerEndpoint) {
+            await sleep(baseRetryDelayMs * Math.pow(2, retry));
+            continue;
+          }
+          throw emptyErr;
+        }
+        let data: T;
+        try {
+          data = JSON.parse(rawText) as T;
+        } catch (parseErr) {
+          lastStatusCode = res.status || 502;
+          const jsonErr = new ExchangeApiUnavailableError(
+            `${exchangeLabel} invalid/truncated JSON response: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+            base,
+            {
+              statusCode: lastStatusCode,
+              attempts: totalAttempts,
+            }
+          );
+          lastError = jsonErr;
+          if (retry < maxRetriesPerEndpoint) {
+            await sleep(baseRetryDelayMs * Math.pow(2, retry));
+            continue;
+          }
+          throw jsonErr;
+        }
         return {
           data,
           endpointUsed: base,

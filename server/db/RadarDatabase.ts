@@ -3,17 +3,37 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  AutoBacktestBatchRunRecord,
+  AutoBacktestConfig,
   BackgroundScanRunRecord,
   BacktestResult,
+  BacktestTriggerSource,
   CandidateDiagnosisStatus,
   DataProvenance,
   ExchangeId,
+  ExternalNotificationChannel,
+  ExternalNotificationConfig,
+  ExternalNotificationDispatchLog,
+  ExternalNotificationSignalTrack,
+  ExternalNotificationStatus,
   FinalTradeSignal,
   Kline,
   MarketRadarCategory,
   MarketTicker,
+  PaperFillStatus,
   PaperLedgerEntry,
+  PaperLimitExpiredReason,
+  PaperStrategyTrack,
+  PaperTrackComparisonStats,
+  PaperTrackMetricSummary,
   Phase6DiagnosticsReport,
+  PositionHealthState,
+  PositionSentinelAlert,
+  PositionSentinelAlertSeverity,
+  PositionSentinelConfig,
+  PositionSentinelEventType,
+  PositionSentinelSourceType,
+  PositionSentinelTrackedPosition,
   ScanCategory,
   SmcActionState,
   SmcAnalysisResult,
@@ -94,7 +114,27 @@ import {
   SymbolSmcGateEvaluation,
   ScopedGateStatisticsSummary,
   ObservationShadowComparisonSummary,
+  CandidateEvidenceType,
+  Confirmed15mCloseEventRecord,
+  ControlledLiveFixtureSummary,
+  LiveCaptureCandidateRecord,
+  LiveCaptureValidationStatus,
+  LiveCloseEventWindowReport,
+  NearMissDistributionSummary,
+  PaperQualityLiveCaptureEventsResponse,
+  PaperQualityLiveCaptureResponse,
+  PaperQualityLiveCaptureSummaryResponse,
+  SharedAtomicLiveCaptureBundle,
+  SignalQualityCalibrationSummary,
+  SmcNearMissSymbolRecord,
+  SnapshotConsistencyMode,
+  StrategyValidityStatus,
+  TradingCostConfig,
 } from '../../src/types/market.ts';
+import {
+  calculateTradeTradingCosts,
+  normalizeTradingCostConfig,
+} from '../engine/TradingCostModel.ts';
 import { DEFAULT_AGGREGATION_WINDOWS } from '../engine/VolumeAnomalyEngine.ts';
 import {
   buildSmcGateDiagnosticsSummary,
@@ -106,6 +146,7 @@ import {
   enforceProvenanceIntegrity,
   isTestFixtureSourceName,
   isVerifiedLivePublicApiSource,
+  resolveCandidateEvidenceType,
 } from '../utils/provenanceQuarantine.ts';
 
 export interface HistoricalVolumeRow {
@@ -123,9 +164,15 @@ export interface HistoricalVolumeRow {
 }
 
 export class RadarDatabase {
-  private readonly db: DatabaseSync;
+  private db: DatabaseSync;
   public readonly dbPath: string;
   public readonly databaseInstanceId: string;
+  private readonly ledgerCheckpointPath: string | null;
+  private isRecoveringRuntimeDb = false;
+  private isRestoringLedgerCheckpoint = false;
+  private lastLedgerPriceCheckpointAtMs = 0;
+  private lastRuntimeRecoveryAtMs = 0;
+  private readonly runtimeSchemaHooks: Array<() => void> = [];
   private readonly runtimeHttpMetricsByExchange = new Map<
     ExchangeId,
     {
@@ -139,6 +186,84 @@ export class RadarDatabase {
       rateLimitEventsCount: number;
     }
   >();
+  private readonly smcStateGenerationByExchange = new Map<ExchangeId, number>();
+  private lastIntegrityCheckAtMs = 0;
+  private lastIntegrityCheckResult = 'ok';
+  private readonly lastReconciledKeyByExchange = new Map<ExchangeId, string>();
+  private readonly parsedSmcRowCache = new Map<
+    string,
+    { cacheKey: string; record: SmcScanResultRecord }
+  >();
+  private readonly bulkHistVolCache = new Map<
+    string,
+    { tc: number; dv: number; result: Map<string, number[]> }
+  >();
+
+  public static isSqliteBusyError(err: unknown): boolean {
+    if (!err) return false;
+    const errObj = err as { code?: string; errcode?: number; errstr?: string; message?: string };
+    const msg = `${err instanceof Error ? err.message : String(err)} ${errObj.errstr ?? ''}`;
+    if (errObj.errcode === 5 || errObj.errcode === 6) {
+      return true;
+    }
+    return /database is locked|SQLITE_BUSY|SQLITE_LOCKED|\bbusy\b/i.test(msg);
+  }
+
+  public static isSqliteCorruptionError(err: unknown): boolean {
+    if (!err || RadarDatabase.isSqliteBusyError(err)) {
+      return false;
+    }
+    const errObj = err as { code?: string; errcode?: number; errstr?: string; message?: string };
+    const msg = `${err instanceof Error ? err.message : String(err)} ${errObj.errstr ?? ''}`;
+    if (errObj.errcode === 11 || errObj.errcode === 26) {
+      return true;
+    }
+    return /file is not a database|not a database|malformed|corrupt|disk image is malformed|unsupported file format|database disk image/i.test(
+      msg
+    );
+  }
+
+  private static hasValidSqliteHeader(filePath: string): boolean {
+    try {
+      if (!fs.existsSync(filePath)) return false;
+      const stat = fs.statSync(filePath);
+      if (stat.size < 100) return false;
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const buf = Buffer.alloc(16);
+        const bytesRead = fs.readSync(fd, buf, 0, 16, 0);
+        return (
+          bytesRead >= 16 &&
+          buf.toString('utf8', 0, 15).startsWith('SQLite format 3')
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  public registerSchemaInitHook(hook: () => void): void {
+    this.runtimeSchemaHooks.push(hook);
+  }
+
+  private runRegisteredSchemaHooks(): void {
+    for (const hook of this.runtimeSchemaHooks) {
+      try {
+        hook();
+      } catch (err) {
+        console.error('[RadarDatabase] Schema init hook error after recovery:', err);
+      }
+    }
+  }
+
+  private touchSmcState(exchange: ExchangeId): void {
+    const nextGen = (this.smcStateGenerationByExchange.get(exchange) ?? 0) + 1;
+    this.smcStateGenerationByExchange.set(exchange, nextGen);
+    this.atomicSnapshotCache.delete(exchange);
+    this.cycleDiagnosticsCache.delete(exchange);
+  }
 
   public updateRuntimeHttpMetrics(
     exchange: ExchangeId,
@@ -165,14 +290,19 @@ export class RadarDatabase {
       symbolsWithTickerOi: new Set<string>(),
       rateLimitEventsCount: 0,
     };
+    let structuralChanged = false;
+    let cycleChanged = false;
     if (partial.resetCompletedHttpRequests) {
       existing.completedHttpRequests = 0;
       existing.rateLimitEventsCount = 0;
+      structuralChanged = true;
     }
     if (partial.cycleId !== undefined) {
       if (existing.cycleId && existing.cycleId !== partial.cycleId) {
         existing.completedHttpRequests = 0;
         existing.rateLimitEventsCount = 0;
+        cycleChanged = true;
+        structuralChanged = true;
       }
       existing.cycleId = partial.cycleId;
     }
@@ -181,6 +311,7 @@ export class RadarDatabase {
         0,
         partial.completedHttpRequests
       );
+      structuralChanged = true;
     }
     if (partial.incrementCompletedHttpRequests !== undefined) {
       existing.completedHttpRequests = Math.max(
@@ -201,9 +332,15 @@ export class RadarDatabase {
       );
     }
     if (partial.requiresPerSymbolOiHttp !== undefined) {
+      if (existing.requiresPerSymbolOiHttp !== partial.requiresPerSymbolOiHttp) {
+        structuralChanged = true;
+      }
       existing.requiresPerSymbolOiHttp = partial.requiresPerSymbolOiHttp;
     }
     if (partial.symbolsWithTickerOi !== undefined) {
+      if (existing.symbolsWithTickerOi.size !== partial.symbolsWithTickerOi.size) {
+        structuralChanged = true;
+      }
       existing.symbolsWithTickerOi = partial.symbolsWithTickerOi;
     }
     if (partial.incrementRateLimitEvents !== undefined) {
@@ -214,11 +351,19 @@ export class RadarDatabase {
     }
     this.runtimeHttpMetricsByExchange.set(exchange, existing);
 
-    if (
-      partial.resetCompletedHttpRequests ||
+    if (structuralChanged) {
+      this.atomicSnapshotCache.delete(exchange);
+    }
+
+    const shouldFlushToSqlite =
+      Boolean(partial.resetCompletedHttpRequests) ||
+      cycleChanged ||
       partial.completedHttpRequests !== undefined ||
-      partial.incrementCompletedHttpRequests !== undefined
-    ) {
+      (partial.incrementCompletedHttpRequests !== undefined &&
+        (existing.completedHttpRequests <= 1 ||
+          existing.completedHttpRequests % 25 === 0));
+
+    if (shouldFlushToSqlite) {
       try {
         this.db
           .prepare(
@@ -243,6 +388,10 @@ export class RadarDatabase {
         : path.resolve(process.cwd(), 'data', 'radar_phase2.sqlite'));
 
     this.dbPath = resolvedPath;
+    this.ledgerCheckpointPath =
+      resolvedPath && resolvedPath !== ':memory:'
+        ? `${resolvedPath}.ledger-checkpoint.json`
+        : null;
     if (resolvedPath !== ':memory:') {
       const dir = path.dirname(resolvedPath);
       if (!fs.existsSync(dir)) {
@@ -250,46 +399,698 @@ export class RadarDatabase {
       }
     }
 
-    let dbInstance = new DatabaseSync(resolvedPath);
-    if (resolvedPath !== ':memory:') {
-      try {
-        dbInstance.exec(
-          'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000;'
-        );
-      } catch {
-        // Ignore pragma warnings on special file handles
-      }
-    }
-    this.db = dbInstance;
+    let dbInstance: DatabaseSync | null = null;
+    this.db = null as unknown as DatabaseSync;
+    let recoveredFromCorruption = false;
+    let recoveryNote = 'Recovered SQLite database cleanly via startup integrity salvage';
     try {
+      dbInstance = this.openAndConfigureDatabase(resolvedPath);
+      this.db = dbInstance;
       this.initSchema();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (resolvedPath !== ':memory:' && /malformed|corrupt/i.test(msg)) {
-        try {
-          dbInstance.exec('REINDEX;');
-          this.initSchema();
-        } catch {
-          try {
-            dbInstance.close();
-          } catch {
-            // ignore
-          }
-          for (const suffix of ['', '-wal', '-shm', '-journal']) {
-            const target = `${resolvedPath}${suffix}`;
-            if (fs.existsSync(target)) {
-              fs.unlinkSync(target);
-            }
-          }
-          dbInstance = new DatabaseSync(resolvedPath);
-          (this as unknown as { db: DatabaseSync }).db = dbInstance;
-          this.initSchema();
+      if (resolvedPath !== ':memory:') {
+        const integrityStatus = this.checkDatabaseIntegrityStatus(dbInstance);
+        if (integrityStatus === 'CORRUPT') {
+          throw new Error(
+            'SQLite startup quick_check detected database disk image is malformed'
+          );
         }
+      }
+    } catch (err) {
+      if (
+        resolvedPath !== ':memory:' &&
+        RadarDatabase.isSqliteCorruptionError(err)
+      ) {
+        const result = this.recoverOrRecreateDatabase(
+          dbInstance,
+          resolvedPath,
+          err
+        );
+        dbInstance = result.dbInstance;
+        recoveryNote = result.recoverySummary;
+        this.db = dbInstance;
+        recoveredFromCorruption = true;
       } else {
         throw err;
       }
     }
     this.databaseInstanceId = this.initOrGetDatabaseInstanceId();
+    this.restorePaperLedgerFromCheckpointIfMissing();
+    if (recoveredFromCorruption) {
+      try {
+        const nowIso = new Date().toISOString();
+        this.db
+          .prepare(
+            `INSERT INTO smc_scan_meta (exchange, stats_version, database_recovery_count, last_backup_at, last_error_message, updated_at)
+             VALUES ('binance_usdm', 1, 1, NULL, ?, ?)
+             ON CONFLICT(exchange) DO UPDATE SET
+               database_recovery_count = COALESCE(smc_scan_meta.database_recovery_count, 0) + 1,
+               last_backup_at = NULL,
+               last_error_message = excluded.last_error_message,
+               updated_at = excluded.updated_at`
+          )
+          .run(recoveryNote, nowIso);
+      } catch {
+        // non-blocking recovery telemetry
+      }
+    }
+  }
+
+  private openAndConfigureDatabase(
+    dbPath: string,
+    fullSync = false
+  ): DatabaseSync {
+    const dbInstance = new DatabaseSync(dbPath);
+    if (dbPath !== ':memory:') {
+      try {
+        dbInstance.exec('PRAGMA busy_timeout = 10000;');
+      } catch (err) {
+        if (RadarDatabase.isSqliteCorruptionError(err)) {
+          try {
+            dbInstance.close();
+          } catch {
+            // ignore
+          }
+          throw err;
+        }
+      }
+      try {
+        dbInstance.exec('PRAGMA journal_mode = WAL;');
+      } catch (err) {
+        if (RadarDatabase.isSqliteCorruptionError(err)) {
+          try {
+            dbInstance.close();
+          } catch {
+            // ignore
+          }
+          throw err;
+        }
+      }
+      try {
+        dbInstance.exec(
+          fullSync
+            ? 'PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 200;'
+            : 'PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 1000;'
+        );
+      } catch (err) {
+        if (RadarDatabase.isSqliteCorruptionError(err)) {
+          try {
+            dbInstance.close();
+          } catch {
+            // ignore
+          }
+          throw err;
+        }
+      }
+    }
+    return dbInstance;
+  }
+
+  private checkDatabaseIntegrityStatus(
+    dbInstance: DatabaseSync,
+    useFullIntegrityCheck = false
+  ): 'OK' | 'BUSY' | 'CORRUPT' {
+    const pragmaSql = useFullIntegrityCheck
+      ? 'PRAGMA integrity_check(10);'
+      : 'PRAGMA quick_check(5);';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const rows = dbInstance.prepare(pragmaSql).all() as Array<{
+          quick_check?: string;
+          integrity_check?: string;
+        }>;
+        const resultValue = useFullIntegrityCheck
+          ? rows[0]?.integrity_check
+          : rows[0]?.quick_check;
+        if (
+          rows.length === 1 &&
+          String(resultValue ?? '').trim().toLowerCase() === 'ok'
+        ) {
+          return 'OK';
+        }
+        return 'CORRUPT';
+      } catch (err) {
+        if (RadarDatabase.isSqliteBusyError(err)) {
+          if (attempt === 2) {
+            return 'BUSY';
+          }
+          continue;
+        }
+        return 'CORRUPT';
+      }
+    }
+    return 'BUSY';
+  }
+
+  private isDatabaseQuickCheckOk(dbInstance: DatabaseSync): boolean {
+    return this.checkDatabaseIntegrityStatus(dbInstance) === 'OK';
+  }
+
+  private quarantineOrphanedSidecars(resolvedPath: string): void {
+    const ts = Date.now();
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      const target = `${resolvedPath}${suffix}`;
+      if (fs.existsSync(target)) {
+        try {
+          fs.renameSync(target, `${target}.corrupt.${ts}`);
+        } catch {
+          try {
+            fs.unlinkSync(target);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  }
+
+  private restoreFromVerifiedBackup(resolvedPath: string): DatabaseSync | null {
+    const backupPath = `${resolvedPath}.backup.sqlite`;
+    if (!RadarDatabase.hasValidSqliteHeader(backupPath)) {
+      return null;
+    }
+    let testBackupDb: DatabaseSync | null = null;
+    try {
+      testBackupDb = new DatabaseSync(backupPath);
+      if (this.checkDatabaseIntegrityStatus(testBackupDb, true) !== 'OK') {
+        return null;
+      }
+      const userTables = testBackupDb
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1`
+        )
+        .all() as Array<{ name?: string }>;
+      if (userTables.length === 0) {
+        return null;
+      }
+    } catch {
+      return null;
+    } finally {
+      try {
+        testBackupDb?.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    const restoreTmp = `${resolvedPath}.restore.tmp`;
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const target = `${restoreTmp}${suffix}`;
+      if (fs.existsSync(target)) {
+        try {
+          fs.unlinkSync(target);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    fs.copyFileSync(backupPath, restoreTmp);
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const target = `${resolvedPath}${suffix}`;
+      if (fs.existsSync(target)) {
+        try {
+          fs.unlinkSync(target);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    fs.renameSync(restoreTmp, resolvedPath);
+
+    const restoredDb = this.openAndConfigureDatabase(resolvedPath, true);
+    this.db = restoredDb;
+    this.initSchema();
+    if (this.checkDatabaseIntegrityStatus(restoredDb, true) !== 'OK') {
+      try {
+        restoredDb.close();
+      } catch {
+        // ignore
+      }
+      throw new Error('Restored backup failed integrity_check verification');
+    }
+    return restoredDb;
+  }
+
+  private recoverOrRecreateDatabase(
+    damagedDb: DatabaseSync | null,
+    resolvedPath: string,
+    triggerErr?: unknown
+  ): { dbInstance: DatabaseSync; recoverySummary: string } {
+    const msg =
+      triggerErr instanceof Error ? triggerErr.message : String(triggerErr ?? '');
+    const isNotADbError =
+      /file is not a database|not a database|unsupported file format/i.test(msg);
+
+    // Step 1: If NOT a header-level 'file is not a database' error, try lightweight REINDEX first
+    if (damagedDb && !isNotADbError) {
+      try {
+        damagedDb.exec('REINDEX;');
+        this.db = damagedDb;
+        this.initSchema();
+        if (this.checkDatabaseIntegrityStatus(damagedDb, true) === 'OK') {
+          return {
+            dbInstance: damagedDb,
+            recoverySummary: 'Recovered SQLite database cleanly via REINDEX',
+          };
+        }
+      } catch {
+        // Proceed to sidecar/salvage/backup recovery
+      }
+    }
+
+    // Step 2: If main file header is valid SQLite format 3 but -wal/-shm sidecars triggered NOTADB,
+    // close handle, move corrupt sidecars aside, and test reopening main file cleanly.
+    if (isNotADbError && RadarDatabase.hasValidSqliteHeader(resolvedPath)) {
+      if (damagedDb) {
+        try {
+          damagedDb.close();
+        } catch {
+          // ignore
+        }
+        damagedDb = null;
+      }
+      this.quarantineOrphanedSidecars(resolvedPath);
+      try {
+        const reopened = this.openAndConfigureDatabase(resolvedPath, true);
+        this.db = reopened;
+        this.initSchema();
+        if (this.checkDatabaseIntegrityStatus(reopened) === 'OK') {
+          return {
+            dbInstance: reopened,
+            recoverySummary:
+              'Recovered SQLite database by quarantining corrupted WAL/SHM sidecars',
+          };
+        }
+        damagedDb = reopened;
+      } catch {
+        // Proceed to backup/salvage
+      }
+    }
+
+    // Step 3: If main file header itself is corrupted/0-byte (cannot salvage tables), restore verified backup first
+    if (!RadarDatabase.hasValidSqliteHeader(resolvedPath)) {
+      if (damagedDb) {
+        try {
+          damagedDb.close();
+        } catch {
+          // ignore
+        }
+        damagedDb = null;
+      }
+      try {
+        const restored = this.restoreFromVerifiedBackup(resolvedPath);
+        if (restored) {
+          return {
+            dbInstance: restored,
+            recoverySummary:
+              'Recovered SQLite database from verified .backup.sqlite after header/file corruption',
+          };
+        }
+      } catch {
+        // Fallback to clean recreate below
+      }
+    }
+
+    // Step 4: Try row/table-level salvage (and if 0 rows were readable, prefer verified backup if available)
+    if (damagedDb) {
+      try {
+        const salvagedDb = this.salvageCorruptedDatabase(damagedDb, resolvedPath);
+        return {
+          dbInstance: salvagedDb,
+          recoverySummary:
+            'Recovered SQLite database cleanly via startup integrity salvage',
+        };
+      } catch {
+        try {
+          damagedDb.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // Step 5: Try verified backup before clean recreate
+    try {
+      const restored = this.restoreFromVerifiedBackup(resolvedPath);
+      if (restored) {
+        return {
+          dbInstance: restored,
+          recoverySummary:
+            'Recovered SQLite database from verified .backup.sqlite fallback',
+        };
+      }
+    } catch {
+      // Fallback to clean recreate
+    }
+
+    // Step 6: Last resort — remove broken DB + sidecars and initialize clean schema
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const target = `${resolvedPath}${suffix}`;
+      if (fs.existsSync(target)) {
+        try {
+          fs.unlinkSync(target);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    const freshDb = this.openAndConfigureDatabase(resolvedPath, true);
+    this.db = freshDb;
+    this.initSchema();
+    return {
+      dbInstance: freshDb,
+      recoverySummary:
+        'Reinitialized clean SQLite database after unrecoverable file corruption',
+    };
+  }
+
+  public recoverFromRuntimeSqliteError(
+    err: unknown,
+    exchange: ExchangeId = 'binance_usdm'
+  ): boolean {
+    if (
+      this.dbPath === ':memory:' ||
+      !RadarDatabase.isSqliteCorruptionError(err)
+    ) {
+      return false;
+    }
+    const nowMs = Date.now();
+    if (
+      this.isRecoveringRuntimeDb ||
+      nowMs - this.lastRuntimeRecoveryAtMs < 2000
+    ) {
+      return false;
+    }
+
+    this.isRecoveringRuntimeDb = true;
+    this.lastRuntimeRecoveryAtMs = nowMs;
+    try {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[RadarDatabase] Runtime SQLite error detected (${errMsg}); attempting automatic recovery for ${this.dbPath}`
+      );
+      try {
+        this.db.close();
+      } catch {
+        // ignore close errors on damaged/stale handle
+      }
+
+      // First try reopening from disk, but require full integrity_check(10) after a runtime corruption error
+      let recoveredDb: DatabaseSync | null = null;
+      let recoverySummary =
+        'Recovered SQLite database at runtime via clean reconnect';
+      if (RadarDatabase.hasValidSqliteHeader(this.dbPath)) {
+        try {
+          const reopened = this.openAndConfigureDatabase(this.dbPath);
+          this.db = reopened;
+          this.initSchema();
+          if (this.checkDatabaseIntegrityStatus(reopened, true) === 'OK') {
+            recoveredDb = reopened;
+          } else {
+            recoveredDb = null;
+            const res = this.recoverOrRecreateDatabase(
+              reopened,
+              this.dbPath,
+              err
+            );
+            recoveredDb = res.dbInstance;
+            recoverySummary = res.recoverySummary;
+          }
+        } catch {
+          const res = this.recoverOrRecreateDatabase(null, this.dbPath, err);
+          recoveredDb = res.dbInstance;
+          recoverySummary = res.recoverySummary;
+        }
+      } else {
+        const res = this.recoverOrRecreateDatabase(null, this.dbPath, err);
+        recoveredDb = res.dbInstance;
+        recoverySummary = res.recoverySummary;
+      }
+
+      if (!recoveredDb) {
+        return false;
+      }
+      this.db = recoveredDb;
+      this.parsedSmcRowCache.clear();
+      this.atomicSnapshotCache.clear();
+      this.cycleDiagnosticsCache.clear();
+      this.lastIntegrityCheckAtMs = 0;
+      this.lastIntegrityCheckResult = 'ok';
+      this.runRegisteredSchemaHooks();
+      this.restorePaperLedgerFromCheckpointIfMissing();
+
+      try {
+        const nowIso = new Date().toISOString();
+        this.db
+          .prepare(
+            `INSERT INTO smc_scan_meta (exchange, stats_version, database_recovery_count, last_error_message, updated_at)
+             VALUES (?, 1, 1, ?, ?)
+             ON CONFLICT(exchange) DO UPDATE SET
+               database_recovery_count = COALESCE(smc_scan_meta.database_recovery_count, 0) + 1,
+               last_error_message = excluded.last_error_message,
+               updated_at = excluded.updated_at`
+          )
+          .run(exchange, recoverySummary, nowIso);
+      } catch {
+        // non-blocking recovery telemetry
+      }
+
+      console.warn(
+        `[RadarDatabase] Runtime SQLite recovery succeeded: ${recoverySummary}`
+      );
+      return true;
+    } catch (recErr) {
+      console.error('[RadarDatabase] Runtime SQLite recovery failed:', recErr);
+      return false;
+    } finally {
+      this.isRecoveringRuntimeDb = false;
+    }
+  }
+
+  private salvageCorruptedDatabase(
+    damagedDb: DatabaseSync,
+    resolvedPath: string
+  ): DatabaseSync {
+    const salvagePath = `${resolvedPath}.salvage.tmp`;
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const target = `${salvagePath}${suffix}`;
+      if (fs.existsSync(target)) {
+        try {
+          fs.unlinkSync(target);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    const cleanDb = new DatabaseSync(salvagePath);
+    try {
+      cleanDb.exec(
+        'PRAGMA busy_timeout = 10000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 200;'
+      );
+      (this as unknown as { db: DatabaseSync }).db = cleanDb;
+      this.initSchema();
+
+      // Also recreate any tables registered by sibling DB wrappers (PaperMonitorDatabase / BacktestDatabase)
+      try {
+        const masterTables = damagedDb
+          .prepare(
+            `SELECT name, sql FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL`
+          )
+          .all() as Array<{ name?: string; sql?: string }>;
+        for (const t of masterTables) {
+          const sql = String(t.sql ?? '').trim();
+          if (!sql) continue;
+          const safeSql = sql.replace(/^CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)/i, 'CREATE TABLE IF NOT EXISTS ');
+          try {
+            cleanDb.exec(safeSql);
+          } catch {
+            // Table already created by initSchema() or non-critical DDL
+          }
+        }
+      } catch {
+        // Ignore if sqlite_master scan fails partially
+      }
+
+      const salvageBudgetDeadlineMs = Date.now() + 3000;
+      const rebuildableCacheTables = new Set([
+        'historical_volume_samples',
+        'smc_scan_candles_cache',
+        'smc_prewarm_tasks',
+        'smc_database_health_checks',
+      ]);
+      const rawTableNames = (
+        cleanDb
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name ASC`
+          )
+          .all() as Array<{ name?: string }>
+      )
+        .map((r) => String(r.name ?? ''))
+        .filter((n) => Boolean(n) && n !== 'sqlite_sequence');
+
+      const targetTables = [
+        ...rawTableNames.filter((n) => !rebuildableCacheTables.has(n)),
+        ...rawTableNames.filter((n) => rebuildableCacheTables.has(n)),
+      ];
+
+      for (const tableName of targetTables) {
+        const quotedTable = `"${tableName.replace(/"/g, '""')}"`;
+        let srcCols: string[] = [];
+        let dstCols: string[] = [];
+        try {
+          srcCols = (
+            damagedDb.prepare(`PRAGMA table_info(${quotedTable})`).all() as Array<{
+              name?: string;
+            }>
+          ).map((c) => String(c.name ?? ''));
+          dstCols = (
+            cleanDb.prepare(`PRAGMA table_info(${quotedTable})`).all() as Array<{
+              name?: string;
+            }>
+          ).map((c) => String(c.name ?? ''));
+        } catch {
+          continue;
+        }
+        const dstSet = new Set(dstCols);
+        const commonCols = srcCols.filter((c) => c && dstSet.has(c));
+        if (commonCols.length === 0) continue;
+
+        const colListSql = commonCols
+          .map((c) => `"${c.replace(/"/g, '""')}"`)
+          .join(', ');
+        const placeholdersSql = commonCols.map(() => '?').join(', ');
+        const insertStmt = cleanDb.prepare(
+          `INSERT OR IGNORE INTO ${quotedTable} (${colListSql}) VALUES (${placeholdersSql})`
+        );
+
+        try {
+          const rows = damagedDb
+            .prepare(`SELECT ${colListSql} FROM ${quotedTable}`)
+            .all() as Array<Record<string, unknown>>;
+          if (rows.length > 0) {
+            cleanDb.exec('BEGIN;');
+            for (const row of rows) {
+              insertStmt.run(...commonCols.map((c) => row[c] as never));
+            }
+            cleanDb.exec('COMMIT;');
+          }
+        } catch {
+          try {
+            cleanDb.exec('ROLLBACK;');
+          } catch {
+            // ignore
+          }
+          if (
+            rebuildableCacheTables.has(tableName) ||
+            Date.now() >= salvageBudgetDeadlineMs
+          ) {
+            continue;
+          }
+          // Row-by-row salvage on high-value tables with partially damaged B-tree pages (bounded by time budget)
+          let cursorRowid = 0;
+          const findNextStmt = damagedDb.prepare(
+            `SELECT rowid FROM ${quotedTable} WHERE rowid > ? ORDER BY rowid ASC LIMIT 1`
+          );
+          const readRowStmt = damagedDb.prepare(
+            `SELECT ${colListSql} FROM ${quotedTable} WHERE rowid = ?`
+          );
+          let batchCount = 0;
+          cleanDb.exec('BEGIN;');
+          try {
+            for (let steps = 0; steps < 50000; steps++) {
+              if ((steps & 31) === 0 && Date.now() >= salvageBudgetDeadlineMs) {
+                break;
+              }
+              let nextRow: { rowid?: number } | undefined;
+              try {
+                nextRow = findNextStmt.get(cursorRowid) as
+                  | { rowid?: number }
+                  | undefined;
+              } catch {
+                break;
+              }
+              if (
+                !nextRow ||
+                typeof nextRow.rowid !== 'number' ||
+                nextRow.rowid <= cursorRowid
+              ) {
+                break;
+              }
+              cursorRowid = nextRow.rowid;
+              try {
+                const row = readRowStmt.get(cursorRowid) as
+                  | Record<string, unknown>
+                  | undefined;
+                if (row) {
+                  insertStmt.run(...commonCols.map((c) => row[c] as never));
+                  batchCount++;
+                  if (batchCount >= 250) {
+                    cleanDb.exec('COMMIT;');
+                    cleanDb.exec('BEGIN;');
+                    batchCount = 0;
+                  }
+                }
+              } catch {
+                // Skip individual unreadable row/page
+              }
+            }
+            cleanDb.exec('COMMIT;');
+          } catch {
+            try {
+              cleanDb.exec('ROLLBACK;');
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+
+      try {
+        cleanDb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      } catch {
+        // ignore
+      }
+    } finally {
+      try {
+        cleanDb.close();
+      } catch {
+        // ignore
+      }
+      try {
+        damagedDb.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const target = `${resolvedPath}${suffix}`;
+      if (fs.existsSync(target)) {
+        fs.unlinkSync(target);
+      }
+    }
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      const tmpSidecar = `${salvagePath}${suffix}`;
+      if (fs.existsSync(tmpSidecar)) {
+        try {
+          fs.unlinkSync(tmpSidecar);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    fs.renameSync(salvagePath, resolvedPath);
+
+    const reopened = new DatabaseSync(resolvedPath);
+    reopened.exec(
+      'PRAGMA busy_timeout = 10000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 200;'
+    );
+    (this as unknown as { db: DatabaseSync }).db = reopened;
+    this.initSchema();
+    return reopened;
   }
 
   private initOrGetDatabaseInstanceId(): string {
@@ -363,7 +1164,22 @@ export class RadarDatabase {
         notes TEXT NOT NULL DEFAULT '',
         opened_at TEXT NOT NULL,
         closed_at TEXT,
-        provenance_json TEXT NOT NULL
+        provenance_json TEXT NOT NULL,
+        strategy_track TEXT NOT NULL DEFAULT 'MANUAL_OBSERVATION',
+        fill_status TEXT NOT NULL DEFAULT 'FILLED',
+        filled_at TEXT,
+        entry_anchor_label TEXT,
+        expires_at TEXT,
+        expired_reason TEXT,
+        gross_pnl_r REAL NOT NULL DEFAULT 0,
+        net_pnl_r REAL NOT NULL DEFAULT 0,
+        fee_cost_r REAL NOT NULL DEFAULT 0,
+        slippage_cost_r REAL NOT NULL DEFAULT 0,
+        funding_cost_r REAL NOT NULL DEFAULT 0,
+        total_cost_r REAL NOT NULL DEFAULT 0,
+        cost_config_json TEXT,
+        trailing_stop_price REAL,
+        breakeven_armed INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS backtest_reports (
@@ -384,8 +1200,124 @@ export class RadarDatabase {
         average_loss_r REAL,
         trades_json TEXT NOT NULL,
         provenance_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        trigger_source TEXT NOT NULL DEFAULT 'MANUAL',
+        auto_batch_id TEXT,
+        end_time TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS auto_backtest_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        interval_ms INTEGER NOT NULL DEFAULT 3600000,
+        timeframe TEXT NOT NULL DEFAULT '15m',
+        max_symbols_per_run INTEGER NOT NULL DEFAULT 15,
+        include_watchlist INTEGER NOT NULL DEFAULT 1,
+        watchlist_symbols_json TEXT NOT NULL DEFAULT '["BTCUSDT","ETHUSDT"]',
+        exchange TEXT NOT NULL DEFAULT 'binance_usdm',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS auto_backtest_batches (
+        batch_id TEXT PRIMARY KEY,
+        exchange TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL,
+        target_symbols_json TEXT NOT NULL DEFAULT '[]',
+        completed_count INTEGER NOT NULL DEFAULT 0,
+        skipped_cached_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        saved_run_ids_json TEXT NOT NULL DEFAULT '[]',
+        note TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS external_notification_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        telegram_enabled INTEGER NOT NULL DEFAULT 0,
+        discord_enabled INTEGER NOT NULL DEFAULT 0,
+        notify_formal_smc INTEGER NOT NULL DEFAULT 1,
+        notify_early_ignition INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS external_notification_logs (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        track TEXT NOT NULL,
+        action_state TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        http_status INTEGER,
+        is_test INTEGER NOT NULL DEFAULT 0,
+        message_preview TEXT NOT NULL,
+        dedupe_key TEXT,
+        cooldown_until TEXT,
         created_at TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_ext_notif_created
+        ON external_notification_logs(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS position_sentinel_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL DEFAULT 1,
+        auto_sync_paper_ledger INTEGER NOT NULL DEFAULT 1,
+        ws_stream_enabled INTEGER NOT NULL DEFAULT 1,
+        poll_interval_ms INTEGER NOT NULL DEFAULT 15000,
+        atr_shock_multiplier REAL NOT NULL DEFAULT 1.25,
+        rvol_spike_threshold REAL NOT NULL DEFAULT 2.5,
+        stop_proximity_pct REAL NOT NULL DEFAULT 0.5,
+        notify_discord INTEGER NOT NULL DEFAULT 1,
+        notify_telegram INTEGER NOT NULL DEFAULT 1,
+        notify_min_severity TEXT NOT NULL DEFAULT 'WARNING',
+        alert_cooldown_ms INTEGER NOT NULL DEFAULT 180000,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS position_sentinel_positions (
+        id TEXT PRIMARY KEY,
+        source_type TEXT NOT NULL DEFAULT 'MANUAL',
+        paper_ledger_id INTEGER UNIQUE,
+        symbol TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        side TEXT NOT NULL,
+        timeframe TEXT NOT NULL DEFAULT '15m',
+        entry_price REAL NOT NULL,
+        invalidation_price REAL NOT NULL,
+        target_price REAL,
+        leverage REAL NOT NULL DEFAULT 1,
+        active INTEGER NOT NULL DEFAULT 1,
+        paused INTEGER NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        opened_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS position_sentinel_alerts (
+        id TEXT PRIMARY KEY,
+        position_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        side TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        health_state TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        title_zh TEXT NOT NULL,
+        detail_zh TEXT NOT NULL,
+        price_at_event REAL NOT NULL,
+        suggested_defense_price REAL,
+        confirmed_close INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ps_alerts_created
+        ON position_sentinel_alerts(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ps_alerts_pos
+        ON position_sentinel_alerts(position_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS background_scan_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -677,6 +1609,60 @@ export class RadarDatabase {
       this.db.exec('ALTER TABLE smc_scan_meta ADD COLUMN lease_recovery_count INTEGER NOT NULL DEFAULT 0;');
     }
 
+    const ledgerColumns = this.db
+      .prepare("PRAGMA table_info('paper_trading_ledger')")
+      .all() as Array<{ name: string }>;
+    const existingLedgerColNames = new Set(ledgerColumns.map((c) => String(c.name)));
+    if (!existingLedgerColNames.has('strategy_track')) {
+      this.db.exec(
+        "ALTER TABLE paper_trading_ledger ADD COLUMN strategy_track TEXT NOT NULL DEFAULT 'MANUAL_OBSERVATION';"
+      );
+    }
+    if (!existingLedgerColNames.has('fill_status')) {
+      this.db.exec(
+        "ALTER TABLE paper_trading_ledger ADD COLUMN fill_status TEXT NOT NULL DEFAULT 'FILLED';"
+      );
+    }
+    if (!existingLedgerColNames.has('filled_at')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN filled_at TEXT;');
+    }
+    if (!existingLedgerColNames.has('entry_anchor_label')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN entry_anchor_label TEXT;');
+    }
+    if (!existingLedgerColNames.has('expires_at')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN expires_at TEXT;');
+    }
+    if (!existingLedgerColNames.has('expired_reason')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN expired_reason TEXT;');
+    }
+    if (!existingLedgerColNames.has('gross_pnl_r')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN gross_pnl_r REAL NOT NULL DEFAULT 0;');
+    }
+    if (!existingLedgerColNames.has('net_pnl_r')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN net_pnl_r REAL NOT NULL DEFAULT 0;');
+    }
+    if (!existingLedgerColNames.has('fee_cost_r')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN fee_cost_r REAL NOT NULL DEFAULT 0;');
+    }
+    if (!existingLedgerColNames.has('slippage_cost_r')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN slippage_cost_r REAL NOT NULL DEFAULT 0;');
+    }
+    if (!existingLedgerColNames.has('funding_cost_r')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN funding_cost_r REAL NOT NULL DEFAULT 0;');
+    }
+    if (!existingLedgerColNames.has('total_cost_r')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN total_cost_r REAL NOT NULL DEFAULT 0;');
+    }
+    if (!existingLedgerColNames.has('cost_config_json')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN cost_config_json TEXT;');
+    }
+    if (!existingLedgerColNames.has('trailing_stop_price')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN trailing_stop_price REAL;');
+    }
+    if (!existingLedgerColNames.has('breakeven_armed')) {
+      this.db.exec('ALTER TABLE paper_trading_ledger ADD COLUMN breakeven_armed INTEGER NOT NULL DEFAULT 0;');
+    }
+
     const resColumns = this.db
       .prepare("PRAGMA table_info('smc_scan_results')")
       .all() as Array<{ name: string }>;
@@ -771,6 +1757,171 @@ export class RadarDatabase {
     if (!existingResColNames.has('gate_pass_json')) {
       this.db.exec("ALTER TABLE smc_scan_results ADD COLUMN gate_pass_json TEXT NOT NULL DEFAULT '{}';");
     }
+    if (!existingResColNames.has('evidence_type')) {
+      this.db.exec("ALTER TABLE smc_scan_results ADD COLUMN evidence_type TEXT NOT NULL DEFAULT 'LIVE_PRODUCTION';");
+    }
+
+    const backtestReportCols = this.db
+      .prepare("PRAGMA table_info('backtest_reports')")
+      .all() as Array<{ name: string }>;
+    const existingBtReportColNames = new Set(
+      backtestReportCols.map((c) => String(c.name))
+    );
+    if (!existingBtReportColNames.has('trigger_source')) {
+      this.db.exec(
+        "ALTER TABLE backtest_reports ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'MANUAL';"
+      );
+    }
+    if (!existingBtReportColNames.has('auto_batch_id')) {
+      this.db.exec('ALTER TABLE backtest_reports ADD COLUMN auto_batch_id TEXT;');
+    }
+    if (!existingBtReportColNames.has('end_time')) {
+      this.db.exec('ALTER TABLE backtest_reports ADD COLUMN end_time TEXT;');
+    }
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS smc_live_capture_candidates (
+        signal_id TEXT PRIMARY KEY,
+        cycle_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        signal_bar_open_time INTEGER,
+        signal_bar_close_time INTEGER,
+        next_bar_open_time INTEGER,
+        candidate_detected_at TEXT NOT NULL,
+        signal_detected_at TEXT NOT NULL,
+        queue_entered_at TEXT,
+        evaluation_started_at TEXT NOT NULL,
+        evaluation_completed_at TEXT NOT NULL,
+        queue_wait_ms INTEGER,
+        evaluation_latency_ms INTEGER,
+        candidate_detection_latency_ms INTEGER,
+        next_bar_remaining_ms INTEGER,
+        entry_window_status TEXT NOT NULL,
+        entry_window_missed INTEGER NOT NULL DEFAULT 0,
+        is_fast_lane INTEGER NOT NULL DEFAULT 1,
+        evidence_type TEXT NOT NULL DEFAULT 'LIVE_PRODUCTION',
+        source TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        stale INTEGER NOT NULL DEFAULT 0,
+        fallback INTEGER NOT NULL DEFAULT 0,
+        is_demo INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_smc_live_capture_candidates_exchange
+        ON smc_live_capture_candidates (exchange, signal_detected_at DESC);
+
+      CREATE TABLE IF NOT EXISTS smc_controlled_fixture_candidates (
+        signal_id TEXT PRIMARY KEY,
+        cycle_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        signal_bar_open_time INTEGER,
+        signal_bar_close_time INTEGER,
+        next_bar_open_time INTEGER,
+        candidate_detected_at TEXT NOT NULL,
+        signal_detected_at TEXT NOT NULL,
+        queue_entered_at TEXT,
+        evaluation_started_at TEXT NOT NULL,
+        evaluation_completed_at TEXT NOT NULL,
+        queue_wait_ms INTEGER,
+        evaluation_latency_ms INTEGER,
+        candidate_detection_latency_ms INTEGER,
+        next_bar_remaining_ms INTEGER,
+        entry_window_status TEXT NOT NULL,
+        entry_window_missed INTEGER NOT NULL DEFAULT 0,
+        is_fast_lane INTEGER NOT NULL DEFAULT 1,
+        evidence_type TEXT NOT NULL DEFAULT 'CONTROLLED_LIVE_FIXTURE',
+        source TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        stale INTEGER NOT NULL DEFAULT 0,
+        fallback INTEGER NOT NULL DEFAULT 0,
+        is_demo INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_smc_controlled_fixture_candidates_exchange
+        ON smc_controlled_fixture_candidates (exchange, signal_detected_at DESC);
+
+      CREATE TABLE IF NOT EXISTS smc_15m_close_events (
+        event_id TEXT PRIMARY KEY,
+        exchange TEXT NOT NULL,
+        cycle_id TEXT NOT NULL,
+        bar_open_time INTEGER NOT NULL,
+        bar_close_time INTEGER NOT NULL,
+        close_event_at TEXT NOT NULL,
+        triggered_fast_lane_count INTEGER NOT NULL DEFAULT 0,
+        completed_fast_lane_count INTEGER NOT NULL DEFAULT 0,
+        formal_candidate_count INTEGER NOT NULL DEFAULT 0,
+        near_miss_count INTEGER NOT NULL DEFAULT 0,
+        candidate_detected_before_entry_count INTEGER NOT NULL DEFAULT 0,
+        entry_window_missed_count INTEGER NOT NULL DEFAULT 0,
+        pending_count INTEGER NOT NULL DEFAULT 0,
+        queue_wait_p50 INTEGER,
+        queue_wait_p95 INTEGER,
+        worker_state TEXT NOT NULL DEFAULT 'RUNNING',
+        cache_mode TEXT NOT NULL DEFAULT 'WARM_CACHE',
+        snapshot_at TEXT NOT NULL,
+        stats_version INTEGER NOT NULL DEFAULT 0,
+        evidence_type TEXT NOT NULL DEFAULT 'LIVE_PRODUCTION',
+        is_demo INTEGER NOT NULL DEFAULT 0,
+        is_test_fixture INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_smc_15m_close_events_exchange
+        ON smc_15m_close_events (exchange, evidence_type, close_event_at DESC);
+
+      CREATE TABLE IF NOT EXISTS smc_near_miss_observations (
+        observation_id TEXT PRIMARY KEY,
+        exchange TEXT NOT NULL,
+        cycle_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        smc_action_state TEXT NOT NULL,
+        market_radar_category TEXT NOT NULL,
+        intended_direction TEXT NOT NULL,
+        missing_gates_json TEXT NOT NULL,
+        missing_gate_count INTEGER NOT NULL,
+        last_blocking_gate TEXT NOT NULL,
+        wait_reasons_json TEXT NOT NULL,
+        evaluation_latency_ms INTEGER,
+        next_bar_remaining_ms INTEGER,
+        queue_wait_ms INTEGER,
+        market_regime TEXT NOT NULL,
+        funding_state TEXT NOT NULL,
+        liquidity_state TEXT NOT NULL,
+        mtf_alignment_state TEXT NOT NULL,
+        evidence_type TEXT NOT NULL DEFAULT 'LIVE_PRODUCTION',
+        is_demo INTEGER NOT NULL DEFAULT 0,
+        is_test_fixture INTEGER NOT NULL DEFAULT 0,
+        is_fast_lane INTEGER NOT NULL DEFAULT 0,
+        observed_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_smc_near_miss_observations_exchange
+        ON smc_near_miss_observations (exchange, evidence_type, observed_at DESC);
+    `);
+
+    const closeEventColumns = this.db
+      .prepare("PRAGMA table_info('smc_15m_close_events')")
+      .all() as Array<{ name: string }>;
+    const existingCloseEventCols = new Set(
+      closeEventColumns.map((c) => String(c.name))
+    );
+    if (!existingCloseEventCols.has('is_demo')) {
+      this.db.exec(
+        'ALTER TABLE smc_15m_close_events ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0;'
+      );
+    }
+    if (!existingCloseEventCols.has('is_test_fixture')) {
+      this.db.exec(
+        'ALTER TABLE smc_15m_close_events ADD COLUMN is_test_fixture INTEGER NOT NULL DEFAULT 0;'
+      );
+    }
 
     const cacheColumns = this.db
       .prepare("PRAGMA table_info('smc_scan_candles_cache')")
@@ -797,6 +1948,13 @@ export class RadarDatabase {
     if (!existingCacheColNames.has('window_key')) {
       this.db.exec('ALTER TABLE smc_scan_candles_cache ADD COLUMN window_key TEXT;');
     }
+    this.db.exec(`
+      UPDATE smc_scan_candles_cache
+      SET oi_fetched_at = NULL,
+          oi_expires_at = NULL
+      WHERE timeframe != '15m'
+        AND (oi_expires_at IS NOT NULL OR oi_fetched_at IS NOT NULL);
+    `);
 
     const cycleColumns = this.db
       .prepare("PRAGMA table_info('smc_scan_cycles')")
@@ -1672,6 +2830,41 @@ export class RadarDatabase {
       } catch {
         // Ignore if paper_monitoring_window_cycles not yet initialized
       }
+
+      // Prune unbounded telemetry/cache/job tables to prevent multi-hundred-MB bloat and WAL contention
+      // Never touches paper_trading_ledger, paper_tracked_signals, or paper_monitoring_windows.
+      try {
+        const volCutoffMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
+        const jobCutoffIso = new Date(
+          Date.now() - 48 * 60 * 60 * 1000
+        ).toISOString();
+        this.db
+          .prepare(`DELETE FROM historical_volume_samples WHERE bucket_time < ?`)
+          .run(volCutoffMs);
+        this.db
+          .prepare(
+            `DELETE FROM smc_scan_jobs
+             WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'SKIPPED')
+               AND COALESCE(completed_at, requested_at) < ?
+               AND COALESCE(cycle_id, '') NOT IN (
+                 SELECT COALESCE(scan_cycle_id, '')
+                 FROM smc_scan_meta
+                 WHERE scan_cycle_id IS NOT NULL
+               )`
+          )
+          .run(jobCutoffIso);
+        this.db.exec(`
+          DELETE FROM smc_database_health_checks
+          WHERE check_id NOT IN (
+            SELECT check_id
+            FROM smc_database_health_checks
+            ORDER BY checked_at DESC
+            LIMIT 500
+          );
+        `);
+      } catch {
+        // Non-blocking startup retention cleanup
+      }
     }
   }
 
@@ -1705,34 +2898,36 @@ export class RadarDatabase {
         is_demo = excluded.is_demo
     `);
 
-    let recorded = 0;
-    for (const t of tickers) {
-      if (!Number.isFinite(t.quoteVolume24h) || t.quoteVolume24h < 0) continue;
-      const safeProv = enforceProvenanceIntegrity(t.provenance);
-      // Never allow TEST_FIXTURE / VERIFICATION_SCRIPT / DEMO data to enter Live exchange statistics
-      if (
-        exchange !== 'demo_synthetic' &&
-        (safeProv.isDemo ||
-          safeProv.isTestFixture ||
-          !isVerifiedLivePublicApiSource(safeProv.source))
-      ) {
-        continue;
+    return this.runInTransaction(() => {
+      let recorded = 0;
+      for (const t of tickers) {
+        if (!Number.isFinite(t.quoteVolume24h) || t.quoteVolume24h < 0) continue;
+        const safeProv = enforceProvenanceIntegrity(t.provenance);
+        // Never allow TEST_FIXTURE / VERIFICATION_SCRIPT / DEMO data to enter Live exchange statistics
+        if (
+          exchange !== 'demo_synthetic' &&
+          (safeProv.isDemo ||
+            safeProv.isTestFixture ||
+            !isVerifiedLivePublicApiSource(safeProv.source))
+        ) {
+          continue;
+        }
+        stmt.run(
+          exchange,
+          t.symbol,
+          volumeTimeframe,
+          aggregationWindow,
+          volumeMetric,
+          bucketTime,
+          t.quoteVolume24h,
+          safeProv.source,
+          safeProv.fetchedAt,
+          safeProv.isDemo ? 1 : 0
+        );
+        recorded++;
       }
-      stmt.run(
-        exchange,
-        t.symbol,
-        volumeTimeframe,
-        aggregationWindow,
-        volumeMetric,
-        bucketTime,
-        t.quoteVolume24h,
-        safeProv.source,
-        safeProv.fetchedAt,
-        safeProv.isDemo ? 1 : 0
-      );
-      recorded++;
-    }
-    return recorded;
+      return recorded;
+    });
   }
 
   public recordConfirmedKlineVolumes(
@@ -1770,22 +2965,24 @@ export class RadarDatabase {
     `);
 
     let count = 0;
-    for (const k of confirmed) {
-      if (!Number.isFinite(k.quoteVolume) || k.quoteVolume < 0) continue;
-      stmt.run(
-        exchange,
-        symbol,
-        volumeTimeframe,
-        aggregationWindow,
-        volumeMetric,
-        k.openTime,
-        k.quoteVolume,
-        safeProv.source,
-        safeProv.fetchedAt,
-        safeProv.isDemo ? 1 : 0
-      );
-      count++;
-    }
+    this.runInTransaction(() => {
+      for (const k of confirmed) {
+        if (!Number.isFinite(k.quoteVolume) || k.quoteVolume < 0) continue;
+        stmt.run(
+          exchange,
+          symbol,
+          volumeTimeframe,
+          aggregationWindow,
+          volumeMetric,
+          k.openTime,
+          k.quoteVolume,
+          safeProv.source,
+          safeProv.fetchedAt,
+          safeProv.isDemo ? 1 : 0
+        );
+        count++;
+      }
+    });
     return count;
   }
 
@@ -1899,6 +3096,30 @@ export class RadarDatabase {
     maxPerSymbol = 40,
     volumeTimeframe: VolumeTimeframe = '15m'
   ): Map<string, number[]> {
+    const bulkCacheKey = `${exchange}:${maxPerSymbol}:${volumeTimeframe}`;
+    let curTc = -1;
+    let curDv = -1;
+    try {
+      const tcRow = this.db
+        .prepare('SELECT total_changes() AS tc')
+        .get() as { tc: number } | undefined;
+      const dvRow = this.db
+        .prepare('PRAGMA data_version')
+        .get() as { data_version: number } | undefined;
+      curTc = Number(tcRow?.tc ?? 0);
+      curDv = Number(dvRow?.data_version ?? 0);
+      const cachedBulk = this.bulkHistVolCache.get(bulkCacheKey);
+      if (
+        cachedBulk &&
+        cachedBulk.tc === curTc &&
+        cachedBulk.dv === curDv
+      ) {
+        return new Map(cachedBulk.result);
+      }
+    } catch {
+      // fallback to query
+    }
+
     const isLiveVenue = exchange !== 'demo_synthetic';
     const stmt = this.db.prepare(`
       SELECT symbol, quote_volume, bucket_time, source, is_demo
@@ -1930,44 +3151,108 @@ export class RadarDatabase {
 
     if (volumeTimeframe === '15m') {
       try {
-        const cacheRows = this.db
+        let exVolCache = this.cached15mCandleVolsByExchange.get(exchange);
+        if (!exVolCache) {
+          exVolCache = new Map();
+          this.cached15mCandleVolsByExchange.set(exchange, exVolCache);
+        }
+        const metaRows = this.db
           .prepare(
-            `SELECT symbol, klines_json, provenance_json FROM smc_scan_candles_cache WHERE exchange = ? AND timeframe = '15m'`
+            `SELECT symbol, fetched_at, stale, fallback, missing_data_json FROM smc_scan_candles_cache WHERE exchange = ? AND timeframe = '15m'`
           )
-          .all(exchange) as Array<Record<string, unknown>>;
-        for (const cr of cacheRows) {
-          const sym = String(cr.symbol);
+          .all(exchange) as Array<{
+          symbol: string;
+          fetched_at: string;
+          stale: number;
+          fallback: number;
+          missing_data_json: string;
+        }>;
+
+        const symbolsNeedingParse: string[] = [];
+        const versionBySymbol = new Map<string, string>();
+
+        for (const mr of metaRows) {
+          const sym = String(mr.symbol);
           const existing = map.get(sym);
           if (existing && existing.length >= 31) {
             continue;
           }
-          const prov = enforceProvenanceIntegrity(
-            JSON.parse(String(cr.provenance_json || '{}'))
-          );
-          if (
-            isLiveVenue &&
-            (prov.isDemo || !isVerifiedLivePublicApiSource(prov.source))
-          ) {
+          if (isLiveVenue && (Number(mr.stale) === 1 || Number(mr.fallback) === 1)) {
             continue;
           }
-          const klines = JSON.parse(String(cr.klines_json || '[]')) as Kline[];
-          const confirmedVols = klines
-            .filter(
-              (k) =>
-                k &&
-                k.isClosed !== false &&
-                Number.isFinite(k.quoteVolume) &&
-                k.quoteVolume >= 0
-            )
-            .sort((a, b) => a.openTime - b.openTime)
-            .map((k) => Number(k.quoteVolume));
-          if (confirmedVols.length > (existing?.length ?? 0)) {
-            map.set(sym, confirmedVols.slice(-maxPerSymbol));
+          const ver = `${String(mr.fetched_at || '')}|${String(mr.stale)}|${String(mr.fallback)}`;
+          versionBySymbol.set(sym, ver);
+          const cachedEntry = exVolCache.get(sym);
+          if (cachedEntry && cachedEntry.version === ver) {
+            if (cachedEntry.vols.length > (existing?.length ?? 0)) {
+              map.set(
+                sym,
+                cachedEntry.vols.length > maxPerSymbol
+                  ? cachedEntry.vols.slice(-maxPerSymbol)
+                  : [...cachedEntry.vols]
+              );
+            }
+          } else {
+            symbolsNeedingParse.push(sym);
+          }
+        }
+
+        if (symbolsNeedingParse.length > 0) {
+          const batchSize = 250;
+          for (let i = 0; i < symbolsNeedingParse.length; i += batchSize) {
+            const batch = symbolsNeedingParse.slice(i, i + batchSize);
+            const placeholders = batch.map(() => '?').join(',');
+            const cacheRows = this.db
+              .prepare(
+                `SELECT symbol, klines_json, provenance_json FROM smc_scan_candles_cache WHERE exchange = ? AND timeframe = '15m' AND symbol IN (${placeholders})`
+              )
+              .all(exchange, ...batch) as Array<Record<string, unknown>>;
+            for (const cr of cacheRows) {
+              const sym = String(cr.symbol);
+              const existing = map.get(sym);
+              const prov = enforceProvenanceIntegrity(
+                JSON.parse(String(cr.provenance_json || '{}'))
+              );
+              if (
+                isLiveVenue &&
+                (prov.isDemo || !isVerifiedLivePublicApiSource(prov.source))
+              ) {
+                continue;
+              }
+              const klines = JSON.parse(
+                String(cr.klines_json || '[]')
+              ) as Kline[];
+              const confirmedVols = klines
+                .filter(
+                  (k) =>
+                    k &&
+                    k.isClosed !== false &&
+                    Number.isFinite(k.quoteVolume) &&
+                    k.quoteVolume >= 0
+                )
+                .sort((a, b) => a.openTime - b.openTime)
+                .map((k) => Number(k.quoteVolume));
+              const ver = versionBySymbol.get(sym);
+              if (ver) {
+                exVolCache.set(sym, { version: ver, vols: confirmedVols });
+              }
+              if (confirmedVols.length > (existing?.length ?? 0)) {
+                map.set(sym, confirmedVols.slice(-maxPerSymbol));
+              }
+            }
           }
         }
       } catch {
         // Ignore cache parse issues
       }
+    }
+
+    if (curTc >= 0) {
+      this.bulkHistVolCache.set(bulkCacheKey, {
+        tc: curTc,
+        dv: curDv,
+        result: new Map(map),
+      });
     }
 
     return map;
@@ -1977,6 +3262,316 @@ export class RadarDatabase {
   // 2. Paper Trading Ledger (Strictly PAPER ONLY / LIVE ORDERS DISABLED)
   // ============================================================================
 
+  private getDefaultLimitTtlMinutes(timeframe: Timeframe): number {
+    if (timeframe === '5m') return 120;
+    if (timeframe === '15m') return 240;
+    if (timeframe === '1h') return 720;
+    if (timeframe === '4h') return 1440;
+    return 240;
+  }
+
+  private checkpointWalPassiveSafely(): void {
+    if (this.dbPath === ':memory:') return;
+    try {
+      this.db.exec('PRAGMA wal_checkpoint(PASSIVE);');
+    } catch {
+      // Non-blocking: busy contention will still be covered by atomic JSON ledger checkpoint
+    }
+  }
+
+  public savePaperLedgerCheckpointToDisk(options?: {
+    forceOverwriteEmpty?: boolean;
+  }): void {
+    if (!this.ledgerCheckpointPath || this.isRestoringLedgerCheckpoint) {
+      return;
+    }
+    try {
+      const rows = this.db
+        .prepare(`SELECT * FROM paper_trading_ledger ORDER BY id ASC`)
+        .all() as Array<Record<string, unknown>>;
+
+      if (rows.length === 0 && !options?.forceOverwriteEmpty) {
+        if (fs.existsSync(this.ledgerCheckpointPath)) {
+          try {
+            const existingRaw = fs.readFileSync(
+              this.ledgerCheckpointPath,
+              'utf8'
+            );
+            const existingParsed = JSON.parse(existingRaw) as {
+              entries?: unknown[];
+            };
+            if (
+              Array.isArray(existingParsed.entries) &&
+              existingParsed.entries.length > 0
+            ) {
+              return;
+            }
+          } catch {
+            // If existing file unreadable/corrupt, proceed to rewrite cleanly
+          }
+        }
+      }
+
+      const serializedRows = rows.map((r) => ({
+        id: Number(r.id),
+        symbol: String(r.symbol),
+        exchange: String(r.exchange),
+        timeframe: String(r.timeframe),
+        side: String(r.side),
+        category: String(r.category),
+        action_state: String(r.action_state),
+        entry_price: Number(r.entry_price),
+        invalidation_price: Number(r.invalidation_price),
+        target_price: Number(r.target_price),
+        current_price: Number(r.current_price),
+        exit_price:
+          r.exit_price !== null && r.exit_price !== undefined
+            ? Number(r.exit_price)
+            : null,
+        status: String(r.status),
+        pnl_r: Number(r.pnl_r ?? 0),
+        pnl_percent: Number(r.pnl_percent ?? 0),
+        rule_version: String(r.rule_version),
+        evidences_json: String(r.evidences_json ?? '[]'),
+        notes: String(r.notes ?? ''),
+        opened_at: String(r.opened_at),
+        closed_at: r.closed_at ? String(r.closed_at) : null,
+        provenance_json: String(r.provenance_json),
+        strategy_track: String(r.strategy_track ?? 'MANUAL_OBSERVATION'),
+        fill_status: String(r.fill_status ?? 'FILLED'),
+        filled_at: r.filled_at ? String(r.filled_at) : null,
+        entry_anchor_label: r.entry_anchor_label
+          ? String(r.entry_anchor_label)
+          : null,
+        expires_at: r.expires_at ? String(r.expires_at) : null,
+        expired_reason: r.expired_reason ? String(r.expired_reason) : null,
+        gross_pnl_r: Number(r.gross_pnl_r ?? r.pnl_r ?? 0),
+        net_pnl_r: Number(r.net_pnl_r ?? r.pnl_r ?? 0),
+        fee_cost_r: Number(r.fee_cost_r ?? 0),
+        slippage_cost_r: Number(r.slippage_cost_r ?? 0),
+        funding_cost_r: Number(r.funding_cost_r ?? 0),
+        total_cost_r: Number(r.total_cost_r ?? 0),
+        cost_config_json: r.cost_config_json
+          ? String(r.cost_config_json)
+          : null,
+        trailing_stop_price:
+          r.trailing_stop_price !== null && r.trailing_stop_price !== undefined
+            ? Number(r.trailing_stop_price)
+            : null,
+        breakeven_armed: r.breakeven_armed ? 1 : 0,
+      }));
+
+      const payload = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        entries: serializedRows,
+      };
+      const tmpPath = `${this.ledgerCheckpointPath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.ledgerCheckpointPath);
+      this.lastLedgerPriceCheckpointAtMs = Date.now();
+    } catch {
+      // Ignore checkpoint disk write errors in restricted environments
+    }
+  }
+
+  public restorePaperLedgerFromCheckpointIfMissing(): number {
+    if (
+      !this.ledgerCheckpointPath ||
+      !fs.existsSync(this.ledgerCheckpointPath)
+    ) {
+      return 0;
+    }
+    try {
+      const rawJson = fs.readFileSync(this.ledgerCheckpointPath, 'utf8');
+      const parsed = JSON.parse(rawJson) as {
+        entries?: Array<Record<string, unknown>>;
+      };
+      if (!Array.isArray(parsed.entries) || parsed.entries.length === 0) {
+        return 0;
+      }
+
+      const existingRows = this.db
+        .prepare(
+          `SELECT id, status, fill_status, breakeven_armed FROM paper_trading_ledger`
+        )
+        .all() as Array<{
+        id: number;
+        status?: string;
+        fill_status?: string;
+        breakeven_armed?: number;
+      }>;
+      const existingById = new Map<
+        number,
+        { status: string; fillStatus: string; breakevenArmed: number }
+      >();
+      for (const row of existingRows) {
+        existingById.set(Number(row.id), {
+          status: String(row.status ?? 'OPEN'),
+          fillStatus: String(row.fill_status ?? 'FILLED'),
+          breakevenArmed: Number(row.breakeven_armed ?? 0),
+        });
+      }
+
+      const insertStmt = this.db.prepare(`
+        INSERT OR IGNORE INTO paper_trading_ledger (
+          id, symbol, exchange, timeframe, side, category, action_state,
+          entry_price, invalidation_price, target_price, current_price,
+          exit_price, status, pnl_r, pnl_percent, rule_version,
+          evidences_json, notes, opened_at, closed_at, provenance_json,
+          strategy_track, fill_status, filled_at, entry_anchor_label,
+          expires_at, expired_reason,
+          gross_pnl_r, net_pnl_r, fee_cost_r, slippage_cost_r, funding_cost_r, total_cost_r, cost_config_json,
+          trailing_stop_price, breakeven_armed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const updateNewerStateStmt = this.db.prepare(`
+        UPDATE paper_trading_ledger
+        SET current_price = ?, exit_price = ?, status = ?, pnl_r = ?, pnl_percent = ?,
+            closed_at = ?, fill_status = ?, filled_at = ?, expires_at = ?, expired_reason = ?, notes = ?,
+            gross_pnl_r = ?, net_pnl_r = ?, fee_cost_r = ?, slippage_cost_r = ?, funding_cost_r = ?, total_cost_r = ?,
+            invalidation_price = ?, trailing_stop_price = ?, breakeven_armed = ?
+        WHERE id = ?
+      `);
+
+      let restoredCount = 0;
+      this.isRestoringLedgerCheckpoint = true;
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const r of parsed.entries) {
+          const id = Number(r.id);
+          if (
+            !Number.isInteger(id) ||
+            id <= 0 ||
+            !r.symbol ||
+            !r.provenance_json
+          ) {
+            continue;
+          }
+          const checkpointStatus = String(r.status ?? 'OPEN');
+          const checkpointFillStatus = String(r.fill_status ?? 'FILLED');
+          const checkpointTrailingStop =
+            r.trailing_stop_price !== null && r.trailing_stop_price !== undefined
+              ? Number(r.trailing_stop_price)
+              : null;
+          const checkpointBreakevenArmed = r.breakeven_armed ? 1 : 0;
+          const existing = existingById.get(id);
+
+          if (!existing) {
+            const info = insertStmt.run(
+              id,
+              String(r.symbol),
+              String(r.exchange ?? 'binance_usdm'),
+              String(r.timeframe ?? '15m'),
+              String(r.side ?? 'LONG'),
+              String(r.category ?? '多頭候選'),
+              String(r.action_state ?? 'LONG CANDIDATE'),
+              Number(r.entry_price),
+              Number(r.invalidation_price),
+              Number(r.target_price),
+              Number(r.current_price ?? r.entry_price),
+              r.exit_price !== null && r.exit_price !== undefined
+                ? Number(r.exit_price)
+                : null,
+              checkpointStatus,
+              Number(r.pnl_r ?? 0),
+              Number(r.pnl_percent ?? 0),
+              String(r.rule_version ?? ''),
+              String(r.evidences_json ?? '[]'),
+              String(r.notes ?? ''),
+              String(r.opened_at ?? new Date().toISOString()),
+              r.closed_at ? String(r.closed_at) : null,
+              String(r.provenance_json),
+              String(r.strategy_track ?? 'MANUAL_OBSERVATION'),
+              checkpointFillStatus,
+              r.filled_at ? String(r.filled_at) : null,
+              r.entry_anchor_label ? String(r.entry_anchor_label) : null,
+              r.expires_at ? String(r.expires_at) : null,
+              r.expired_reason ? String(r.expired_reason) : null,
+              Number(r.gross_pnl_r ?? r.pnl_r ?? 0),
+              Number(r.net_pnl_r ?? r.pnl_r ?? 0),
+              Number(r.fee_cost_r ?? 0),
+              Number(r.slippage_cost_r ?? 0),
+              Number(r.funding_cost_r ?? 0),
+              Number(r.total_cost_r ?? 0),
+              r.cost_config_json ? String(r.cost_config_json) : null,
+              checkpointTrailingStop,
+              checkpointBreakevenArmed
+            );
+            if (Number(info.changes ?? 0) > 0) {
+              restoredCount++;
+            }
+          } else {
+            const dbWasOpenAndCheckpointClosed =
+              existing.status === 'OPEN' && checkpointStatus !== 'OPEN';
+            const dbWasWaitingAndCheckpointFilled =
+              existing.status === 'OPEN' &&
+              existing.fillStatus === 'WAITING_LIMIT' &&
+              checkpointFillStatus === 'FILLED';
+            const dbNeedsBreakevenSync =
+              existing.status === 'OPEN' &&
+              existing.breakevenArmed === 0 &&
+              checkpointBreakevenArmed === 1;
+            if (
+              dbWasOpenAndCheckpointClosed ||
+              dbWasWaitingAndCheckpointFilled ||
+              dbNeedsBreakevenSync
+            ) {
+              updateNewerStateStmt.run(
+                Number(r.current_price ?? r.entry_price),
+                r.exit_price !== null && r.exit_price !== undefined
+                  ? Number(r.exit_price)
+                  : null,
+                checkpointStatus,
+                Number(r.pnl_r ?? 0),
+                Number(r.pnl_percent ?? 0),
+                r.closed_at ? String(r.closed_at) : null,
+                checkpointFillStatus,
+                r.filled_at ? String(r.filled_at) : null,
+                r.expires_at ? String(r.expires_at) : null,
+                r.expired_reason ? String(r.expired_reason) : null,
+                String(r.notes ?? ''),
+                Number(r.gross_pnl_r ?? r.pnl_r ?? 0),
+                Number(r.net_pnl_r ?? r.pnl_r ?? 0),
+                Number(r.fee_cost_r ?? 0),
+                Number(r.slippage_cost_r ?? 0),
+                Number(r.funding_cost_r ?? 0),
+                Number(r.total_cost_r ?? 0),
+                Number(r.invalidation_price),
+                checkpointTrailingStop,
+                checkpointBreakevenArmed,
+                id
+              );
+              restoredCount++;
+            }
+          }
+        }
+        this.db.exec('COMMIT;');
+      } catch (txErr) {
+        try {
+          this.db.exec('ROLLBACK;');
+        } catch {
+          // ignore
+        }
+        throw txErr;
+      } finally {
+        this.isRestoringLedgerCheckpoint = false;
+      }
+
+      if (restoredCount > 0) {
+        this.checkpointWalPassiveSafely();
+        console.warn(
+          `[RadarDatabase] Restored ${restoredCount} paper_trading_ledger record(s) from ${this.ledgerCheckpointPath}`
+        );
+      }
+      return restoredCount;
+    } catch {
+      this.isRestoringLedgerCheckpoint = false;
+      return 0;
+    }
+  }
+
   public addPaperLedgerEntry(input: {
     symbol: string;
     exchange: ExchangeId;
@@ -1984,6 +3579,11 @@ export class RadarDatabase {
     side: 'LONG' | 'SHORT';
     category: ScanCategory;
     actionState: SmcActionState;
+    strategyTrack?: PaperStrategyTrack;
+    fillStatus?: PaperFillStatus;
+    entryAnchorLabel?: string | null;
+    ttlMinutes?: number | null;
+    expiresAt?: string | null;
     entryPrice: number;
     invalidationPrice: number;
     targetPrice: number;
@@ -1991,15 +3591,56 @@ export class RadarDatabase {
     evidences: string[];
     notes?: string;
     provenance: DataProvenance;
+    costConfig?: Partial<TradingCostConfig>;
   }): PaperLedgerEntry {
     const openedAt = new Date().toISOString();
+    const resolvedTrack: PaperStrategyTrack =
+      input.strategyTrack ??
+      (input.actionState === 'LONG CANDIDATE' ||
+      input.actionState === 'SHORT CANDIDATE'
+        ? 'FORMAL_SMC_MARKET'
+        : 'MANUAL_OBSERVATION');
+    const resolvedFillStatus: PaperFillStatus =
+      input.fillStatus ?? 'FILLED';
+    const filledAt = resolvedFillStatus === 'FILLED' ? openedAt : null;
+
+    const resolvedCostConfig = normalizeTradingCostConfig({
+      ...input.costConfig,
+      entryOrderType:
+        resolvedFillStatus === 'WAITING_LIMIT' ||
+        resolvedTrack === 'SMC_PULLBACK_LIMIT'
+          ? 'LIMIT'
+          : input.costConfig?.entryOrderType ?? 'MARKET',
+    });
+
+    let resolvedExpiresAt: string | null = null;
+    if (resolvedFillStatus === 'WAITING_LIMIT') {
+      if (input.expiresAt && Number.isFinite(Date.parse(input.expiresAt))) {
+        resolvedExpiresAt = new Date(Date.parse(input.expiresAt)).toISOString();
+      } else {
+        const ttlMins =
+          input.ttlMinutes !== undefined &&
+          input.ttlMinutes !== null &&
+          Number.isFinite(input.ttlMinutes) &&
+          input.ttlMinutes > 0
+            ? Math.min(10080, Math.max(1, Math.round(input.ttlMinutes)))
+            : this.getDefaultLimitTtlMinutes(input.timeframe);
+        resolvedExpiresAt = new Date(
+          Date.parse(openedAt) + ttlMins * 60_000
+        ).toISOString();
+      }
+    }
+
     const stmt = this.db.prepare(`
       INSERT INTO paper_trading_ledger (
         symbol, exchange, timeframe, side, category, action_state,
         entry_price, invalidation_price, target_price, current_price,
         exit_price, status, pnl_r, pnl_percent, rule_version,
-        evidences_json, notes, opened_at, closed_at, provenance_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'OPEN', 0, 0, ?, ?, ?, ?, NULL, ?)
+        evidences_json, notes, opened_at, closed_at, provenance_json,
+        strategy_track, fill_status, filled_at, entry_anchor_label,
+        expires_at, expired_reason,
+        gross_pnl_r, net_pnl_r, fee_cost_r, slippage_cost_r, funding_cost_r, total_cost_r, cost_config_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'OPEN', 0, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, 0, 0, 0, 0, 0, 0, ?)
     `);
 
     const safeProvenance = enforceProvenanceIntegrity(input.provenance);
@@ -2018,16 +3659,25 @@ export class RadarDatabase {
       JSON.stringify(input.evidences),
       input.notes || `[${TRADING_SAFETY_FLAGS.mode}] 紙上觀察紀錄，嚴禁自動或實盤下單`,
       openedAt,
-      JSON.stringify(safeProvenance)
+      JSON.stringify(safeProvenance),
+      resolvedTrack,
+      resolvedFillStatus,
+      filledAt,
+      input.entryAnchorLabel ?? null,
+      resolvedExpiresAt,
+      JSON.stringify(resolvedCostConfig)
     );
 
     const id = Number(info.lastInsertRowid);
+    this.checkpointWalPassiveSafely();
+    this.savePaperLedgerCheckpointToDisk();
     return this.getPaperLedgerEntryById(id)!;
   }
 
   public updateOpenPaperEntriesWithPrices(
     exchange: ExchangeId,
-    priceMap: Map<string, number>
+    priceMap: Map<string, number>,
+    nowIsoOverride?: string
   ): void {
     const openEntries = this.listPaperLedgerEntries(200).filter(
       (e) => e.status === 'OPEN' && e.exchange === exchange
@@ -2035,9 +3685,16 @@ export class RadarDatabase {
 
     const updateStmt = this.db.prepare(`
       UPDATE paper_trading_ledger
-      SET current_price = ?, exit_price = ?, status = ?, pnl_r = ?, pnl_percent = ?, closed_at = ?
+      SET current_price = ?, exit_price = ?, status = ?, pnl_r = ?, pnl_percent = ?, closed_at = ?, fill_status = ?, filled_at = ?, expired_reason = ?, notes = ?,
+          gross_pnl_r = ?, net_pnl_r = ?, fee_cost_r = ?, slippage_cost_r = ?, funding_cost_r = ?, total_cost_r = ?,
+          trailing_stop_price = ?, breakeven_armed = ?
       WHERE id = ?
     `);
+
+    const nowMs = nowIsoOverride ? Date.parse(nowIsoOverride) : Date.now();
+    const nowIso = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString();
+    let hasStateTransition = false;
+    let hasAnyPriceUpdate = false;
 
     for (const entry of openEntries) {
       const latestPrice = priceMap.get(entry.symbol);
@@ -2045,43 +3702,228 @@ export class RadarDatabase {
         continue;
       }
 
-      const riskDistance = Math.max(
-        Math.abs(entry.entryPrice - entry.invalidationPrice),
-        entry.entryPrice * 0.002
-      );
-      const rawDiff =
-        entry.side === 'LONG'
-          ? latestPrice - entry.entryPrice
-          : entry.entryPrice - latestPrice;
+      let currentFillStatus: PaperFillStatus = entry.fillStatus ?? 'FILLED';
+      let filledAt: string | null = entry.filledAt ?? entry.openedAt;
+      let trailingStopPrice: number | null = entry.trailingStopPrice ?? null;
+      let breakevenArmed = Boolean(entry.breakevenArmed);
 
-      const pnlR = Number((rawDiff / riskDistance).toFixed(2));
-      const pnlPercent = Number(((rawDiff / entry.entryPrice) * 100).toFixed(2));
+      if (currentFillStatus === 'WAITING_LIMIT') {
+        const expiresMs = entry.expiresAt ? Date.parse(entry.expiresAt) : NaN;
+        if (Number.isFinite(expiresMs) && nowMs >= expiresMs) {
+          updateStmt.run(
+            latestPrice,
+            latestPrice,
+            'CLOSED_EXPIRED',
+            0,
+            0,
+            nowIso,
+            'WAITING_LIMIT',
+            null,
+            'TTL_TIMEOUT',
+            '[PAPER ONLY] 超過回踩等待時限 (TTL)，限價掛單自動過期作廢 (0R)',
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            trailingStopPrice,
+            breakevenArmed ? 1 : 0,
+            entry.id
+          );
+          hasStateTransition = true;
+          continue;
+        }
+
+        const limitTouched =
+          entry.side === 'LONG'
+            ? latestPrice <= entry.entryPrice
+            : latestPrice >= entry.entryPrice;
+
+        if (!limitTouched) {
+          const invalidatedBeforeFill =
+            entry.side === 'LONG'
+              ? latestPrice <= entry.invalidationPrice
+              : latestPrice >= entry.invalidationPrice;
+          if (invalidatedBeforeFill) {
+            updateStmt.run(
+              latestPrice,
+              latestPrice,
+              'CLOSED_EXPIRED',
+              0,
+              0,
+              nowIso,
+              'WAITING_LIMIT',
+              null,
+              'INVALIDATED_BEFORE_FILL',
+              '[PAPER ONLY] 未回踩觸價前結構已提前跌破/突破失效價，限價掛單自動作廢 (0R)',
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              trailingStopPrice,
+              breakevenArmed ? 1 : 0,
+              entry.id
+            );
+            hasStateTransition = true;
+            continue;
+          }
+
+          const targetMissedBeforeFill =
+            entry.side === 'LONG'
+              ? latestPrice >= entry.targetPrice
+              : latestPrice <= entry.targetPrice;
+          if (targetMissedBeforeFill) {
+            updateStmt.run(
+              latestPrice,
+              latestPrice,
+              'CLOSED_EXPIRED',
+              0,
+              0,
+              nowIso,
+              'WAITING_LIMIT',
+              null,
+              'TARGET_MISSED',
+              '[PAPER ONLY] 價格未回踩即先行觸及目標價，踏空作廢失效掛單 (0R)',
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              trailingStopPrice,
+              breakevenArmed ? 1 : 0,
+              entry.id
+            );
+            hasStateTransition = true;
+            continue;
+          }
+
+          updateStmt.run(
+            latestPrice,
+            null,
+            'OPEN',
+            0,
+            0,
+            null,
+            'WAITING_LIMIT',
+            null,
+            null,
+            entry.notes,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            trailingStopPrice,
+            breakevenArmed ? 1 : 0,
+            entry.id
+          );
+          hasAnyPriceUpdate = true;
+          continue;
+        }
+        currentFillStatus = 'FILLED';
+        filledAt = nowIso;
+        hasStateTransition = true;
+      }
 
       let nextStatus: PaperLedgerEntry['status'] = 'OPEN';
       let exitPrice: number | null = null;
       let closedAt: string | null = null;
+      let nextNotes = entry.notes;
+
+      const activeStopPrice =
+        breakevenArmed &&
+        trailingStopPrice !== null &&
+        Number.isFinite(trailingStopPrice)
+          ? trailingStopPrice
+          : entry.invalidationPrice;
+      const initialRisk = Math.max(
+        Math.abs(entry.entryPrice - entry.invalidationPrice),
+        1e-8
+      );
 
       if (entry.side === 'LONG') {
-        if (latestPrice <= entry.invalidationPrice) {
-          nextStatus = 'CLOSED_LOSS';
+        if (latestPrice <= activeStopPrice) {
+          const rawGrossR = (latestPrice - entry.entryPrice) / initialRisk;
+          if (breakevenArmed && rawGrossR >= 0.05) {
+            nextStatus = 'CLOSED_WIN';
+            nextNotes = '[PAPER ONLY] +1R 移動保本止盈觸發';
+          } else {
+            nextStatus = 'CLOSED_LOSS';
+          }
           exitPrice = latestPrice;
-          closedAt = new Date().toISOString();
+          closedAt = nowIso;
         } else if (latestPrice >= entry.targetPrice) {
           nextStatus = 'CLOSED_WIN';
           exitPrice = latestPrice;
-          closedAt = new Date().toISOString();
+          closedAt = nowIso;
         }
       } else {
-        if (latestPrice >= entry.invalidationPrice) {
-          nextStatus = 'CLOSED_LOSS';
+        if (latestPrice >= activeStopPrice) {
+          const rawGrossR = (entry.entryPrice - latestPrice) / initialRisk;
+          if (breakevenArmed && rawGrossR >= 0.05) {
+            nextStatus = 'CLOSED_WIN';
+            nextNotes = '[PAPER ONLY] +1R 移動保本止盈觸發';
+          } else {
+            nextStatus = 'CLOSED_LOSS';
+          }
           exitPrice = latestPrice;
-          closedAt = new Date().toISOString();
+          closedAt = nowIso;
         } else if (latestPrice <= entry.targetPrice) {
           nextStatus = 'CLOSED_WIN';
           exitPrice = latestPrice;
-          closedAt = new Date().toISOString();
+          closedAt = nowIso;
         }
       }
+
+      const entryTimeMs = Date.parse(filledAt || entry.openedAt) || nowMs;
+      const costBreakdown = calculateTradeTradingCosts({
+        direction: entry.side,
+        entryPrice: entry.entryPrice,
+        invalidationPrice: entry.invalidationPrice,
+        exitPrice: latestPrice,
+        entryTimeMs,
+        exitTimeMs: nowMs,
+        entryOrderType:
+          entry.costConfig?.entryOrderType ??
+          (entry.strategyTrack === 'SMC_PULLBACK_LIMIT' ? 'LIMIT' : 'MARKET'),
+        exitIsLimitFill: nextStatus === 'CLOSED_WIN',
+        costConfig: entry.costConfig,
+      });
+
+      if (
+        nextStatus === 'OPEN' &&
+        !breakevenArmed &&
+        costBreakdown.grossRMultiple >= 1.0
+      ) {
+        const feeCoverBuffer = Math.max(
+          entry.entryPrice * 0.0018,
+          initialRisk * 0.12
+        );
+        const beStop =
+          entry.side === 'LONG'
+            ? Number((entry.entryPrice + feeCoverBuffer).toPrecision(6))
+            : Number((entry.entryPrice - feeCoverBuffer).toPrecision(6));
+        const validBeStop =
+          entry.side === 'LONG'
+            ? beStop > entry.invalidationPrice && beStop < latestPrice
+            : beStop < entry.invalidationPrice && beStop > latestPrice;
+        if (validBeStop) {
+          breakevenArmed = true;
+          trailingStopPrice = beStop;
+          if (!nextNotes.includes('[已啟動 +1R 自動保本]')) {
+            nextNotes = `${nextNotes} · [已啟動 +1R 自動保本]`;
+          }
+          hasStateTransition = true;
+        }
+      }
+
+      const pnlR = costBreakdown.grossRMultiple;
+      const pnlPercent = costBreakdown.grossPnlPercent;
 
       updateStmt.run(
         latestPrice,
@@ -2090,15 +3932,113 @@ export class RadarDatabase {
         pnlR,
         pnlPercent,
         closedAt,
+        currentFillStatus,
+        filledAt,
+        null,
+        nextNotes,
+        costBreakdown.grossRMultiple,
+        costBreakdown.netRMultiple,
+        costBreakdown.feeCostR,
+        costBreakdown.slippageCostR,
+        costBreakdown.fundingCostR,
+        costBreakdown.totalCostR,
+        trailingStopPrice,
+        breakevenArmed ? 1 : 0,
         entry.id
       );
+      hasAnyPriceUpdate = true;
+      if (nextStatus !== 'OPEN') {
+        hasStateTransition = true;
+      }
+    }
+
+    if (hasStateTransition) {
+      this.checkpointWalPassiveSafely();
+      this.savePaperLedgerCheckpointToDisk();
+    } else if (
+      hasAnyPriceUpdate &&
+      Date.now() - this.lastLedgerPriceCheckpointAtMs >= 30_000
+    ) {
+      this.savePaperLedgerCheckpointToDisk();
+    }
+  }
+
+  public extendPaperLimitTtl(
+    id: number,
+    extraMinutes = 120
+  ): PaperLedgerEntry | null {
+    const existing = this.getPaperLedgerEntryById(id);
+    if (
+      !existing ||
+      existing.status !== 'OPEN' ||
+      existing.fillStatus !== 'WAITING_LIMIT'
+    ) {
+      return existing;
+    }
+    const baseMs = existing.expiresAt
+      ? Math.max(Date.now(), Date.parse(existing.expiresAt))
+      : Date.now();
+    const safeExtra = Math.min(1440, Math.max(15, Math.round(extraMinutes)));
+    const nextExpiresAt = new Date(baseMs + safeExtra * 60_000).toISOString();
+    this.db
+      .prepare(
+        `UPDATE paper_trading_ledger SET expires_at = ? WHERE id = ?`
+      )
+      .run(nextExpiresAt, id);
+    this.checkpointWalPassiveSafely();
+    this.savePaperLedgerCheckpointToDisk();
+    return this.getPaperLedgerEntryById(id);
+  }
+
+  public updatePaperLedgerInvalidation(
+    id: number,
+    invalidationPrice: number
+  ): PaperLedgerEntry | null {
+    const existing = this.getPaperLedgerEntryById(id);
+    if (!existing || existing.status !== 'OPEN') return existing;
+    if (!Number.isFinite(invalidationPrice) || invalidationPrice <= 0) {
+      return existing;
+    }
+    this.db
+      .prepare(
+        `UPDATE paper_trading_ledger SET invalidation_price = ? WHERE id = ?`
+      )
+      .run(invalidationPrice, id);
+    this.checkpointWalPassiveSafely();
+    this.savePaperLedgerCheckpointToDisk();
+    return this.getPaperLedgerEntryById(id);
+  }
+
+  public syncPaperLedgerOpenPriceAndPnl(
+    id: number,
+    currentPrice: number,
+    pnlPercent: number,
+    pnlR: number
+  ): void {
+    const info = this.db
+      .prepare(
+        `UPDATE paper_trading_ledger
+         SET current_price = ?, pnl_percent = ?, pnl_r = ?
+         WHERE id = ? AND status = 'OPEN'`
+      )
+      .run(currentPrice, pnlPercent, pnlR, id);
+    if (
+      Number(info.changes ?? 0) > 0 &&
+      Date.now() - this.lastLedgerPriceCheckpointAtMs >= 30_000
+    ) {
+      this.savePaperLedgerCheckpointToDisk();
     }
   }
 
   public closePaperLedgerEntry(
     id: number,
     exitPrice?: number,
-    notes?: string
+    notes?: string,
+    options?: {
+      fundingRatePer8h?: number | null;
+      exitIsLimitFill?: boolean;
+      closedAtIso?: string;
+    }
   ): PaperLedgerEntry | null {
     const existing = this.getPaperLedgerEntryById(id);
     if (!existing) return null;
@@ -2108,36 +4048,72 @@ export class RadarDatabase {
         ? exitPrice
         : existing.currentPrice;
 
-    const riskDistance = Math.max(
-      Math.abs(existing.entryPrice - existing.invalidationPrice),
-      existing.entryPrice * 0.002
-    );
-    const rawDiff =
-      existing.side === 'LONG'
-        ? finalPrice - existing.entryPrice
-        : existing.entryPrice - finalPrice;
+    const isUnfilledLimit = existing.fillStatus === 'WAITING_LIMIT';
+    const closedAt = options?.closedAtIso ?? new Date().toISOString();
+    const closedAtMs = Date.parse(closedAt) || Date.now();
+    const entryTimeMs =
+      Date.parse(existing.filledAt || existing.openedAt) || closedAtMs;
 
-    const pnlR = Number((rawDiff / riskDistance).toFixed(2));
-    const pnlPercent = Number(((rawDiff / existing.entryPrice) * 100).toFixed(2));
-    const closedAt = new Date().toISOString();
+    const costBreakdown = isUnfilledLimit
+      ? {
+          grossRMultiple: 0,
+          grossPnlPercent: 0,
+          netRMultiple: 0,
+          feeCostR: 0,
+          slippageCostR: 0,
+          fundingCostR: 0,
+          totalCostR: 0,
+        }
+      : calculateTradeTradingCosts({
+          direction: existing.side,
+          entryPrice: existing.entryPrice,
+          invalidationPrice: existing.invalidationPrice,
+          exitPrice: finalPrice,
+          entryTimeMs,
+          exitTimeMs: closedAtMs,
+          entryOrderType:
+            existing.costConfig?.entryOrderType ??
+            (existing.strategyTrack === 'SMC_PULLBACK_LIMIT'
+              ? 'LIMIT'
+              : 'MARKET'),
+          exitIsLimitFill: options?.exitIsLimitFill ?? false,
+          fundingRatePer8h: options?.fundingRatePer8h,
+          costConfig: existing.costConfig,
+        });
+
+    const pnlR = costBreakdown.grossRMultiple;
+    const pnlPercent = costBreakdown.grossPnlPercent;
 
     const stmt = this.db.prepare(`
       UPDATE paper_trading_ledger
-      SET current_price = ?, exit_price = ?, status = 'CLOSED_MANUAL',
-          pnl_r = ?, pnl_percent = ?, closed_at = ?, notes = ?
+      SET current_price = ?, exit_price = ?, status = ?,
+          pnl_r = ?, pnl_percent = ?, closed_at = ?, expired_reason = ?, notes = ?,
+          gross_pnl_r = ?, net_pnl_r = ?, fee_cost_r = ?, slippage_cost_r = ?, funding_cost_r = ?, total_cost_r = ?
       WHERE id = ?
     `);
 
     stmt.run(
       finalPrice,
       finalPrice,
+      isUnfilledLimit ? 'CLOSED_EXPIRED' : 'CLOSED_MANUAL',
       pnlR,
       pnlPercent,
       closedAt,
-      notes || existing.notes,
+      isUnfilledLimit ? 'MANUAL_CANCEL' : null,
+      isUnfilledLimit
+        ? '[PAPER ONLY] 未觸價前手動撤銷待回踩限價單 (0R)'
+        : notes || existing.notes,
+      costBreakdown.grossRMultiple,
+      costBreakdown.netRMultiple,
+      costBreakdown.feeCostR,
+      costBreakdown.slippageCostR,
+      costBreakdown.fundingCostR,
+      costBreakdown.totalCostR,
       id
     );
 
+    this.checkpointWalPassiveSafely();
+    this.savePaperLedgerCheckpointToDisk();
     return this.getPaperLedgerEntryById(id);
   }
 
@@ -2156,6 +4132,206 @@ export class RadarDatabase {
     return stmt.all(limit).map((r) => this.mapPaperLedgerRow(r));
   }
 
+  public getPaperTrackComparisonStats(
+    includeDemo = false
+  ): PaperTrackComparisonStats {
+    const allEntries = this.listPaperLedgerEntries(500);
+    const liveEntries = allEntries.filter((e) => !e.isDemo);
+    const totalDemoExcluded = allEntries.length - liveEntries.length;
+    const scopedEntries = includeDemo ? allEntries : liveEntries;
+
+    const trackDefs: Array<{ track: PaperStrategyTrack; labelZh: string }> = [
+      { track: 'EARLY_IGNITION', labelZh: '早鳥起漲進場 (Early Ignition)' },
+      { track: 'FORMAL_SMC_MARKET', labelZh: '正式 SMC 現價進場' },
+      { track: 'SMC_PULLBACK_LIMIT', labelZh: 'FVG / OB 回踩限價進場' },
+      { track: 'MANUAL_OBSERVATION', labelZh: '一般手動觀察紀錄' },
+    ];
+
+    const tracks: PaperTrackMetricSummary[] = trackDefs.map(
+      ({ track, labelZh }) => {
+        const entries = scopedEntries.filter(
+          (e) => (e.strategyTrack ?? 'MANUAL_OBSERVATION') === track
+        );
+        const waitingLimitCount = entries.filter(
+          (e) => e.status === 'OPEN' && e.fillStatus === 'WAITING_LIMIT'
+        ).length;
+        const expiredLimitCount = entries.filter(
+          (e) =>
+            e.status === 'CLOSED_EXPIRED' ||
+            (e.fillStatus === 'WAITING_LIMIT' && e.status !== 'OPEN')
+        ).length;
+        const filledEntries = entries.filter(
+          (e) => (e.fillStatus ?? 'FILLED') === 'FILLED'
+        );
+        const fillDenom = filledEntries.length + expiredLimitCount;
+        const fillRatePercent =
+          fillDenom > 0
+            ? Number(((filledEntries.length / fillDenom) * 100).toFixed(1))
+            : null;
+        const openFilledCount = filledEntries.filter(
+          (e) => e.status === 'OPEN'
+        ).length;
+        const closedFilled = filledEntries.filter((e) => e.status !== 'OPEN');
+
+        const getNetR = (e: PaperLedgerEntry) => e.netPnlR ?? e.pnlR;
+        const getCostR = (e: PaperLedgerEntry) => e.totalCostR ?? 0;
+
+        const winCount = closedFilled.filter(
+          (e) =>
+            e.status === 'CLOSED_WIN' ||
+            (e.status === 'CLOSED_MANUAL' && e.pnlR > 0)
+        ).length;
+        const lossCount = closedFilled.filter(
+          (e) =>
+            e.status === 'CLOSED_LOSS' ||
+            (e.status === 'CLOSED_MANUAL' && e.pnlR < 0)
+        ).length;
+        const netWinCount = closedFilled.filter((e) => getNetR(e) > 0).length;
+
+        const closedCount = closedFilled.length;
+        const totalPnlR = Number(
+          closedFilled.reduce((acc, e) => acc + e.pnlR, 0).toFixed(2)
+        );
+        const avgPnlR =
+          closedCount > 0 ? Number((totalPnlR / closedCount).toFixed(2)) : null;
+        const winRatePercent =
+          closedCount > 0
+            ? Number(((winCount / closedCount) * 100).toFixed(1))
+            : null;
+
+        const netTotalPnlR = Number(
+          closedFilled.reduce((acc, e) => acc + getNetR(e), 0).toFixed(2)
+        );
+        const netAvgPnlR =
+          closedCount > 0
+            ? Number((netTotalPnlR / closedCount).toFixed(2))
+            : null;
+        const netWinRatePercent =
+          closedCount > 0
+            ? Number(((netWinCount / closedCount) * 100).toFixed(1))
+            : null;
+        const totalCostDrag = closedFilled.reduce(
+          (acc, e) => acc + getCostR(e),
+          0
+        );
+        const avgCostDragR =
+          closedCount > 0
+            ? Number((totalCostDrag / closedCount).toFixed(3))
+            : null;
+
+        const grossWinR = closedFilled
+          .filter((e) => e.pnlR > 0)
+          .reduce((acc, e) => acc + e.pnlR, 0);
+        const grossLossR = Math.abs(
+          closedFilled
+            .filter((e) => e.pnlR < 0)
+            .reduce((acc, e) => acc + e.pnlR, 0)
+        );
+        const profitFactor =
+          closedCount === 0
+            ? null
+            : grossLossR > 0
+              ? Number((grossWinR / grossLossR).toFixed(2))
+              : grossWinR > 0
+                ? 99.9
+                : null;
+
+        const netWinR = closedFilled
+          .filter((e) => getNetR(e) > 0)
+          .reduce((acc, e) => acc + getNetR(e), 0);
+        const netLossR = Math.abs(
+          closedFilled
+            .filter((e) => getNetR(e) <= 0)
+            .reduce((acc, e) => acc + getNetR(e), 0)
+        );
+        const netProfitFactor =
+          closedCount === 0
+            ? null
+            : netLossR > 0
+              ? Number((netWinR / netLossR).toFixed(2))
+              : netWinR > 0
+                ? 99.9
+                : null;
+
+        const bestR =
+          closedCount > 0
+            ? Math.max(...closedFilled.map((e) => e.pnlR))
+            : null;
+        const worstR =
+          closedCount > 0
+            ? Math.min(...closedFilled.map((e) => e.pnlR))
+            : null;
+
+        return {
+          track,
+          labelZh,
+          totalEntries: entries.length,
+          waitingLimitCount,
+          expiredLimitCount,
+          fillRatePercent,
+          filledCount: filledEntries.length,
+          openFilledCount,
+          closedCount,
+          winCount,
+          lossCount,
+          winRatePercent,
+          avgPnlR,
+          totalPnlR,
+          profitFactor,
+          netWinRatePercent,
+          netAvgPnlR,
+          netTotalPnlR,
+          netProfitFactor,
+          avgCostDragR,
+          bestR,
+          worstR,
+        };
+      }
+    );
+
+    const candidateTracks = tracks.filter(
+      (t) =>
+        t.track !== 'MANUAL_OBSERVATION' &&
+        t.closedCount > 0 &&
+        t.avgPnlR !== null
+    );
+    let leaderTrack: PaperStrategyTrack | null = null;
+    if (candidateTracks.length > 0) {
+      leaderTrack = [...candidateTracks].sort(
+        (a, b) =>
+          (b.netAvgPnlR ?? b.avgPnlR ?? -999) -
+          (a.netAvgPnlR ?? a.avgPnlR ?? -999)
+      )[0].track;
+    }
+
+    const smcMarket = tracks.find((t) => t.track === 'FORMAL_SMC_MARKET');
+    const pullback = tracks.find((t) => t.track === 'SMC_PULLBACK_LIMIT');
+    const pullbackVsChaseDeltaR =
+      smcMarket?.avgPnlR !== null &&
+      smcMarket?.avgPnlR !== undefined &&
+      pullback?.avgPnlR !== null &&
+      pullback?.avgPnlR !== undefined
+        ? Number((pullback.avgPnlR - smcMarket.avgPnlR).toFixed(2))
+        : null;
+    const netPullbackVsChaseDeltaR =
+      smcMarket?.netAvgPnlR !== null &&
+      smcMarket?.netAvgPnlR !== undefined &&
+      pullback?.netAvgPnlR !== null &&
+      pullback?.netAvgPnlR !== undefined
+        ? Number((pullback.netAvgPnlR - smcMarket.netAvgPnlR).toFixed(2))
+        : null;
+
+    return {
+      scope: includeDemo ? 'ALL_INCLUDING_DEMO' : 'LIVE_ONLY',
+      totalIncludedEntries: scopedEntries.length,
+      totalDemoExcluded: includeDemo ? 0 : totalDemoExcluded,
+      tracks,
+      leaderTrack,
+      pullbackVsChaseDeltaR,
+      netPullbackVsChaseDeltaR,
+    };
+  }
+
   private mapPaperLedgerRow(r: Record<string, unknown>): PaperLedgerEntry {
     const safeProv = enforceProvenanceIntegrity(
       JSON.parse(String(r.provenance_json))
@@ -2167,6 +4343,55 @@ export class RadarDatabase {
         ex === 'demo_synthetic' ||
         !isVerifiedLivePublicApiSource(safeProv.source)
     );
+    const rawActionState = String(r.action_state) as SmcActionState;
+    const rawTrack = r.strategy_track ? String(r.strategy_track) : '';
+    const strategyTrack: PaperStrategyTrack =
+      rawTrack === 'EARLY_IGNITION' ||
+      rawTrack === 'FORMAL_SMC_MARKET' ||
+      rawTrack === 'SMC_PULLBACK_LIMIT' ||
+      rawTrack === 'MANUAL_OBSERVATION'
+        ? rawTrack
+        : rawActionState === 'LONG CANDIDATE' ||
+            rawActionState === 'SHORT CANDIDATE'
+          ? 'FORMAL_SMC_MARKET'
+          : 'MANUAL_OBSERVATION';
+
+    const rawFill = r.fill_status ? String(r.fill_status) : 'FILLED';
+    const fillStatus: PaperFillStatus =
+      rawFill === 'WAITING_LIMIT' ? 'WAITING_LIMIT' : 'FILLED';
+
+    const rawExpiredReason = r.expired_reason ? String(r.expired_reason) : null;
+    const expiredReason: PaperLimitExpiredReason | null =
+      rawExpiredReason === 'TTL_TIMEOUT' ||
+      rawExpiredReason === 'TARGET_MISSED' ||
+      rawExpiredReason === 'INVALIDATED_BEFORE_FILL' ||
+      rawExpiredReason === 'MANUAL_CANCEL'
+        ? rawExpiredReason
+        : null;
+
+    let parsedCostConfig: TradingCostConfig | undefined;
+    if (r.cost_config_json) {
+      try {
+        parsedCostConfig = JSON.parse(String(r.cost_config_json));
+      } catch {
+        parsedCostConfig = undefined;
+      }
+    }
+
+    const pnlR = Number(r.pnl_r);
+    const grossPnlR =
+      r.gross_pnl_r !== null && r.gross_pnl_r !== undefined
+        ? Number(r.gross_pnl_r)
+        : pnlR;
+    const totalCostR =
+      r.total_cost_r !== null && r.total_cost_r !== undefined
+        ? Number(r.total_cost_r)
+        : 0;
+    const netPnlR =
+      r.net_pnl_r !== null && r.net_pnl_r !== undefined
+        ? Number(r.net_pnl_r)
+        : Number((grossPnlR - totalCostR).toFixed(2));
+
     return {
       id: Number(r.id),
       symbol: String(r.symbol),
@@ -2174,9 +4399,22 @@ export class RadarDatabase {
       timeframe: String(r.timeframe) as Timeframe,
       side: String(r.side) as 'LONG' | 'SHORT',
       category: String(r.category) as ScanCategory,
-      actionState: String(r.action_state) as SmcActionState,
+      actionState: rawActionState,
+      strategyTrack,
+      fillStatus,
+      filledAt: r.filled_at ? String(r.filled_at) : null,
+      entryAnchorLabel: r.entry_anchor_label
+        ? String(r.entry_anchor_label)
+        : null,
+      expiresAt: r.expires_at ? String(r.expires_at) : null,
+      expiredReason,
       entryPrice: Number(r.entry_price),
       invalidationPrice: Number(r.invalidation_price),
+      trailingStopPrice:
+        r.trailing_stop_price !== null && r.trailing_stop_price !== undefined
+          ? Number(r.trailing_stop_price)
+          : null,
+      breakevenArmed: Boolean(r.breakeven_armed),
       targetPrice: Number(r.target_price),
       currentPrice: Number(r.current_price),
       exitPrice:
@@ -2184,8 +4422,24 @@ export class RadarDatabase {
           ? Number(r.exit_price)
           : null,
       status: String(r.status) as PaperLedgerEntry['status'],
-      pnlR: Number(r.pnl_r),
+      pnlR,
       pnlPercent: Number(r.pnl_percent),
+      grossPnlR,
+      netPnlR,
+      feeCostR:
+        r.fee_cost_r !== null && r.fee_cost_r !== undefined
+          ? Number(r.fee_cost_r)
+          : 0,
+      slippageCostR:
+        r.slippage_cost_r !== null && r.slippage_cost_r !== undefined
+          ? Number(r.slippage_cost_r)
+          : 0,
+      fundingCostR:
+        r.funding_cost_r !== null && r.funding_cost_r !== undefined
+          ? Number(r.funding_cost_r)
+          : 0,
+      totalCostR,
+      costConfig: parsedCostConfig,
       ruleVersion: String(r.rule_version),
       evidences: JSON.parse(String(r.evidences_json || '[]')),
       notes: String(r.notes || ''),
@@ -2226,11 +4480,17 @@ export class RadarDatabase {
       };
     }
 
+    const triggerSource: BacktestTriggerSource =
+      report.triggerSource === 'AUTO_SCHEDULED' ? 'AUTO_SCHEDULED' : 'MANUAL';
+    const autoBatchId = report.autoBatchId ?? null;
+
     const fullReport: BacktestResult = {
       ...report,
       exchange,
       scannerRuleVersion,
       createdAt,
+      triggerSource,
+      autoBatchId,
       provenance: safeProvenance,
     };
 
@@ -2239,8 +4499,9 @@ export class RadarDatabase {
         symbol, exchange, timeframe, rule_version, scanner_rule_version,
         status, insufficient_reason, confirmed_bars_tested,
         total_trades, win_rate_percent, max_drawdown_r, profit_factor,
-        average_win_r, average_loss_r, trades_json, provenance_json, created_at, report_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        average_win_r, average_loss_r, trades_json, provenance_json, created_at, report_json,
+        trigger_source, auto_batch_id, end_time
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const info = stmt.run(
@@ -2261,7 +4522,10 @@ export class RadarDatabase {
       JSON.stringify(report.trades),
       JSON.stringify(safeProvenance),
       createdAt,
-      JSON.stringify(fullReport)
+      JSON.stringify(fullReport),
+      triggerSource,
+      autoBatchId,
+      report.endTime ?? null
     );
 
     return {
@@ -2390,6 +4654,15 @@ export class RadarDatabase {
           shortCount: storedReport.shortCount ?? null,
           trades: JSON.parse(String(r.trades_json || '[]')),
           createdAt: String(r.created_at),
+          triggerSource: (
+            String(r.trigger_source || storedReport.triggerSource || 'MANUAL') ===
+            'AUTO_SCHEDULED'
+              ? 'AUTO_SCHEDULED'
+              : 'MANUAL'
+          ) as BacktestTriggerSource,
+          autoBatchId: r.auto_batch_id
+            ? String(r.auto_batch_id)
+            : storedReport.autoBatchId ?? null,
           provenance: prov,
         };
       })
@@ -2514,6 +4787,7 @@ export class RadarDatabase {
     const row = this.db
       .prepare(`SELECT stats_version FROM smc_scan_meta WHERE exchange = ?`)
       .get(exchange) as { stats_version?: number } | undefined;
+    this.touchSmcState(exchange);
     return Number(row?.stats_version ?? nextVersion);
   }
 
@@ -2598,7 +4872,7 @@ export class RadarDatabase {
     if (this.inTransactionDepth > 0) {
       return fn();
     }
-    const maxAttempts = 5;
+    const maxAttempts = 8;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         this.db.exec('BEGIN IMMEDIATE');
@@ -2664,7 +4938,7 @@ export class RadarDatabase {
       `);
 
       const findValidResultStmt = this.db.prepare(`
-        SELECT evaluated_at, smc_evaluation_status, smc_action_state, rule_version
+        SELECT evaluated_at, smc_evaluation_status, smc_action_state, rule_version, stale, fallback, missing_data_json
         FROM smc_scan_results
         WHERE exchange = ? AND symbol = ?
         LIMIT 1
@@ -2688,10 +4962,10 @@ export class RadarDatabase {
       const insertQueuedStmt = this.db.prepare(`
         INSERT INTO smc_scan_jobs (
           symbol, exchange, priority, priority_tier, priority_label, priority_class,
-          status, rule_version, window_key, requested_at, queue_entered_at, started_at,
+          status, pending_reason, rule_version, window_key, requested_at, queue_entered_at, started_at,
           completed_at, last_error, retry_count, next_retry_at,
           worker_id, lease_until, heartbeat_at, is_fast_lane, prewarm_wait_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'QUEUED', ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?, ?)
       `);
 
       const insertSucceededStmt = this.db.prepare(`
@@ -2721,8 +4995,8 @@ export class RadarDatabase {
       const requeueJobStmt = this.db.prepare(`
         UPDATE smc_scan_jobs
         SET priority = ?, priority_tier = ?, priority_label = ?, priority_class = ?,
-            status = 'QUEUED', rule_version = ?, window_key = ?,
-            requested_at = ?, queue_entered_at = ?, started_at = NULL, completed_at = NULL,
+            status = 'QUEUED', pending_reason = 'QUEUED', rule_version = ?, window_key = ?,
+            requested_at = ?, queue_entered_at = ?, last_progress_at = ?, started_at = NULL, completed_at = NULL,
             job_claimed_at = NULL,
             smc_evaluation_started_at = NULL, smc_evaluation_completed_at = NULL,
             queue_wait_ms = NULL, prewarm_wait_ms = ?, http_request_latency_ms = NULL,
@@ -2767,8 +5041,68 @@ export class RadarDatabase {
         }
       }
 
+      const activeQueueExchangeSet = new Set<ExchangeId>();
+      if (!forceRefresh) {
+        const activeExRows = this.db
+          .prepare(
+            `SELECT DISTINCT exchange FROM smc_scan_jobs
+             WHERE status IN ('QUEUED', 'RUNNING', 'RATE_LIMITED')`
+          )
+          .all() as Array<{ exchange?: string }>;
+        for (const row of activeExRows) {
+          if (row.exchange) {
+            activeQueueExchangeSet.add(row.exchange as ExchangeId);
+          }
+        }
+      }
+
+      const preloadedCacheRowsByKey = new Map<
+        string,
+        Array<{
+          timeframe: string;
+          expires_at: string;
+          stale: number;
+          fallback: number;
+          missing_data_json: string;
+          rule_version: string | null;
+          oi_expires_at: string | null;
+          open_interest: number | null;
+          funding_rate: number | null;
+        }>
+      >();
+      const jobExchanges = Array.from(new Set(jobs.map((j) => j.exchange)));
+      const preloadCacheStmt = this.db.prepare(
+        `SELECT symbol, timeframe, expires_at, stale, fallback, missing_data_json, rule_version, oi_expires_at, open_interest, funding_rate
+         FROM smc_scan_candles_cache
+         WHERE exchange = ?`
+      );
+      for (const jobEx of jobExchanges) {
+        const allExCacheRows = preloadCacheStmt.all(jobEx) as Array<{
+          symbol: string;
+          timeframe: string;
+          expires_at: string;
+          stale: number;
+          fallback: number;
+          missing_data_json: string;
+          rule_version: string | null;
+          oi_expires_at: string | null;
+          open_interest: number | null;
+          funding_rate: number | null;
+        }>;
+        for (const row of allExCacheRows) {
+          const mapKey = `${jobEx}:${String(row.symbol)}`;
+          let list = preloadedCacheRowsByKey.get(mapKey);
+          if (!list) {
+            list = [];
+            preloadedCacheRowsByKey.set(mapKey, list);
+          }
+          list.push(row);
+        }
+      }
+
       for (const job of jobs) {
         touchedExchanges.add(job.exchange);
+        const hasActiveQueueInExchange = activeQueueExchangeSet.has(job.exchange);
         const queueEnteredAt = job.queueEnteredAt || job.requestedAt || nowIso;
         const isFastLane = job.priorityTier >= 1 && job.priorityTier <= 5;
         const isFastLaneInt = isFastLane ? 1 : 0;
@@ -2818,6 +5152,9 @@ export class RadarDatabase {
               smc_evaluation_status: string;
               smc_action_state: string;
               rule_version: string;
+              stale: number;
+              fallback: number;
+              missing_data_json: string | null;
             }
           | undefined;
 
@@ -2828,24 +5165,9 @@ export class RadarDatabase {
           Number.isFinite(existingEvalMs) &&
           (Date.parse(nowIso) || Date.now()) - existingEvalMs <= 30 * 60 * 1000;
 
-        // Check if symbol has any cached rows in smc_scan_candles_cache and whether any are expired/invalid
-        const cacheRows = this.db
-          .prepare(
-            `SELECT timeframe, expires_at, stale, fallback, missing_data_json, rule_version, oi_expires_at, open_interest, funding_rate
-             FROM smc_scan_candles_cache
-             WHERE exchange = ? AND symbol = ?`
-          )
-          .all(job.exchange, job.symbol) as Array<{
-          timeframe: string;
-          expires_at: string;
-          stale: number;
-          fallback: number;
-          missing_data_json: string;
-          rule_version: string | null;
-          oi_expires_at: string | null;
-          open_interest: number | null;
-          funding_rate: number | null;
-        }>;
+        // Read preloaded smc_scan_candles_cache metadata for this symbol
+        const cacheRows =
+          preloadedCacheRowsByKey.get(`${job.exchange}:${job.symbol}`) ?? [];
 
         const nowMs = Date.parse(nowIso) || Date.now();
         let hasAnyExpiredOrInvalidCacheRow = false;
@@ -2903,6 +5225,7 @@ export class RadarDatabase {
               job.windowKey,
               job.requestedAt,
               queueEnteredAt,
+              queueEnteredAt,
               prewarmWaitMs,
               isFastLaneInt,
               exactJob.id
@@ -2911,10 +5234,22 @@ export class RadarDatabase {
             continue;
           }
 
+          const isEvaluatedResultIntact =
+            existingResult !== undefined &&
+            existingResult.smc_evaluation_status === 'EVALUATED' &&
+            existingResult.smc_action_state !== 'PENDING' &&
+            existingResult.rule_version === job.ruleVersion &&
+            Number(existingResult.stale) === 0 &&
+            Number(existingResult.fallback) === 0 &&
+            String(existingResult.missing_data_json || '[]') === '[]' &&
+            isExistingResultFresh;
+
           if (exactJob.status === 'SUCCEEDED') {
+            // exactJob already matches the same rule_version AND window_key.
+            // Never delete valid evaluated results mid-window purely because 5m candle cache TTL elapsed.
             if (
               latestSymbolJob?.id === exactJob.id &&
-              !hasValidEvaluatedResultForRule
+              !isEvaluatedResultIntact
             ) {
               deleteResultStmt.run(job.exchange, job.symbol);
               requeueJobStmt.run(
@@ -2925,6 +5260,7 @@ export class RadarDatabase {
                 job.ruleVersion,
                 job.windowKey,
                 job.requestedAt,
+                queueEnteredAt,
                 queueEnteredAt,
                 prewarmWaitMs,
                 isFastLaneInt,
@@ -3281,7 +5617,18 @@ export class RadarDatabase {
   ): number {
     return this.runInTransaction(() => {
       const nowIso = new Date().toISOString();
+      this.scrubCorruptCandlesCacheRows(exchange);
       if (exchange) {
+        this.db
+          .prepare(
+            `UPDATE smc_scan_jobs SET pending_reason = NULL WHERE exchange = ? AND status = 'SUCCEEDED' AND pending_reason IS NOT NULL`
+          )
+          .run(exchange);
+        this.db
+          .prepare(
+            `UPDATE smc_scan_jobs SET pending_reason = 'QUEUED' WHERE exchange = ? AND status = 'QUEUED' AND pending_reason IS NULL`
+          )
+          .run(exchange);
         const statsBefore = this.getSmcStatsVersion(exchange);
         const stmt = this.db.prepare(`
           UPDATE smc_scan_jobs
@@ -3294,13 +5641,14 @@ export class RadarDatabase {
               heartbeat_at = NULL,
               pending_reason = 'QUEUED',
               last_progress_at = ?,
-              retry_count = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' THEN 0 ELSE retry_count END,
-              last_error = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' THEN NULL ELSE last_error END,
-              next_retry_at = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' THEN NULL ELSE next_retry_at END
+              retry_count = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' THEN 0 ELSE retry_count END,
+              last_error = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' THEN NULL ELSE last_error END,
+              next_retry_at = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' THEN NULL ELSE next_retry_at END
           WHERE exchange = ?
             AND (
               status = 'RUNNING'
-              OR (status = 'FAILED' AND last_error LIKE '%SMC Queue rate limit guard%')
+              OR (status = 'QUEUED' AND pending_reason = 'RUNNING')
+              OR (status = 'FAILED' AND (last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' OR last_error LIKE '%empty response body%'))
             )
         `);
         const info = stmt.run(nowIso, nowIso, exchange);
@@ -3320,12 +5668,23 @@ export class RadarDatabase {
         }
         return changes;
       }
+      this.db
+        .prepare(
+          `UPDATE smc_scan_jobs SET pending_reason = NULL WHERE status = 'SUCCEEDED' AND pending_reason IS NOT NULL`
+        )
+        .run();
+      this.db
+        .prepare(
+          `UPDATE smc_scan_jobs SET pending_reason = 'QUEUED' WHERE status = 'QUEUED' AND pending_reason IS NULL`
+        )
+        .run();
       const runningByExchange = this.db
         .prepare(
           `SELECT exchange, COUNT(*) as cnt
            FROM smc_scan_jobs
            WHERE status = 'RUNNING'
-              OR (status = 'FAILED' AND last_error LIKE '%SMC Queue rate limit guard%')
+              OR (status = 'QUEUED' AND pending_reason = 'RUNNING')
+              OR (status = 'FAILED' AND (last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' OR last_error LIKE '%empty response body%'))
            GROUP BY exchange`
         )
         .all() as Array<{ exchange: string; cnt: number }>;
@@ -3341,11 +5700,12 @@ export class RadarDatabase {
             heartbeat_at = NULL,
             pending_reason = 'QUEUED',
             last_progress_at = ?,
-            retry_count = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' THEN 0 ELSE retry_count END,
-            last_error = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' THEN NULL ELSE last_error END,
-            next_retry_at = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' THEN NULL ELSE next_retry_at END
+            retry_count = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' THEN 0 ELSE retry_count END,
+            last_error = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' THEN NULL ELSE last_error END,
+            next_retry_at = CASE WHEN last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' THEN NULL ELSE next_retry_at END
         WHERE status = 'RUNNING'
-          OR (status = 'FAILED' AND last_error LIKE '%SMC Queue rate limit guard%')
+          OR (status = 'QUEUED' AND pending_reason = 'RUNNING')
+          OR (status = 'FAILED' AND (last_error LIKE '%SMC Queue rate limit guard%' OR last_error LIKE '%database is locked%' OR last_error LIKE '%SQLITE_BUSY%' OR last_error LIKE '%JSON%' OR last_error LIKE '%Unexpected%' OR last_error LIKE '%Expected%' OR last_error LIKE '%empty response body%'))
       `);
       const info = stmt.run(nowIso, nowIso);
       const totalChanges = Number(info.changes);
@@ -3990,6 +6350,7 @@ export class RadarDatabase {
     {
       stateKey: string;
       nowMs: number;
+      validUntilMs: number;
       result: ReturnType<RadarDatabase['getAtomicSmcSnapshot']>;
     }
   >();
@@ -4002,18 +6363,37 @@ export class RadarDatabase {
     }
   >();
 
-  private getDbStateFingerprint(exchange: ExchangeId): string {
+  private readonly cached15mCandleVolsByExchange = new Map<
+    ExchangeId,
+    Map<string, { version: string; vols: number[] }>
+  >();
+
+  private readonly cachedClosedKlinesByExchange = new Map<
+    ExchangeId,
+    Map<string, { version: string; klines: Kline[] }>
+  >();
+
+  public getDbStructuralFingerprint(exchange: ExchangeId): string {
     const tcRow = this.db
       .prepare('SELECT total_changes() AS tc')
       .get() as { tc: number } | undefined;
+    const smcGen = this.smcStateGenerationByExchange.get(exchange) ?? 0;
     const dvRow = this.db
       .prepare('PRAGMA data_version')
       .get() as { data_version: number } | undefined;
-    const rtHttp = this.runtimeHttpMetricsByExchange.get(exchange);
-    const rtKey = rtHttp
-      ? `${rtHttp.completedHttpRequests}:${rtHttp.rateLimitEventsCount}:${rtHttp.currentRequestsInWindow}:${rtHttp.requiresPerSymbolOiHttp}:${rtHttp.symbolsWithTickerOi?.size ?? 0}`
-      : 'none';
-    return `${tcRow?.tc ?? 0}:${dvRow?.data_version ?? 0}:${rtKey}`;
+    return `${tcRow?.tc ?? 0}:${smcGen}:${dvRow?.data_version ?? 0}`;
+  }
+
+  public hasPendingScanJobs(exchange: ExchangeId): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok
+         FROM smc_scan_jobs
+         WHERE exchange = ? AND status IN ('QUEUED', 'RUNNING', 'RATE_LIMITED')
+         LIMIT 1`
+      )
+      .get(exchange) as { ok?: number } | undefined;
+    return Boolean(row?.ok);
   }
 
   public getAtomicSmcSnapshot(
@@ -4163,15 +6543,59 @@ export class RadarDatabase {
     results: SmcScanResultRecord[];
     resultsMap: Map<string, SmcScanResultRecord>;
   } {
-    const preStateKey = this.getDbStateFingerprint(exchange);
+    const preStateKey = this.getDbStructuralFingerprint(exchange);
     const cached = this.atomicSnapshotCache.get(exchange);
     if (
       cached &&
       cached.stateKey === preStateKey &&
-      Math.abs(nowMs - cached.nowMs) < 500
+      nowMs >= cached.nowMs &&
+      nowMs < cached.validUntilMs
     ) {
-      return cached.result;
+      const rtHttp = this.runtimeHttpMetricsByExchange.get(exchange);
+      if (!rtHttp) {
+        return cached.result;
+      }
+      const rtCompleted = rtHttp.completedHttpRequests;
+      const isWarmZeroMiss =
+        cached.result.evaluatedCount > 0 &&
+        !cached.result.isColdStartCycle &&
+        cached.result.cacheMode === 'WARM' &&
+        cached.result.remainingHttpRequests === 0;
+      const patchedCompletedHttp = isWarmZeroMiss
+        ? rtCompleted
+        : Math.max(cached.result.completedHttpRequests, rtCompleted);
+      const patchedTotalExpectedHttp =
+        patchedCompletedHttp + cached.result.remainingHttpRequests;
+      const patchedRateLimitCount = Math.max(
+        cached.result.rateLimitedCount,
+        rtHttp.rateLimitEventsCount
+      );
+      if (
+        patchedCompletedHttp === cached.result.completedHttpRequests &&
+        patchedTotalExpectedHttp === cached.result.totalExpectedHttpRequests &&
+        rtHttp.currentRequestsInWindow === cached.result.currentRequestsInWindow &&
+        rtHttp.maxHttpConcurrency === cached.result.maxHttpConcurrency &&
+        rtHttp.maxRequestsPerMinute === cached.result.maxRequestsPerMinute &&
+        patchedRateLimitCount === cached.result.rateLimitCount
+      ) {
+        return cached.result;
+      }
+      return {
+        ...cached.result,
+        completedHttpRequests: patchedCompletedHttp,
+        totalExpectedHttpRequests: patchedTotalExpectedHttp,
+        currentRequestsInWindow: rtHttp.currentRequestsInWindow,
+        maxHttpConcurrency: rtHttp.maxHttpConcurrency,
+        maxRequestsPerMinute: rtHttp.maxRequestsPerMinute,
+        rateLimitCount: patchedRateLimitCount,
+      };
     }
+
+    const preTcAndGen = preStateKey;
+    const needsReconcile =
+      this.lastReconciledKeyByExchange.get(exchange) !== preTcAndGen;
+
+    let nextCacheExpiryMs = Number.POSITIVE_INFINITY;
 
     const computed = this.runInTransaction(() => {
       const snapshotAt = new Date(nowMs).toISOString();
@@ -4190,104 +6614,117 @@ export class RadarDatabase {
       const expiredChanges = 0;
       const promotedChanges = 0;
 
-      // 3. Delete any invalid/demo results on live venues or non-EVALUATED rows in smc_scan_results
-      this.db
-        .prepare(
-          `
-        DELETE FROM smc_scan_results
-        WHERE exchange = ?
-          AND (
-            smc_evaluation_status != 'EVALUATED'
-            OR smc_action_state = 'PENDING'
-            ${isLiveVenue ? 'OR is_demo = 1' : ''}
+      if (needsReconcile) {
+        // 3. Delete any invalid/demo results on live venues or non-EVALUATED rows in smc_scan_results
+        this.db
+          .prepare(
+            `
+          DELETE FROM smc_scan_results
+          WHERE exchange = ?
+            AND (
+              smc_evaluation_status != 'EVALUATED'
+              OR smc_action_state = 'PENDING'
+              ${isLiveVenue ? 'OR is_demo = 1' : ''}
+            )
+        `
           )
-      `
-        )
-        .run(exchange);
+          .run(exchange);
 
-      // 4. Delete any smc_scan_results rows whose symbol's canonical job in smc_scan_jobs is NOT SUCCEEDED
-      const orphanResultsDeleted = this.db
-        .prepare(
-          `
-        DELETE FROM smc_scan_results
-        WHERE exchange = ?
-          AND symbol IN (
-            SELECT symbol FROM smc_scan_jobs
-            WHERE id IN (${canonicalIdsSql})
-              AND status != 'SUCCEEDED'
+        // 4. Delete any smc_scan_results rows whose symbol's canonical job in smc_scan_jobs is NOT SUCCEEDED
+        const orphanResultsDeleted = this.db
+          .prepare(
+            `
+          DELETE FROM smc_scan_results
+          WHERE exchange = ?
+            AND symbol IN (
+              SELECT symbol FROM smc_scan_jobs
+              WHERE id IN (${canonicalIdsSql})
+                AND status != 'SUCCEEDED'
+            )
+        `
           )
-      `
-        )
-        .run(exchange, exchange).changes;
+          .run(exchange, exchange).changes;
 
-      // 5. If any canonical SUCCEEDED job in smc_scan_jobs has no valid row in smc_scan_results, reset it to QUEUED
-      const brokenSucceededFixed = this.db
-        .prepare(
-          `
-        UPDATE smc_scan_jobs
-        SET status = 'QUEUED',
-            completed_at = NULL,
-            started_at = NULL,
-            job_claimed_at = NULL,
-            worker_id = NULL,
-            lease_until = NULL,
-            heartbeat_at = NULL
-        WHERE id IN (${canonicalIdsSql})
-          AND status = 'SUCCEEDED'
-          AND symbol NOT IN (
-            SELECT symbol FROM smc_scan_results WHERE exchange = ?
+        // 5. If any canonical SUCCEEDED job in smc_scan_jobs has no valid row in smc_scan_results, reset it to QUEUED
+        const brokenSucceededFixed = this.db
+          .prepare(
+            `
+          UPDATE smc_scan_jobs
+          SET status = 'QUEUED',
+              pending_reason = 'QUEUED',
+              completed_at = NULL,
+              started_at = NULL,
+              job_claimed_at = NULL,
+              worker_id = NULL,
+              lease_until = NULL,
+              heartbeat_at = NULL
+          WHERE id IN (${canonicalIdsSql})
+            AND status = 'SUCCEEDED'
+            AND symbol NOT IN (
+              SELECT symbol FROM smc_scan_results WHERE exchange = ?
+            )
+        `
           )
-      `
-        )
-        .run(exchange, exchange).changes;
+          .run(exchange, exchange).changes;
 
-      // 6. If any valid row in smc_scan_results has no row at all in smc_scan_jobs, insert a SUCCEEDED job row for it
-      const unindexedResults = this.db
-        .prepare(
-          `
-        SELECT symbol, evaluated_at, rule_version
-        FROM smc_scan_results
-        WHERE exchange = ?
-          AND symbol NOT IN (
-            SELECT symbol FROM smc_scan_jobs WHERE exchange = ?
+        // 6. If any valid row in smc_scan_results has no row at all in smc_scan_jobs, insert a SUCCEEDED job row for it
+        const unindexedResults = this.db
+          .prepare(
+            `
+          SELECT symbol, evaluated_at, rule_version
+          FROM smc_scan_results
+          WHERE exchange = ?
+            AND symbol NOT IN (
+              SELECT symbol FROM smc_scan_jobs WHERE exchange = ?
+            )
+        `
           )
-      `
-        )
-        .all(exchange, exchange) as Array<{
-        symbol: string;
-        evaluated_at: string;
-        rule_version: string;
-      }>;
+          .all(exchange, exchange) as Array<{
+          symbol: string;
+          evaluated_at: string;
+          rule_version: string;
+        }>;
 
-      if (unindexedResults.length > 0) {
-        const insertMissingJobStmt = this.db.prepare(`
-          INSERT INTO smc_scan_jobs (
-            symbol, exchange, priority, priority_tier, priority_label, priority_class,
-            status, rule_version, window_key, requested_at, started_at,
-            completed_at, last_error, retry_count, next_retry_at,
-            worker_id, lease_until, heartbeat_at, is_fast_lane, execution_worker
-          ) VALUES (?, ?, 50000, 1, '1_WATCHLIST', 'FAST_LANE', 'SUCCEEDED', ?, 'synced_from_result', ?, ?, ?, NULL, 0, NULL, NULL, NULL, NULL, 1, 'FAST_LANE_WORKER')
-        `);
-        for (const ur of unindexedResults) {
-          insertMissingJobStmt.run(
-            String(ur.symbol),
-            exchange,
-            String(ur.rule_version),
-            String(ur.evaluated_at),
-            String(ur.evaluated_at),
-            String(ur.evaluated_at)
-          );
+        if (unindexedResults.length > 0) {
+          const insertMissingJobStmt = this.db.prepare(`
+            INSERT INTO smc_scan_jobs (
+              symbol, exchange, priority, priority_tier, priority_label, priority_class,
+              status, rule_version, window_key, requested_at, started_at,
+              completed_at, last_error, retry_count, next_retry_at,
+              worker_id, lease_until, heartbeat_at, is_fast_lane, execution_worker
+            ) VALUES (?, ?, 50000, 1, '1_WATCHLIST', 'FAST_LANE', 'SUCCEEDED', ?, 'synced_from_result', ?, ?, ?, NULL, 0, NULL, NULL, NULL, NULL, 1, 'FAST_LANE_WORKER')
+          `);
+          for (const ur of unindexedResults) {
+            insertMissingJobStmt.run(
+              String(ur.symbol),
+              exchange,
+              String(ur.rule_version),
+              String(ur.evaluated_at),
+              String(ur.evaluated_at),
+              String(ur.evaluated_at)
+            );
+          }
         }
-      }
 
-      if (
-        Number(expiredChanges) > 0 ||
-        Number(promotedChanges) > 0 ||
-        Number(orphanResultsDeleted) > 0 ||
-        Number(brokenSucceededFixed) > 0 ||
-        unindexedResults.length > 0
-      ) {
-        this.bumpSmcStatsVersion(exchange, snapshotAt);
+        if (
+          Number(expiredChanges) > 0 ||
+          Number(promotedChanges) > 0 ||
+          Number(orphanResultsDeleted) > 0 ||
+          Number(brokenSucceededFixed) > 0 ||
+          unindexedResults.length > 0
+        ) {
+          this.bumpSmcStatsVersion(exchange, snapshotAt);
+        }
+        const postReconcileTc = this.db
+          .prepare('SELECT total_changes() AS tc')
+          .get() as { tc: number } | undefined;
+        const postReconcileDv = this.db
+          .prepare('PRAGMA data_version')
+          .get() as { data_version: number } | undefined;
+        this.lastReconciledKeyByExchange.set(
+          exchange,
+          `${postReconcileTc?.tc ?? 0}:${this.smcStateGenerationByExchange.get(exchange) ?? 0}:${postReconcileDv?.data_version ?? 0}`
+        );
       }
 
       const statsVersion = this.getSmcStatsVersion(exchange);
@@ -4955,24 +7392,34 @@ export class RadarDatabase {
             )
           : null;
 
-      this.db
-        .prepare(
-          `UPDATE smc_scan_meta
-           SET scan_cycle_id = ?,
-               cycle_started_at = ?,
-               cycle_completed_at = ?,
-               cycle_status = ?,
-               full_cycle_duration_ms = ?
-           WHERE exchange = ?`
-        )
-        .run(
-          scanCycleId,
-          cycleStartedAt,
-          cycleCompletedAt,
-          cycleStatus,
-          computedFullCycleDurationMs,
-          exchange
-        );
+      const metaChanged =
+        !metaRow ||
+        rawScanCycleId !== scanCycleId ||
+        (metaRow.cycle_started_at ?? null) !== cycleStartedAt ||
+        (metaRow.cycle_completed_at ?? null) !== cycleCompletedAt ||
+        (metaRow.cycle_status ?? null) !== cycleStatus ||
+        (metaRow.full_cycle_duration_ms ?? null) !== computedFullCycleDurationMs;
+
+      if (metaChanged) {
+        this.db
+          .prepare(
+            `UPDATE smc_scan_meta
+             SET scan_cycle_id = ?,
+                 cycle_started_at = ?,
+                 cycle_completed_at = ?,
+                 cycle_status = ?,
+                 full_cycle_duration_ms = ?
+             WHERE exchange = ?`
+          )
+          .run(
+            scanCycleId,
+            cycleStartedAt,
+            cycleCompletedAt,
+            cycleStatus,
+            computedFullCycleDurationMs,
+            exchange
+          );
+      }
 
       const currentRuleVersion = 'v1.0.0-smc-ict-deterministic';
       let baseCandidateStatus: CandidateDiagnosisStatus = 'SCAN_INCOMPLETE';
@@ -5062,7 +7509,9 @@ export class RadarDatabase {
           this.getLatestActiveWindowKey(exchange) ?? 'win_default';
         const existingCompletedCycleRow = this.db
           .prepare(
-            `SELECT total_contracts, evaluated_count, gate_stats_json
+            `SELECT total_contracts, evaluated_count, wait_count, watch_count,
+                    high_risk_count, long_candidate_count, short_candidate_count,
+                    candidate_status, stats_version, gate_stats_json
              FROM smc_scan_cycles
              WHERE scan_cycle_id = ? AND cycle_status = 'COMPLETED'`
           )
@@ -5070,14 +7519,32 @@ export class RadarDatabase {
           | {
               total_contracts: number;
               evaluated_count: number;
+              wait_count: number;
+              watch_count: number;
+              high_risk_count: number;
+              long_candidate_count: number;
+              short_candidate_count: number;
+              candidate_status: string | null;
+              stats_version: number;
               gate_stats_json: string | null;
             }
           | undefined;
         const preserveExistingCompletedCycleStats =
           Boolean(existingCompletedCycleRow) &&
           Number(existingCompletedCycleRow?.total_contracts ?? 0) > totalContracts;
+        const completedCycleRowMatches =
+          Boolean(existingCompletedCycleRow) &&
+          Number(existingCompletedCycleRow?.total_contracts ?? -1) === totalContracts &&
+          Number(existingCompletedCycleRow?.evaluated_count ?? -1) === evaluatedCount &&
+          Number(existingCompletedCycleRow?.wait_count ?? -1) === waitCount &&
+          Number(existingCompletedCycleRow?.watch_count ?? -1) === watchCount &&
+          Number(existingCompletedCycleRow?.high_risk_count ?? -1) === highRiskCount &&
+          Number(existingCompletedCycleRow?.long_candidate_count ?? -1) === longCandidateCount &&
+          Number(existingCompletedCycleRow?.short_candidate_count ?? -1) === shortCandidateCount &&
+          String(existingCompletedCycleRow?.candidate_status ?? '') === baseCandidateStatus &&
+          Number(existingCompletedCycleRow?.stats_version ?? -1) === statsVersion;
 
-        if (!preserveExistingCompletedCycleStats) {
+        if (!preserveExistingCompletedCycleStats && !completedCycleRowMatches) {
           this.db
             .prepare(
               `INSERT INTO smc_scan_cycles (
@@ -5600,13 +8067,15 @@ export class RadarDatabase {
           ? 'MET'
           : 'NOT_MET';
 
-      const cacheCoverage = this.getCacheCoverageMetrics(
+      const cacheCoverageWithExpiry = this.computeCacheCoverageWithExpiry(
         exchange,
         totalContracts,
         runningJobCount > 0 || queuedCount > 0,
         currentRuleVersion,
         nowMs
       );
+      nextCacheExpiryMs = cacheCoverageWithExpiry.nextExpiryMs;
+      const cacheCoverage = cacheCoverageWithExpiry.metrics;
       const latestPrewarmSnapshot = this.getLatestPrewarmSnapshot(exchange);
       const prewarmTasks = this.listPrewarmTasks(exchange, 100);
 
@@ -5872,30 +8341,51 @@ export class RadarDatabase {
         }
       }
 
-      this.db
-        .prepare(
-          `UPDATE smc_scan_meta
-           SET completed_http_requests = ?,
-               cache_mode = ?
-           WHERE exchange = ?`
-        )
-        .run(completedHttpRequests, cacheMode, exchange);
+      if (
+        !metaRow ||
+        persistedMetaHttp !== completedHttpRequests ||
+        (metaRow.cache_mode ?? null) !== cacheMode
+      ) {
+        this.db
+          .prepare(
+            `UPDATE smc_scan_meta
+             SET completed_http_requests = ?,
+                 cache_mode = ?
+             WHERE exchange = ?`
+          )
+          .run(completedHttpRequests, cacheMode, exchange);
+      }
 
       if (isCycleCompleted) {
         const existingCycleForQuality = this.db
           .prepare(
-            `SELECT total_contracts, gate_stats_json
+            `SELECT total_contracts, evaluated_count, stats_version, cache_mode,
+                    completed_http_requests, gate_stats_json
              FROM smc_scan_cycles
              WHERE scan_cycle_id = ? AND cycle_status = 'COMPLETED'`
           )
           .get(resolvedScanCycleId) as
-          | { total_contracts: number; gate_stats_json: string | null }
+          | {
+              total_contracts: number;
+              evaluated_count: number;
+              stats_version: number;
+              cache_mode: string | null;
+              completed_http_requests: number | null;
+              gate_stats_json: string | null;
+            }
           | undefined;
         const preserveExistingQualityStats =
           Boolean(existingCycleForQuality?.gate_stats_json) &&
           Number(existingCycleForQuality?.total_contracts ?? 0) > totalContracts;
+        const qualityAlreadySynced =
+          Boolean(existingCycleForQuality?.gate_stats_json) &&
+          Number(existingCycleForQuality?.evaluated_count ?? -1) === evaluatedCount &&
+          Number(existingCycleForQuality?.stats_version ?? -1) === statsVersion &&
+          String(existingCycleForQuality?.cache_mode ?? '') === cacheMode &&
+          Number(existingCycleForQuality?.completed_http_requests ?? -1) ===
+            completedHttpRequests;
 
-        if (!preserveExistingQualityStats) {
+        if (!preserveExistingQualityStats && !qualityAlreadySynced) {
           const cycleQualitySummary = this.summarizeResultsGateAndReasons(
             results,
             resolvedScanCycleId,
@@ -6140,10 +8630,11 @@ export class RadarDatabase {
       };
     });
 
-    const postStateKey = this.getDbStateFingerprint(exchange);
+    const postStateKey = this.getDbStructuralFingerprint(exchange);
     this.atomicSnapshotCache.set(exchange, {
       stateKey: postStateKey,
       nowMs,
+      validUntilMs: Math.min(nowMs + 1500, nextCacheExpiryMs),
       result: computed,
     });
     return computed;
@@ -6995,6 +9486,17 @@ export class RadarDatabase {
     };
   }
 
+  public getRunningSmcJobCount(exchange: ExchangeId): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(DISTINCT symbol) as cnt
+         FROM smc_scan_jobs
+         WHERE exchange = ? AND status = 'RUNNING'`
+      )
+      .get(exchange) as { cnt?: number } | undefined;
+    return Number(row?.cnt ?? 0);
+  }
+
   public getSmcScanQueueStats(exchange: ExchangeId) {
     const snap = this.getAtomicSmcSnapshot(exchange);
     return {
@@ -7129,6 +9631,107 @@ export class RadarDatabase {
     record: SmcScanResultRecord,
     completedJobId?: number
   ): void {
+    const resolvedEvidenceType = resolveCandidateEvidenceType({
+      exchange: record.exchange,
+      isDemo: record.isDemo,
+      source: record.source,
+      evidenceType: record.evidenceType,
+    });
+
+    if (
+      record.exchange !== 'demo_synthetic' &&
+      resolvedEvidenceType === 'CONTROLLED_LIVE_FIXTURE'
+    ) {
+      if (
+        record.smcEvaluationStatus === 'EVALUATED' &&
+        (record.smcActionState === 'LONG CANDIDATE' ||
+          record.smcActionState === 'SHORT CANDIDATE')
+      ) {
+        const evalCompletedAtStr =
+          record.evaluationCompletedAt ??
+          record.smcEvaluationCompletedAt ??
+          record.evaluatedAt;
+        const evalCompletedMs = Date.parse(evalCompletedAtStr);
+        const sigBarClose =
+          record.signalBarCloseTime !== undefined
+            ? record.signalBarCloseTime
+            : null;
+        const sigBarOpen =
+          record.signalBarOpenTime !== undefined &&
+          record.signalBarOpenTime !== null
+            ? record.signalBarOpenTime
+            : sigBarClose !== null
+              ? Number(sigBarClose) % 900_000 === 899_999
+                ? Number(sigBarClose) - 900_000 + 1
+                : Number(sigBarClose) - 900_000
+              : null;
+        const nextBarOpen =
+          record.nextBarOpenTime !== undefined ? record.nextBarOpenTime : null;
+        const isMissed =
+          record.entryWindowStatus === 'ENTRY_WINDOW_MISSED' ||
+          (nextBarOpen !== null &&
+            Number.isFinite(evalCompletedMs) &&
+            evalCompletedMs >= Number(nextBarOpen));
+        const direction: 'LONG' | 'SHORT' =
+          record.smcActionState === 'SHORT CANDIDATE' ? 'SHORT' : 'LONG';
+        const normalizedRule = record.ruleVersion.includes('+')
+          ? record.ruleVersion.split('+')[0]
+          : record.ruleVersion;
+        const safeRule = normalizedRule.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const sigId = `sig_${record.exchange}_${record.symbol}_15m_${direction}_${sigBarOpen ?? 'nobar'}_${safeRule}`;
+
+        this.saveControlledFixtureCandidate({
+          cycleId:
+            record.scanCycleId || this.getSmcScanCycleId(record.exchange),
+          signalId: sigId,
+          symbol: record.symbol,
+          exchange: record.exchange,
+          timeframe: '15m',
+          direction,
+          signalBarOpenTime: sigBarOpen,
+          signalBarCloseTime: sigBarClose,
+          nextBarOpenTime: nextBarOpen,
+          candidateDetectedAt:
+            record.candidateDetectedAt ?? evalCompletedAtStr,
+          signalDetectedAt: record.signalDetectedAt ?? evalCompletedAtStr,
+          queueEnteredAt: record.queueEnteredAt ?? record.evaluatedAt,
+          evaluationStartedAt:
+            record.evaluationStartedAt ??
+            record.smcEvaluationStartedAt ??
+            record.evaluatedAt,
+          evaluationCompletedAt: evalCompletedAtStr,
+          queueWaitMs: record.queueWaitMs ?? null,
+          evaluationLatencyMs:
+            record.evaluationLatencyMs ?? record.smcEvaluationLatencyMs ?? null,
+          candidateDetectionLatencyMs:
+            record.candidateDetectionLatencyMs ??
+            record.detectionLatencyMs ??
+            null,
+          nextBarRemainingMs:
+            record.nextBarRemainingMs ??
+            (nextBarOpen !== null && Number.isFinite(evalCompletedMs)
+              ? Math.round(Number(nextBarOpen) - evalCompletedMs)
+              : null),
+          entryWindowStatus: isMissed
+            ? 'ENTRY_WINDOW_MISSED'
+            : 'DETECTED_BEFORE_NEXT_BAR_OPEN',
+          entryWindowMissed: isMissed,
+          isFastLane:
+            record.isFastLane !== undefined
+              ? record.isFastLane
+              : (record.priorityTier ?? 1) <= 5,
+          evidenceType: 'CONTROLLED_LIVE_FIXTURE',
+          source: record.source || 'CONTROLLED_LIVE_FIXTURE',
+          fetchedAt: record.fetchedAt ?? record.dataFetchedAt,
+          stale: record.stale,
+          fallback: record.fallback,
+          isDemo: false,
+          isTestFixture: true,
+        });
+      }
+      return;
+    }
+
     const safeProv = enforceProvenanceIntegrity({
       source: record.source,
       fetchedAt: record.dataFetchedAt,
@@ -7311,8 +9914,9 @@ export class RadarDatabase {
           db_write_latency_ms, smc_evaluation_latency_ms, rate_limit_wait_ms,
           detection_latency_ms, cache_hit, cache_miss, reused_cache,
           signal_bar_close_time, next_bar_open_time, entry_window_status, is_fast_lane,
-          primary_blocking_reason, primary_reason_category, all_blocking_reasons_json, gate_pass_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          primary_blocking_reason, primary_reason_category, all_blocking_reasons_json, gate_pass_json,
+          evidence_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(exchange, symbol) DO UPDATE SET
           smc_evaluation_status = excluded.smc_evaluation_status,
           smc_action_state = excluded.smc_action_state,
@@ -7357,8 +9961,14 @@ export class RadarDatabase {
           primary_blocking_reason = excluded.primary_blocking_reason,
           primary_reason_category = excluded.primary_reason_category,
           all_blocking_reasons_json = excluded.all_blocking_reasons_json,
-          gate_pass_json = excluded.gate_pass_json
+          gate_pass_json = excluded.gate_pass_json,
+          evidence_type = excluded.evidence_type
       `);
+
+      const persistedEvidenceType: CandidateEvidenceType =
+        record.exchange === 'demo_synthetic' || safeProv.isDemo
+          ? 'DEMO_LATENCY_FIXTURE'
+          : 'LIVE_PRODUCTION';
 
       stmt.run(
         record.symbol,
@@ -7406,8 +10016,84 @@ export class RadarDatabase {
         symbolDiag.primaryBlockingReason,
         symbolDiag.primaryReasonCategory,
         JSON.stringify(symbolDiag.allReasons),
-        JSON.stringify(symbolDiag.gatePassMap)
+        JSON.stringify(symbolDiag.gatePassMap),
+        persistedEvidenceType
       );
+
+      // Persist LIVE_PRODUCTION formal candidates into smc_live_capture_candidates
+      if (
+        persistedEvidenceType === 'LIVE_PRODUCTION' &&
+        record.smcEvaluationStatus === 'EVALUATED' &&
+        (record.smcActionState === 'LONG CANDIDATE' ||
+          record.smcActionState === 'SHORT CANDIDATE') &&
+        !safeProv.stale &&
+        !safeProv.fallback &&
+        safeProv.missingData.length === 0
+      ) {
+        const evalCompletedMs = Date.parse(smcEvaluationCompletedAt);
+        const sigBarOpen =
+          record.signalBarOpenTime !== undefined &&
+          record.signalBarOpenTime !== null
+            ? Number(record.signalBarOpenTime)
+            : signalBarCloseTime !== null
+              ? signalBarCloseTime % 900_000 === 899_999
+                ? signalBarCloseTime - 900_000 + 1
+                : signalBarCloseTime - 900_000
+              : null;
+        const isMissed =
+          entryWindowStatus === 'ENTRY_WINDOW_MISSED' ||
+          (nextBarOpenTime !== null &&
+            Number.isFinite(evalCompletedMs) &&
+            evalCompletedMs >= nextBarOpenTime);
+        const direction: 'LONG' | 'SHORT' =
+          record.smcActionState === 'SHORT CANDIDATE' ? 'SHORT' : 'LONG';
+        const safeRule = normalizedRuleVersion.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const sigId = `sig_${record.exchange}_${record.symbol}_15m_${direction}_${sigBarOpen ?? 'nobar'}_${safeRule}`;
+
+        this.saveLiveCaptureCandidate({
+          cycleId: scanCycleId,
+          signalId: sigId,
+          symbol: record.symbol,
+          exchange: record.exchange,
+          timeframe: '15m',
+          direction,
+          signalBarOpenTime: sigBarOpen,
+          signalBarCloseTime,
+          nextBarOpenTime,
+          candidateDetectedAt:
+            record.candidateDetectedAt ?? smcEvaluationCompletedAt,
+          signalDetectedAt:
+            record.signalDetectedAt ?? smcEvaluationCompletedAt,
+          queueEnteredAt,
+          evaluationStartedAt: smcEvaluationStartedAt,
+          evaluationCompletedAt: smcEvaluationCompletedAt,
+          queueWaitMs,
+          evaluationLatencyMs: smcEvaluationLatencyMs,
+          candidateDetectionLatencyMs:
+            record.candidateDetectionLatencyMs ??
+            detectionLatencyMs ??
+            (signalBarCloseTime !== null && Number.isFinite(evalCompletedMs)
+              ? Math.max(0, Math.round(evalCompletedMs - signalBarCloseTime))
+              : null),
+          nextBarRemainingMs:
+            record.nextBarRemainingMs ??
+            (nextBarOpenTime !== null && Number.isFinite(evalCompletedMs)
+              ? Math.round(nextBarOpenTime - evalCompletedMs)
+              : null),
+          entryWindowStatus: isMissed
+            ? 'ENTRY_WINDOW_MISSED'
+            : 'DETECTED_BEFORE_NEXT_BAR_OPEN',
+          entryWindowMissed: isMissed,
+          isFastLane,
+          evidenceType: 'LIVE_PRODUCTION',
+          source: safeProv.source,
+          fetchedAt: safeProv.fetchedAt,
+          stale: false,
+          fallback: false,
+          isDemo: false,
+          isTestFixture: false,
+        });
+      }
 
       // Atomically ensure the corresponding smc_scan_jobs row is marked SUCCEEDED in the same transaction
       if (completedJobId !== undefined) {
@@ -7433,6 +10119,8 @@ export class RadarDatabase {
               execution_worker = ?,
               worker_role = ?,
               is_fast_lane = ?,
+              pending_reason = NULL,
+              last_progress_at = ?,
               last_error = NULL,
               next_retry_at = NULL,
               worker_id = NULL,
@@ -7459,6 +10147,7 @@ export class RadarDatabase {
             executionWorker,
             workerRole,
             isFastLaneInt,
+            record.evaluatedAt,
             completedJobId
           );
       } else {
@@ -7488,6 +10177,8 @@ export class RadarDatabase {
                 worker_role = ?,
                 is_fast_lane = ?,
                 rule_version = ?,
+                pending_reason = NULL,
+                last_progress_at = ?,
                 last_error = NULL,
                 next_retry_at = NULL,
                 worker_id = NULL,
@@ -7517,6 +10208,7 @@ export class RadarDatabase {
               workerRole,
               isFastLaneInt,
               normalizedRuleVersion,
+              record.evaluatedAt,
               existingJobForSymbol.id
             );
         } else {
@@ -7604,7 +10296,18 @@ export class RadarDatabase {
     const freshnessSeconds = Number.isFinite(evalMs)
       ? Math.max(0, Math.round((nowMs - evalMs) / 1000))
       : 0;
-    const isStaleByAge = freshnessSeconds > 24 * 60 * 60; // >24h considered stale
+
+    const exStr = String(r.exchange);
+    const symStr = String(r.symbol);
+    const mapCacheId = `${exStr}:${symStr}`;
+    const cacheKey = `${evaluatedAt}|${String(r.data_fetched_at)}|${String(r.smc_action_state)}|${String(r.final_trade_signal)}|${String(r.scan_cycle_id || '')}|${String(r.stale)}|${String(r.fallback)}|${String(r.smc_analysis_json || '').length}|${String(r.wait_reasons_json || '')}|${String(r.missing_data_json || '')}`;
+    const memo = this.parsedSmcRowCache.get(mapCacheId);
+    if (memo && memo.cacheKey === cacheKey) {
+      return {
+        ...memo.record,
+        freshnessSeconds,
+      };
+    }
 
     let parsedAnalysis: SmcAnalysisResult | undefined;
     if (r.smc_analysis_json) {
@@ -7664,7 +10367,7 @@ export class RadarDatabase {
       executionWorker,
       workerRole,
       freshnessSeconds,
-      stale: Number(r.stale) === 1 || isStaleByAge,
+      stale: Number(r.stale) === 1,
       fallback: Number(r.fallback) === 1,
       missingData: JSON.parse(String(r.missing_data_json || '[]')),
       source: String(r.source),
@@ -7831,8 +10534,18 @@ export class RadarDatabase {
           ? 'ENTRY_WINDOW_MISSED: 偵測時間晚於下一根 K 線開盤時間窗'
           : null
       : baseRecord.primaryBlockingReason ?? baseRecord.waitReasons[0] ?? null;
+    baseRecord.evidenceType = resolveCandidateEvidenceType({
+      exchange: baseRecord.exchange,
+      isDemo: baseRecord.isDemo,
+      source: baseRecord.source,
+      evidenceType: r.evidence_type ? String(r.evidence_type) : null,
+    });
 
-    return baseRecord;
+    this.parsedSmcRowCache.set(mapCacheId, {
+      cacheKey,
+      record: baseRecord,
+    });
+    return { ...baseRecord };
   }
 
   public saveSmcCandlesCache(record: SmcCandlesCacheRecord): void {
@@ -7867,6 +10580,13 @@ export class RadarDatabase {
       record.windowKey ||
       `win_${Math.floor((Date.parse(safeProv.fetchedAt) || Date.now()) / 300_000)}`;
 
+    const is15m = record.timeframe === '15m';
+    const explicitClearOi = is15m && record.oiExpiresAt === null;
+    const resolvedOpenInterest = record.openInterest ?? null;
+    const resolvedOpenInterestValue = record.openInterestValue ?? null;
+    const resolvedOiFetchedAt = is15m ? (record.oiFetchedAt ?? null) : null;
+    const resolvedOiExpiresAt = is15m ? (record.oiExpiresAt ?? null) : null;
+
     const stmt = this.db.prepare(`
       INSERT INTO smc_scan_candles_cache (
         symbol, exchange, timeframe, klines_json,
@@ -7877,12 +10597,26 @@ export class RadarDatabase {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(exchange, symbol, timeframe) DO UPDATE SET
         klines_json = excluded.klines_json,
-        open_interest = COALESCE(excluded.open_interest, smc_scan_candles_cache.open_interest),
-        open_interest_value = COALESCE(excluded.open_interest_value, smc_scan_candles_cache.open_interest_value),
+        open_interest = CASE
+          WHEN ? = 1 THEN excluded.open_interest
+          ELSE COALESCE(excluded.open_interest, smc_scan_candles_cache.open_interest)
+        END,
+        open_interest_value = CASE
+          WHEN ? = 1 THEN excluded.open_interest_value
+          ELSE COALESCE(excluded.open_interest_value, smc_scan_candles_cache.open_interest_value)
+        END,
         funding_rate = COALESCE(excluded.funding_rate, smc_scan_candles_cache.funding_rate),
         next_funding_time = COALESCE(excluded.next_funding_time, smc_scan_candles_cache.next_funding_time),
-        oi_fetched_at = COALESCE(excluded.oi_fetched_at, smc_scan_candles_cache.oi_fetched_at),
-        oi_expires_at = COALESCE(excluded.oi_expires_at, smc_scan_candles_cache.oi_expires_at),
+        oi_fetched_at = CASE
+          WHEN excluded.timeframe != '15m' THEN NULL
+          WHEN ? = 1 THEN excluded.oi_fetched_at
+          ELSE COALESCE(excluded.oi_fetched_at, smc_scan_candles_cache.oi_fetched_at)
+        END,
+        oi_expires_at = CASE
+          WHEN excluded.timeframe != '15m' THEN NULL
+          WHEN ? = 1 THEN excluded.oi_expires_at
+          ELSE COALESCE(excluded.oi_expires_at, smc_scan_candles_cache.oi_expires_at)
+        END,
         data_timestamp = excluded.data_timestamp,
         rule_version = COALESCE(?, smc_scan_candles_cache.rule_version, excluded.rule_version),
         window_key = COALESCE(?, smc_scan_candles_cache.window_key, excluded.window_key),
@@ -7900,12 +10634,12 @@ export class RadarDatabase {
       record.exchange,
       record.timeframe,
       JSON.stringify(confirmedKlines),
-      record.openInterest,
-      record.openInterestValue,
+      resolvedOpenInterest,
+      resolvedOpenInterestValue,
       record.fundingRate ?? null,
       record.nextFundingTime ?? null,
-      record.oiFetchedAt ?? null,
-      record.oiExpiresAt ?? null,
+      resolvedOiFetchedAt,
+      resolvedOiExpiresAt,
       resolvedDataTimestamp,
       resolvedRuleVersion,
       resolvedWindowKey,
@@ -7916,9 +10650,60 @@ export class RadarDatabase {
       safeProv.fallback ? 1 : 0,
       JSON.stringify(safeProv.missingData),
       safeProv.isDemo ? 1 : 0,
+      explicitClearOi ? 1 : 0,
+      explicitClearOi ? 1 : 0,
+      explicitClearOi ? 1 : 0,
+      explicitClearOi ? 1 : 0,
       record.ruleVersion ?? null,
       record.windowKey ?? null
     );
+    if (record.timeframe === '15m') {
+      this.cached15mCandleVolsByExchange.get(record.exchange)?.delete(record.symbol);
+    }
+    this.cachedClosedKlinesByExchange
+      .get(record.exchange)
+      ?.delete(`${record.symbol}:${record.timeframe}`);
+    this.touchSmcState(record.exchange);
+  }
+
+  public scrubCorruptCandlesCacheRows(exchange?: ExchangeId): number {
+    let removed = 0;
+    try {
+      const rows = (
+        exchange
+          ? this.db
+              .prepare(
+                `SELECT exchange, symbol, timeframe, klines_json, missing_data_json FROM smc_scan_candles_cache WHERE exchange = ?`
+              )
+              .all(exchange)
+          : this.db
+              .prepare(
+                `SELECT exchange, symbol, timeframe, klines_json, missing_data_json FROM smc_scan_candles_cache`
+              )
+              .all()
+      ) as Array<{
+        exchange: string;
+        symbol: string;
+        timeframe: string;
+        klines_json: string;
+        missing_data_json: string;
+      }>;
+      const delStmt = this.db.prepare(
+        `DELETE FROM smc_scan_candles_cache WHERE exchange = ? AND symbol = ? AND timeframe = ?`
+      );
+      for (const r of rows) {
+        try {
+          JSON.parse(String(r.klines_json || '[]'));
+          JSON.parse(String(r.missing_data_json || '[]'));
+        } catch {
+          delStmt.run(r.exchange, r.symbol, r.timeframe);
+          removed++;
+        }
+      }
+    } catch {
+      // ignore scrub errors
+    }
+    return removed;
   }
 
   public getSmcCandlesCache(
@@ -7958,7 +10743,25 @@ export class RadarDatabase {
       return null;
     }
 
-    const rawKlines: Kline[] = JSON.parse(String(r.klines_json || '[]'));
+    let rawKlines: Kline[] = [];
+    let missingDataParsed: string[] = [];
+    try {
+      rawKlines = JSON.parse(String(r.klines_json || '[]')) as Kline[];
+      missingDataParsed = JSON.parse(
+        String(r.missing_data_json || '[]')
+      ) as string[];
+    } catch {
+      try {
+        this.db
+          .prepare(
+            `DELETE FROM smc_scan_candles_cache WHERE exchange = ? AND symbol = ? AND timeframe = ?`
+          )
+          .run(exchange, symbol, timeframe);
+      } catch {
+        // ignore delete error
+      }
+      return null;
+    }
     const klines = rawKlines.filter((k) => k.isClosed).slice(-60);
     const latestClosed =
       klines.length > 0 ? klines[klines.length - 1] : null;
@@ -8029,9 +10832,7 @@ export class RadarDatabase {
 
     const rawStale = Number(r.stale) === 1;
     const fallback = Number(r.fallback) === 1;
-    const missingData: string[] = JSON.parse(
-      String(r.missing_data_json || '[]')
-    );
+    const missingData: string[] = missingDataParsed;
     const isExpired =
       isTtlExpired ||
       isNewBarFormed ||
@@ -8090,13 +10891,143 @@ export class RadarDatabase {
     };
   }
 
-  public getCacheCoverageMetrics(
+  public getBulkCachedClosedKlinesMap(
+    exchange: ExchangeId,
+    timeframes: Timeframe[] = ['15m', '1h'],
+    maxBars = 60
+  ): Map<string, Partial<Record<Timeframe, Kline[]>>> {
+    const result = new Map<string, Partial<Record<Timeframe, Kline[]>>>();
+    if (timeframes.length === 0) return result;
+    const isLiveVenue = exchange !== 'demo_synthetic';
+    const placeholders = timeframes.map(() => '?').join(', ');
+
+    try {
+      let exKlineCache = this.cachedClosedKlinesByExchange.get(exchange);
+      if (!exKlineCache) {
+        exKlineCache = new Map();
+        this.cachedClosedKlinesByExchange.set(exchange, exKlineCache);
+      }
+
+      const metaStmt = this.db.prepare(`
+        SELECT symbol, timeframe, fetched_at, data_timestamp, source
+        FROM smc_scan_candles_cache
+        WHERE exchange = ? AND timeframe IN (${placeholders}) AND is_demo = ?
+      `);
+      const metaRows = metaStmt.all(
+        exchange,
+        ...timeframes,
+        isLiveVenue ? 0 : 1
+      ) as Array<{
+        symbol: string;
+        timeframe: string;
+        fetched_at: string;
+        data_timestamp: number | null;
+        source: string;
+      }>;
+
+      const missingKeys: Array<{ sym: string; tf: Timeframe; ver: string }> = [];
+      for (const mr of metaRows) {
+        const source = String(mr.source || '');
+        if (isLiveVenue && !isVerifiedLivePublicApiSource(source)) {
+          continue;
+        }
+        const tf = String(mr.timeframe) as Timeframe;
+        if (!timeframes.includes(tf)) continue;
+        const sym = String(mr.symbol);
+        const cacheKey = `${sym}:${tf}`;
+        const ver = `${String(mr.fetched_at || '')}|${String(mr.data_timestamp ?? '')}`;
+        const cached = exKlineCache.get(cacheKey);
+        if (cached && cached.version === ver) {
+          const sliced =
+            cached.klines.length > maxBars
+              ? cached.klines.slice(-maxBars)
+              : cached.klines;
+          if (sliced.length > 0) {
+            let entry = result.get(sym);
+            if (!entry) {
+              entry = {};
+              result.set(sym, entry);
+            }
+            entry[tf] = sliced;
+          }
+        } else {
+          missingKeys.push({ sym, tf, ver });
+        }
+      }
+
+      if (missingKeys.length > 0) {
+        const missingSymSet = Array.from(new Set(missingKeys.map((m) => m.sym)));
+        const verLookup = new Map(missingKeys.map((m) => [`${m.sym}:${m.tf}`, m.ver]));
+        const batchSize = 200;
+        for (let i = 0; i < missingSymSet.length; i += batchSize) {
+          const symBatch = missingSymSet.slice(i, i + batchSize);
+          const symPlaceholders = symBatch.map(() => '?').join(', ');
+          const rows = this.db
+            .prepare(`
+              SELECT symbol, timeframe, klines_json, source
+              FROM smc_scan_candles_cache
+              WHERE exchange = ? AND timeframe IN (${placeholders}) AND is_demo = ? AND symbol IN (${symPlaceholders})
+            `)
+            .all(
+              exchange,
+              ...timeframes,
+              isLiveVenue ? 0 : 1,
+              ...symBatch
+            ) as Array<{
+            symbol: string;
+            timeframe: string;
+            klines_json: string;
+            source: string;
+          }>;
+
+          for (const row of rows) {
+            const sym = String(row.symbol);
+            const tf = String(row.timeframe) as Timeframe;
+            const cacheKey = `${sym}:${tf}`;
+            const ver = verLookup.get(cacheKey);
+            if (!ver) continue;
+            let parsed: Kline[];
+            try {
+              parsed = JSON.parse(String(row.klines_json || '[]')) as Kline[];
+            } catch {
+              continue;
+            }
+            const closed = parsed
+              .filter(
+                (k) =>
+                  k &&
+                  k.isClosed &&
+                  Number.isFinite(k.openTime) &&
+                  Number.isFinite(k.close) &&
+                  k.close > 0
+              )
+              .sort((a, b) => a.openTime - b.openTime);
+            exKlineCache.set(cacheKey, { version: ver, klines: closed });
+            const sliced = closed.slice(-maxBars);
+            if (sliced.length === 0) continue;
+            let entry = result.get(sym);
+            if (!entry) {
+              entry = {};
+              result.set(sym, entry);
+            }
+            entry[tf] = sliced;
+          }
+        }
+      }
+    } catch {
+      // Non-fatal: cache may be empty on cold start
+    }
+
+    return result;
+  }
+
+  private computeCacheCoverageWithExpiry(
     exchange: ExchangeId,
     totalUniverseSymbolsCount?: number,
     isPrewarming = false,
     expectedRuleVersion = 'v1.0.0-smc-ict-deterministic',
     nowMs = Date.now()
-  ): SmcCacheCoverageMetrics {
+  ): { metrics: SmcCacheCoverageMetrics; nextExpiryMs: number } {
     const isLiveVenue = exchange !== 'demo_synthetic';
     const rows = this.db
       .prepare(
@@ -8159,12 +11090,16 @@ export class RadarDatabase {
     };
     const freshOiSymbols = new Set<string>();
     const freshFundingSymbols = new Set<string>();
+    let nextExpiryMs = Number.POSITIVE_INFINITY;
 
     for (const r of rows) {
       const sym = String(r.symbol);
       const tf = String(r.timeframe) as Timeframe;
       const expMs = Date.parse(String(r.expires_at));
       const isTtlExpired = !Number.isFinite(expMs) || nowMs >= expMs;
+      if (Number.isFinite(expMs) && expMs > nowMs && expMs < nextExpiryMs) {
+        nextExpiryMs = expMs;
+      }
 
       const fetchedAtMs = Date.parse(String(r.fetched_at)) || nowMs;
       const dataTs =
@@ -8176,10 +11111,14 @@ export class RadarDatabase {
         const barMs = tf === '5m' ? 300_000 : 900_000;
         if (
           Number.isFinite(dataTs) &&
-          Math.abs(fetchedAtMs - dataTs) <= 6 * barMs &&
-          nowMs >= dataTs + barMs
+          Math.abs(fetchedAtMs - dataTs) <= 6 * barMs
         ) {
-          isNewBarFormed = true;
+          const barExpireAtMs = dataTs + barMs;
+          if (nowMs >= barExpireAtMs) {
+            isNewBarFormed = true;
+          } else if (barExpireAtMs < nextExpiryMs) {
+            nextExpiryMs = barExpireAtMs;
+          }
         }
       }
 
@@ -8200,8 +11139,21 @@ export class RadarDatabase {
 
       const oiExpMs = r.oi_expires_at ? Date.parse(String(r.oi_expires_at)) : expMs;
       const isOiExp = Boolean(
-        r.oi_expires_at && Number.isFinite(oiExpMs) && nowMs >= oiExpMs
+        tf === '15m' &&
+          r.oi_expires_at &&
+          Number.isFinite(oiExpMs) &&
+          nowMs >= oiExpMs
       );
+      if (
+        tf === '15m' &&
+        r.oi_expires_at &&
+        Number.isFinite(oiExpMs) &&
+        oiExpMs > nowMs &&
+        oiExpMs < nextExpiryMs
+      ) {
+        nextExpiryMs = oiExpMs;
+      }
+
       const nextFundingMs =
         r.next_funding_time !== null && r.next_funding_time !== undefined
           ? Number(r.next_funding_time)
@@ -8211,6 +11163,14 @@ export class RadarDatabase {
           Number.isFinite(nextFundingMs) &&
           nowMs >= nextFundingMs
       );
+      if (
+        nextFundingMs !== null &&
+        Number.isFinite(nextFundingMs) &&
+        nextFundingMs > nowMs &&
+        nextFundingMs < nextExpiryMs
+      ) {
+        nextExpiryMs = nextFundingMs;
+      }
 
       const isRowExpired =
         isTtlExpired ||
@@ -8234,6 +11194,7 @@ export class RadarDatabase {
 
       if (!rawStale && !fallback && !hasMissingData && !ruleMismatch && !winInvalid) {
         if (
+          tf === '15m' &&
           r.open_interest !== null &&
           r.open_interest !== undefined &&
           r.open_interest_value !== null &&
@@ -8362,26 +11323,354 @@ export class RadarDatabase {
     }
 
     return {
-      cacheCoverage: cacheCoverageRate,
-      cacheCoverageRate,
-      freshCacheCount,
-      expiredCacheCount,
-      staleCacheCount,
-      cacheMissCount,
-      prewarmRequiredCount,
-      '5mCoverage': cov5m,
-      '15mCoverage': cov15m,
-      '1hCoverage': cov1h,
-      '4hCoverage': cov4h,
-      '5mCacheCoverage': cov5m,
-      '15mCacheCoverage': cov15m,
-      '1hCacheCoverage': cov1h,
-      '4hCacheCoverage': cov4h,
-      oiCacheCoverage: covOi,
-      fundingCacheCoverage: covFunding,
-      cacheStatus: cacheStatusLabel,
-      cacheStatusLabel,
+      metrics: {
+        cacheCoverage: cacheCoverageRate,
+        cacheCoverageRate,
+        freshCacheCount,
+        expiredCacheCount,
+        staleCacheCount,
+        cacheMissCount,
+        prewarmRequiredCount,
+        '5mCoverage': cov5m,
+        '15mCoverage': cov15m,
+        '1hCoverage': cov1h,
+        '4hCoverage': cov4h,
+        '5mCacheCoverage': cov5m,
+        '15mCacheCoverage': cov15m,
+        '1hCacheCoverage': cov1h,
+        '4hCacheCoverage': cov4h,
+        oiCacheCoverage: covOi,
+        fundingCacheCoverage: covFunding,
+        cacheStatus: cacheStatusLabel,
+        cacheStatusLabel,
+      },
+      nextExpiryMs,
     };
+  }
+
+  public getCacheCoverageMetrics(
+    exchange: ExchangeId,
+    totalUniverseSymbolsCount?: number,
+    isPrewarming = false,
+    expectedRuleVersion = 'v1.0.0-smc-ict-deterministic',
+    nowMs = Date.now()
+  ): SmcCacheCoverageMetrics {
+    return this.computeCacheCoverageWithExpiry(
+      exchange,
+      totalUniverseSymbolsCount,
+      isPrewarming,
+      expectedRuleVersion,
+      nowMs
+    ).metrics;
+  }
+
+  public listCacheRefreshNeeds(
+    exchange: ExchangeId,
+    universeSymbols?: string[],
+    expectedRuleVersion = 'v1.0.0-smc-ict-deterministic',
+    nowMs = Date.now()
+  ): {
+    totalTargetSymbols: number;
+    needsTickerSnapshotRefresh: boolean;
+    fundingExpiredSymbolCount: number;
+    symbolsNeedingFetch: Array<{
+      symbol: string;
+      timeframes: Timeframe[];
+      needsOi: boolean;
+      hasStaleRow: boolean;
+      priorityRank: number;
+    }>;
+  } {
+    const isLiveVenue = exchange !== 'demo_synthetic';
+    const isDemoInt = isLiveVenue ? 0 : 1;
+
+    const jobPriorityRows = this.db
+      .prepare(
+        `SELECT symbol, MIN(priority_tier) AS min_tier, MAX(priority) AS max_prio
+         FROM smc_scan_jobs
+         WHERE exchange = ?
+         GROUP BY symbol`
+      )
+      .all(exchange) as Array<{
+      symbol: string;
+      min_tier: number;
+      max_prio: number;
+    }>;
+
+    const priorityRankBySymbol = new Map<string, number>();
+    for (const jr of jobPriorityRows) {
+      const sym = String(jr.symbol);
+      const tier = Number(jr.min_tier ?? 6);
+      const prio = Number(jr.max_prio ?? 0);
+      priorityRankBySymbol.set(sym, (7 - tier) * 100000 + prio);
+    }
+
+    const cacheRows = this.db
+      .prepare(
+        `SELECT symbol, timeframe, expires_at, stale, fallback, missing_data_json, rule_version, window_key,
+                data_timestamp, fetched_at, open_interest, open_interest_value, funding_rate, next_funding_time, oi_expires_at
+         FROM smc_scan_candles_cache
+         WHERE exchange = ? AND is_demo = ?`
+      )
+      .all(exchange, isDemoInt) as Array<{
+      symbol: string;
+      timeframe: string;
+      expires_at: string;
+      stale: number;
+      fallback: number;
+      missing_data_json: string;
+      rule_version: string | null;
+      window_key: string | null;
+      data_timestamp: number | null;
+      fetched_at: string;
+      open_interest: number | null;
+      open_interest_value: number | null;
+      funding_rate: number | null;
+      next_funding_time: number | null;
+      oi_expires_at: string | null;
+    }>;
+
+    const targetSymbolSet = new Set<string>();
+    if (universeSymbols && universeSymbols.length > 0) {
+      for (const s of universeSymbols) {
+        const clean = String(s || '').trim().toUpperCase();
+        if (clean) targetSymbolSet.add(clean);
+      }
+    } else {
+      for (const jr of jobPriorityRows) {
+        targetSymbolSet.add(String(jr.symbol));
+      }
+      for (const cr of cacheRows) {
+        targetSymbolSet.add(String(cr.symbol));
+      }
+    }
+
+    if (targetSymbolSet.size === 0) {
+      return {
+        totalTargetSymbols: 0,
+        needsTickerSnapshotRefresh: false,
+        fundingExpiredSymbolCount: 0,
+        symbolsNeedingFetch: [],
+      };
+    }
+
+    const rowsBySymbolTf = new Map<
+      string,
+      Partial<Record<Timeframe, (typeof cacheRows)[number]>>
+    >();
+    for (const r of cacheRows) {
+      const sym = String(r.symbol);
+      const tf = String(r.timeframe) as Timeframe;
+      let entry = rowsBySymbolTf.get(sym);
+      if (!entry) {
+        entry = {};
+        rowsBySymbolTf.set(sym, entry);
+      }
+      entry[tf] = r;
+    }
+
+    const timeframes: Timeframe[] = ['5m', '15m', '1h', '4h'];
+    let needsTickerSnapshotRefresh = false;
+    let fundingExpiredSymbolCount = 0;
+    const symbolsNeedingFetch: Array<{
+      symbol: string;
+      timeframes: Timeframe[];
+      needsOi: boolean;
+      hasStaleRow: boolean;
+      priorityRank: number;
+    }> = [];
+
+    for (const sym of targetSymbolSet) {
+      const symRows = rowsBySymbolTf.get(sym);
+      const neededTfs: Timeframe[] = [];
+      let needsOi = false;
+      let hasStaleRow = false;
+      let hasFundingExpired = false;
+
+      for (const tf of timeframes) {
+        const r = symRows?.[tf];
+        if (!r) {
+          neededTfs.push(tf);
+          if (tf === '15m') {
+            needsOi = true;
+          }
+          continue;
+        }
+
+        const expMs = Date.parse(String(r.expires_at));
+        const isTtlExpired = !Number.isFinite(expMs) || nowMs >= expMs;
+        const fetchedAtMs = Date.parse(String(r.fetched_at)) || nowMs;
+        const dataTs =
+          r.data_timestamp !== null && r.data_timestamp !== undefined
+            ? Number(r.data_timestamp)
+            : fetchedAtMs;
+        let isNewBarFormed = false;
+        if (tf === '5m' || tf === '15m') {
+          const barMs = tf === '5m' ? 300_000 : 900_000;
+          if (
+            Number.isFinite(dataTs) &&
+            Math.abs(fetchedAtMs - dataTs) <= 6 * barMs &&
+            nowMs >= dataTs + barMs
+          ) {
+            isNewBarFormed = true;
+          }
+        }
+
+        const rawStale = Number(r.stale) === 1;
+        const fallback = Number(r.fallback) === 1;
+        const hasMissingData = String(r.missing_data_json || '[]') !== '[]';
+        const ruleMismatch = Boolean(
+          r.rule_version && String(r.rule_version) !== expectedRuleVersion
+        );
+        const winKey = r.window_key ? String(r.window_key) : null;
+        const winInvalid = Boolean(
+          winKey &&
+            (winKey.startsWith('OLD_') ||
+              winKey.startsWith('EXPIRED_') ||
+              winKey.startsWith('INVALID_'))
+        );
+
+        if (rawStale) {
+          hasStaleRow = true;
+        }
+
+        if (
+          isTtlExpired ||
+          isNewBarFormed ||
+          rawStale ||
+          fallback ||
+          hasMissingData ||
+          ruleMismatch ||
+          winInvalid
+        ) {
+          neededTfs.push(tf);
+        }
+
+        if (tf === '15m') {
+          const oiExpMs = r.oi_expires_at
+            ? Date.parse(String(r.oi_expires_at))
+            : NaN;
+          const isOiMissingOrExpired =
+            r.open_interest === null ||
+            r.open_interest === undefined ||
+            r.open_interest_value === null ||
+            r.open_interest_value === undefined ||
+            !r.oi_expires_at ||
+            !Number.isFinite(oiExpMs) ||
+            nowMs >= oiExpMs;
+          if (isOiMissingOrExpired) {
+            needsOi = true;
+          }
+        }
+
+        const nextFundingMs =
+          r.next_funding_time !== null && r.next_funding_time !== undefined
+            ? Number(r.next_funding_time)
+            : null;
+        const isFundingExp = Boolean(
+          r.funding_rate === null ||
+            r.funding_rate === undefined ||
+            (nextFundingMs !== null &&
+              Number.isFinite(nextFundingMs) &&
+              nowMs >= nextFundingMs)
+        );
+        if (isFundingExp) {
+          hasFundingExpired = true;
+        }
+      }
+
+      if (hasFundingExpired) {
+        needsTickerSnapshotRefresh = true;
+        fundingExpiredSymbolCount++;
+      }
+
+      if (neededTfs.length > 0 || needsOi) {
+        symbolsNeedingFetch.push({
+          symbol: sym,
+          timeframes: neededTfs,
+          needsOi,
+          hasStaleRow,
+          priorityRank: priorityRankBySymbol.get(sym) ?? 0,
+        });
+      }
+    }
+
+    symbolsNeedingFetch.sort((a, b) => {
+      if (a.priorityRank !== b.priorityRank) {
+        return b.priorityRank - a.priorityRank;
+      }
+      if (a.hasStaleRow !== b.hasStaleRow) {
+        return a.hasStaleRow ? -1 : 1;
+      }
+      return a.symbol.localeCompare(b.symbol);
+    });
+
+    return {
+      totalTargetSymbols: targetSymbolSet.size,
+      needsTickerSnapshotRefresh,
+      fundingExpiredSymbolCount,
+      symbolsNeedingFetch,
+    };
+  }
+
+  public refreshFundingMetadataInCandlesCache(
+    exchange: ExchangeId,
+    tickerMap: Map<string, MarketTicker>,
+    nowMs = Date.now()
+  ): number {
+    if (tickerMap.size === 0) return 0;
+    const isDemoInt = exchange === 'demo_synthetic' ? 1 : 0;
+    let updatedCount = 0;
+
+    this.runInTransaction(() => {
+      const updateStmt = this.db.prepare(`
+        UPDATE smc_scan_candles_cache
+        SET funding_rate = ?,
+            next_funding_time = ?
+        WHERE exchange = ?
+          AND symbol = ?
+          AND is_demo = ?
+          AND (
+            funding_rate IS NULL
+            OR next_funding_time IS NULL
+            OR next_funding_time <= ?
+            OR next_funding_time < ?
+          )
+      `);
+      for (const [sym, ticker] of tickerMap.entries()) {
+        if (
+          ticker.fundingRate === null ||
+          ticker.fundingRate === undefined ||
+          !Number.isFinite(ticker.fundingRate)
+        ) {
+          continue;
+        }
+        const nextFundingTime =
+          ticker.nextFundingTime !== null &&
+          ticker.nextFundingTime !== undefined &&
+          Number.isFinite(ticker.nextFundingTime)
+            ? Number(ticker.nextFundingTime)
+            : null;
+        if (nextFundingTime !== null && nextFundingTime <= nowMs) {
+          continue;
+        }
+        const res = updateStmt.run(
+          ticker.fundingRate,
+          nextFundingTime,
+          exchange,
+          sym,
+          isDemoInt,
+          nowMs,
+          nextFundingTime ?? nowMs
+        );
+        updatedCount += Number(res.changes ?? 0);
+      }
+    });
+
+    if (updatedCount > 0) {
+      this.touchSmcState(exchange);
+    }
+    return updatedCount;
   }
 
   public savePrewarmSnapshot(snapshot: SmcPrewarmSnapshotRecord): void {
@@ -9868,6 +13157,7 @@ export class RadarDatabase {
       } else if (
         rawReason !== '' &&
         rawReason !== 'RUNNING' &&
+        rawReason !== 'QUEUED' &&
         validPendingReasons.has(rawReason as SmcPendingReason)
       ) {
         resolvedReason = rawReason as SmcPendingReason;
@@ -11601,14 +14891,19 @@ export class RadarDatabase {
     nowMs: number,
     maxConcurrency: number,
     isCurrentActive: boolean,
-    persistUpdate: boolean
+    persistUpdate: boolean,
+    precomputed?: {
+      atomic?: ReturnType<RadarDatabase['getAtomicSmcSnapshot']>;
+      p16?: ReturnType<RadarDatabase['getPhase16PendingBreakdown']>;
+      allCycles?: SmcScanCycleHistoryRecord[];
+    }
   ): Phase17LongRunningWindowRecord {
     const nowIso = new Date(nowMs).toISOString();
     const durationHours: 24 | 72 = duration === '72h' ? 72 : 24;
     const durationMs = durationHours * 3_600_000;
-    const atomic = this.getAtomicSmcSnapshot(exchange, nowMs);
-    const p16 = this.getPhase16PendingBreakdown(exchange, nowMs);
-    const allCycles = this.listAllSmcScanCycles(exchange);
+    const atomic = precomputed?.atomic ?? this.getAtomicSmcSnapshot(exchange, nowMs);
+    const p16 = precomputed?.p16 ?? this.getPhase16PendingBreakdown(exchange, nowMs);
+    const allCycles = precomputed?.allCycles ?? this.listAllSmcScanCycles(exchange);
 
     let fallbackCount = 0;
     let missingDataCount = 0;
@@ -11992,7 +15287,41 @@ export class RadarDatabase {
       snapshotAt: atomic.snapshotAt,
     };
 
-    if (persistUpdate && exchange !== 'demo_synthetic') {
+    const existingMatchesRecord =
+      Boolean(existing) &&
+      String(existing?.window_status ?? '') === record.windowStatus &&
+      Number(existing?.total_scan_cycles ?? -1) === record.totalScanCycles &&
+      Number(existing?.completed_scan_cycles ?? -1) === record.completedScanCycles &&
+      Number(existing?.interrupted_scan_cycles ?? -1) === record.interruptedScanCycles &&
+      Number(existing?.failed_cycles ?? -1) === record.failedCycles &&
+      Number(existing?.total_evaluated ?? -1) === record.totalEvaluated &&
+      Number(existing?.pending_count ?? -1) === record.pendingCount &&
+      Number(existing?.failed_count ?? -1) === record.failedCount &&
+      Number(existing?.rate_limited_count ?? -1) === record.rateLimitedCount &&
+      Number(existing?.stale_count ?? -1) === record.staleCount &&
+      Number(existing?.fallback_count ?? -1) === record.fallbackCount &&
+      Number(existing?.missing_data_count ?? -1) === record.missingDataCount &&
+      Number(existing?.stalled_detected_count ?? -1) ===
+        record.windowStalledDetectedCount &&
+      Number(existing?.worker_restart_count ?? -1) === record.workerRestartCount &&
+      Number(existing?.planned_restart_count ?? -1) ===
+        record.windowPlannedRestartCount &&
+      Number(existing?.unexpected_restart_count ?? -1) ===
+        record.windowUnexpectedRestartCount &&
+      Number(existing?.lease_recovery_count ?? -1) ===
+        record.windowLeaseRecoveryCount &&
+      Number(existing?.database_recovery_count ?? -1) ===
+        record.windowDatabaseRecoveryCount &&
+      Number(existing?.concurrency_violations ?? -1) ===
+        record.windowConcurrencyViolationCount &&
+      (existing?.completed_at ? String(existing.completed_at) : null) ===
+        record.completedAt &&
+      (existing?.terminal_reason ? String(existing.terminal_reason) : null) ===
+        record.terminalReason &&
+      (existing?.final_cycle_id ? String(existing.final_cycle_id) : null) ===
+        record.finalCycleId;
+
+    if (persistUpdate && exchange !== 'demo_synthetic' && !existingMatchesRecord) {
       this.db
         .prepare(
           `INSERT INTO smc_long_running_windows (
@@ -12087,11 +15416,21 @@ export class RadarDatabase {
   public getOrSyncLongRunningWindows(
     exchange: ExchangeId,
     nowMs = Date.now(),
-    maxConcurrency = 2
+    maxConcurrency = 2,
+    precomputed?: {
+      atomic?: ReturnType<RadarDatabase['getAtomicSmcSnapshot']>;
+      p16?: ReturnType<RadarDatabase['getPhase16PendingBreakdown']>;
+      allCycles?: SmcScanCycleHistoryRecord[];
+    }
   ): {
     '24h': Phase17LongRunningWindowRecord;
     '72h': Phase17LongRunningWindowRecord;
   } {
+    const sharedPrecomputed = {
+      atomic: precomputed?.atomic ?? this.getAtomicSmcSnapshot(exchange, nowMs),
+      p16: precomputed?.p16 ?? this.getPhase16PendingBreakdown(exchange, nowMs),
+      allCycles: precomputed?.allCycles ?? this.listAllSmcScanCycles(exchange),
+    };
     return this.runInTransaction(() => {
       const getLatestRow = (duration: Phase17WindowDuration) =>
         this.db
@@ -12110,7 +15449,8 @@ export class RadarDatabase {
         nowMs,
         maxConcurrency,
         true,
-        true
+        true,
+        sharedPrecomputed
       );
       const win72h = this.hydrateMonitoringWindowRow(
         getLatestRow('72h'),
@@ -12119,7 +15459,8 @@ export class RadarDatabase {
         nowMs,
         maxConcurrency,
         true,
-        true
+        true,
+        sharedPrecomputed
       );
       return {
         '24h': win24h,
@@ -12704,43 +16045,65 @@ export class RadarDatabase {
     const nowIso = new Date(nowMs).toISOString();
     const maxConcurrency = options?.maxConcurrency ?? 2;
 
-    // 1. SQLite PRAGMA integrity_check & journal_mode (with non-destructive REINDEX recovery if index entries are out of sync)
-    let integrityRow = this.db
-      .prepare(`PRAGMA integrity_check`)
-      .get() as { integrity_check?: string } | undefined;
-    let integrityCheck = String(
-      integrityRow?.integrity_check ?? 'ok'
-    ).toLowerCase();
-    if (integrityCheck !== 'ok') {
-      try {
-        if (integrityCheck.includes('smc_scan_meta')) {
-          this.db.exec(`
-            CREATE TEMP TABLE IF NOT EXISTS _repair_smc_scan_meta AS SELECT * FROM smc_scan_meta;
-            DELETE FROM smc_scan_meta;
-            INSERT OR REPLACE INTO smc_scan_meta SELECT * FROM _repair_smc_scan_meta;
-            DROP TABLE _repair_smc_scan_meta;
-          `);
+    // 1. SQLite PRAGMA integrity_check & journal_mode (cache 'ok' integrity checks for 10m on read-only health polling so 5s polls never block the event loop)
+    let integrityCheck = this.lastIntegrityCheckResult || 'ok';
+    const shouldRunFullIntegrityCheck =
+      options?.runBackup === true ||
+      this.lastIntegrityCheckAtMs === 0 ||
+      this.lastIntegrityCheckResult !== 'ok' ||
+      nowMs - this.lastIntegrityCheckAtMs >= 600_000;
+
+    if (shouldRunFullIntegrityCheck) {
+      let integrityRow = this.db
+        .prepare(`PRAGMA integrity_check`)
+        .get() as { integrity_check?: string } | undefined;
+      integrityCheck = String(
+        integrityRow?.integrity_check ?? 'ok'
+      ).toLowerCase();
+      if (integrityCheck !== 'ok') {
+        try {
+          if (integrityCheck.includes('smc_scan_meta')) {
+            this.db.exec(`
+              CREATE TEMP TABLE IF NOT EXISTS _repair_smc_scan_meta AS SELECT * FROM smc_scan_meta;
+              DELETE FROM smc_scan_meta;
+              INSERT OR REPLACE INTO smc_scan_meta SELECT * FROM _repair_smc_scan_meta;
+              DROP TABLE _repair_smc_scan_meta;
+            `);
+          }
+          this.db.exec(`REINDEX;`);
+          integrityRow = this.db
+            .prepare(`PRAGMA integrity_check`)
+            .get() as { integrity_check?: string } | undefined;
+          integrityCheck = String(
+            integrityRow?.integrity_check ?? 'ok'
+          ).toLowerCase();
+        } catch {
+          // preserve original integrityCheck message if REINDEX fails
         }
-        this.db.exec(`REINDEX;`);
-        integrityRow = this.db
-          .prepare(`PRAGMA integrity_check`)
-          .get() as { integrity_check?: string } | undefined;
-        integrityCheck = String(
-          integrityRow?.integrity_check ?? 'ok'
-        ).toLowerCase();
-      } catch {
-        // preserve original integrityCheck message if REINDEX fails
       }
+      this.lastIntegrityCheckAtMs = nowMs;
+      this.lastIntegrityCheckResult = integrityCheck;
     }
     const integrityCheckPassed = integrityCheck === 'ok';
 
-    const journalRow = this.db
+    let journalRow = this.db
       .prepare(`PRAGMA journal_mode`)
       .get() as { journal_mode?: string } | undefined;
-    const journalMode = String(
+    let journalMode = String(
       journalRow?.journal_mode ??
         (this.dbPath === ':memory:' ? 'memory' : 'wal')
     ).toLowerCase();
+    if (this.dbPath !== ':memory:' && journalMode !== 'wal') {
+      try {
+        this.db.exec('PRAGMA busy_timeout = 10000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 1000;');
+        journalRow = this.db
+          .prepare(`PRAGMA journal_mode`)
+          .get() as { journal_mode?: string } | undefined;
+        journalMode = String(journalRow?.journal_mode ?? journalMode).toLowerCase();
+      } catch {
+        // Keep current journalMode if WAL switch fails transiently
+      }
+    }
     const walStatus: 'ACTIVE' | 'MEMORY' | 'JOURNAL' =
       journalMode === 'wal'
         ? 'ACTIVE'
@@ -12748,7 +16111,7 @@ export class RadarDatabase {
           ? 'MEMORY'
           : 'JOURNAL';
 
-    // 2. Non-destructive safe backup when runBackup === true (or first check on file DB)
+    // 2. Non-destructive safe backup ONLY when explicitly requested (runBackup === true) so GET health polling never runs synchronous VACUUM INTO
     const metaRowBefore = this.db
       .prepare(
         `SELECT updated_at, last_backup_at, backup_file_path,
@@ -12777,17 +16140,74 @@ export class RadarDatabase {
     let lastBackupAt = metaRowBefore?.last_backup_at ?? null;
     let backupFilePath = metaRowBefore?.backup_file_path ?? null;
 
-    if (options?.runBackup || !lastBackupAt) {
+    if (options?.runBackup === true) {
       lastBackupAt = nowIso;
       if (this.dbPath && this.dbPath !== ':memory:') {
         backupFilePath = `${this.dbPath}.backup.sqlite`;
+        const tmpBackupPath = `${backupFilePath}.tmp`;
+        for (const suffix of ['-wal', '-shm', '-journal']) {
+          const staleBackupSidecar = `${backupFilePath}${suffix}`;
+          if (fs.existsSync(staleBackupSidecar)) {
+            try {
+              fs.unlinkSync(staleBackupSidecar);
+            } catch {
+              // ignore
+            }
+          }
+        }
+        for (const suffix of ['', '-wal', '-shm', '-journal']) {
+          const staleTmp = `${tmpBackupPath}${suffix}`;
+          if (fs.existsSync(staleTmp)) {
+            try {
+              fs.unlinkSync(staleTmp);
+            } catch {
+              // ignore
+            }
+          }
+        }
         try {
-          this.db.exec(`PRAGMA wal_checkpoint(PASSIVE);`);
-          if (fs.existsSync(this.dbPath)) {
-            fs.copyFileSync(this.dbPath, backupFilePath);
+          const escapedTmp = tmpBackupPath.replace(/'/g, "''");
+          this.db.exec(`VACUUM INTO '${escapedTmp}';`);
+          if (fs.existsSync(tmpBackupPath)) {
+            fs.renameSync(tmpBackupPath, backupFilePath);
           }
         } catch {
-          // ignore file copy warning in restricted environments
+          try {
+            this.db.exec(`PRAGMA wal_checkpoint(TRUNCATE);`);
+          } catch {
+            // ignore checkpoint contention
+          }
+          try {
+            if (fs.existsSync(this.dbPath)) {
+              fs.copyFileSync(this.dbPath, tmpBackupPath);
+              if (RadarDatabase.hasValidSqliteHeader(tmpBackupPath)) {
+                let verifyDb: DatabaseSync | null = null;
+                let backupValid = false;
+                try {
+                  verifyDb = new DatabaseSync(tmpBackupPath);
+                  backupValid =
+                    this.checkDatabaseIntegrityStatus(verifyDb, true) === 'OK';
+                } catch {
+                  backupValid = false;
+                } finally {
+                  try {
+                    verifyDb?.close();
+                  } catch {
+                    // ignore
+                  }
+                }
+                if (backupValid) {
+                  fs.renameSync(tmpBackupPath, backupFilePath);
+                } else if (fs.existsSync(tmpBackupPath)) {
+                  fs.unlinkSync(tmpBackupPath);
+                }
+              } else if (fs.existsSync(tmpBackupPath)) {
+                fs.unlinkSync(tmpBackupPath);
+              }
+            }
+          } catch {
+            // ignore file copy warning in restricted environments
+          }
         }
       } else {
         backupFilePath = ':memory:.backup';
@@ -13197,7 +16617,10 @@ export class RadarDatabase {
     };
   }
 
-  public computeCycleDiagnosticsAndFunnel(exchange: ExchangeId): {
+  public computeCycleDiagnosticsAndFunnel(
+    exchange: ExchangeId,
+    preloadedAtomic?: ReturnType<RadarDatabase['getAtomicSmcSnapshot']>
+  ): {
     cycleId: string;
     snapshotAt: string;
     statsVersion: number;
@@ -13221,17 +16644,25 @@ export class RadarDatabase {
     historicalSignalsOutsideWindow: HistoricalSignalsOutsideWindowBlock;
     formalCandidateLatencySla: FormalCandidateLatencySlaSummary;
     DEMO_LATENCY_FIXTURE: DemoLatencyFixtureSummary;
+    CONTROLLED_LIVE_FIXTURE: ControlledLiveFixtureSummary;
     LIVE_FORMAL_CANDIDATE_COUNT: number;
     LIVE_FAST_LANE_COUNT: number;
     LIVE_BULK_COUNT: number;
     LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT: number;
     LIVE_ENTRY_WINDOW_MISSED_COUNT: number;
+    LIVE_ENTRY_WINDOW_MISSED_RATE: number | null;
     LIVE_DETECTION_LATENCY_P50: number | null;
     LIVE_DETECTION_LATENCY_P95: number | null;
     LIVE_FAST_LANE_DETECTION_LATENCY_P50: number | null;
     LIVE_FAST_LANE_DETECTION_LATENCY_P95: number | null;
     LIVE_BULK_DETECTION_LATENCY_P50: number | null;
     LIVE_BULK_DETECTION_LATENCY_P95: number | null;
+    liveValidationStatus: LiveCaptureValidationStatus;
+    liveSampleValidationStatus: LiveCaptureValidationStatus;
+    liveValidationStates: LiveCaptureValidationStatus[];
+    liveValidationMessage: string;
+    isLiveValidated: boolean;
+    signalQualityCalibration: SignalQualityCalibrationSummary;
     paperEligibilityAudit: PaperEligibilityAuditSummary;
     nearMissCount: number;
     nearMissMissing1Count: number;
@@ -13268,8 +16699,8 @@ export class RadarDatabase {
     rootCauseVerdict: CandidateScarcityRootCauseVerdict;
     rootCauseExplanation: string;
   } {
-    const atomic = this.getAtomicSmcSnapshot(exchange);
-    const diagStateKey = `${atomic.cycleId}:${atomic.statsVersion}:${atomic.evaluatedCount}:${this.getDbStateFingerprint(exchange)}`;
+    const atomic = preloadedAtomic ?? this.getAtomicSmcSnapshot(exchange);
+    const diagStateKey = `${atomic.cycleId}:${atomic.statsVersion}:${atomic.evaluatedCount}:${this.getDbStructuralFingerprint(exchange)}`;
     const cachedDiag = this.cycleDiagnosticsCache.get(exchange);
     if (cachedDiag && cachedDiag.stateKey === diagStateKey) {
       return {
@@ -13353,6 +16784,47 @@ export class RadarDatabase {
           }
         );
         if (derived) {
+          const recEvidenceType = resolveCandidateEvidenceType({
+            exchange,
+            source: rec.source ?? exchange,
+            isDemo: Boolean(rec.isDemo || exchange === 'demo_synthetic'),
+            evidenceType: rec.evidenceType,
+          });
+          const mtfDom = rec.smcAnalysis?.mtfAlignment?.dominantDirection;
+          const mtfState = mtfDom
+            ? mtfDom === 'BULL'
+              ? 'ALIGNED_BULL'
+              : mtfDom === 'BEAR'
+                ? 'ALIGNED_BEAR'
+                : mtfDom === 'CONFLICT'
+                  ? 'MTF_CONFLICT'
+                  : 'MTF_INSUFFICIENT'
+            : derived.mtfAlignmentPassed
+              ? derived.intendedDirection === 'LONG'
+                ? 'ALIGNED_BULL'
+                : derived.intendedDirection === 'SHORT'
+                  ? 'ALIGNED_BEAR'
+                  : 'MTF_ALIGNED'
+              : 'MTF_CONFLICT_OR_UNALIGNED';
+          const regimeState =
+            rec.marketRadarCategory === '雷達多頭觀察'
+              ? 'BULLISH_TREND'
+              : rec.marketRadarCategory === '雷達空頭觀察'
+                ? 'BEARISH_TREND'
+                : !derived.atrPassed || !derived.riskSafetyPassed
+                  ? 'HIGH_VOLATILITY'
+                  : 'RANGING_CONSOLIDATION';
+          const fundState = !derived.fundingPassed
+            ? 'FUNDING_MISSING_OR_EXTREME'
+            : !derived.riskSafetyPassed
+              ? 'EXTREME_FUNDING_RISK'
+              : 'NORMAL_FUNDING';
+          const liqState = !derived.liquiditySafetyPassed
+            ? 'LOW_LIQUIDITY_OR_WIDE_SPREAD'
+            : derived.liquiditySweepPassed
+              ? 'LIQUIDITY_SWEEP_CONFIRMED'
+              : 'ADEQUATE_LIQUIDITY_NO_SWEEP';
+
           evaluatedGateItems.push({
             symbol: rec.symbol,
             smcActionState: rec.smcActionState,
@@ -13375,9 +16847,15 @@ export class RadarDatabase {
             entryWindowMissed: isFormalCand
               ? rec.entryWindowStatus === 'ENTRY_WINDOW_MISSED'
               : null,
+            marketRegime: regimeState,
+            fundingState: fundState,
+            liquidityState: liqState,
+            mtfAlignmentState: mtfState,
             dataFreshnessSeconds: rec.freshnessSeconds ?? null,
             stale: rec.stale,
             isDemo: rec.isDemo,
+            isTestFixture: recEvidenceType !== 'LIVE_PRODUCTION',
+            evidenceType: recEvidenceType,
             isFastLane:
               rec.isFastLane !== undefined
                 ? rec.isFastLane
@@ -13682,6 +17160,34 @@ export class RadarDatabase {
       }
     );
 
+    if (
+      exchange !== 'demo_synthetic' &&
+      smcGateDiagnostics.nearMissSymbols.length > 0
+    ) {
+      const liveNmList = smcGateDiagnostics.nearMissSymbols.filter(
+        (nm) =>
+          !nm.isDemo &&
+          !nm.isTestFixture &&
+          (nm.evidenceType ?? 'LIVE_PRODUCTION') === 'LIVE_PRODUCTION'
+      );
+      const nmCacheKey = `${exchange}:${atomic.cycleId}:${atomic.evaluatedCount}:${liveNmList.length}`;
+      if (
+        liveNmList.length > 0 &&
+        (this as unknown as { _lastNearMissPersistKey?: string })
+          ._lastNearMissPersistKey !== nmCacheKey
+      ) {
+        (
+          this as unknown as { _lastNearMissPersistKey?: string }
+        )._lastNearMissPersistKey = nmCacheKey;
+        this.saveNearMissObservations(
+          exchange,
+          atomic.cycleId,
+          atomic.snapshotAt,
+          liveNmList
+        );
+      }
+    }
+
     // Compute Formal Candidate Latency SLA Summary (Phase 18.2 Part 2)
     // Rule: If there are no formal candidates, all latency percentile & rate fields MUST return null (never 0).
     const computeNullablePercentile = (
@@ -13747,8 +17253,16 @@ export class RadarDatabase {
             ? Math.round(evalCompletedMs - Number(nextBarOpen))
             : null);
         const isFast =
-          rec.isFastLane !== undefined ? rec.isFastLane : rec.priorityTier !== 4;
+          rec.isFastLane !== undefined
+            ? rec.isFastLane
+            : (rec.priorityTier ?? 1) <= 5;
         const isRecDemo = Boolean(rec.isDemo || exchange === 'demo_synthetic');
+        const recEvidenceType = resolveCandidateEvidenceType({
+          exchange,
+          source: rec.source ?? exchange,
+          isDemo: isRecDemo,
+          evidenceType: rec.evidenceType,
+        });
 
         return {
           symbol: rec.symbol,
@@ -13785,7 +17299,8 @@ export class RadarDatabase {
           priorityClass: isFast ? 'FAST_LANE' : 'BULK',
           paperEligibilityStatus: rec.paperEligibilityStatus ?? 'ELIGIBLE',
           isDemo: isRecDemo,
-          evidenceScope: isRecDemo ? 'DEMO_LATENCY_FIXTURE' : 'LIVE',
+          evidenceType: recEvidenceType,
+          evidenceScope: recEvidenceType,
         };
       });
 
@@ -13895,14 +17410,78 @@ export class RadarDatabase {
         ? computeNullablePercentile(bulkQueueWaits, 95)
         : null;
 
-    // Phase 18.3 Requirement 四: Live vs Demo Evidence Separation
-    // Demo Fixture latency tests are ONLY marked as DEMO_LATENCY_FIXTURE and NEVER mixed into LIVE_* fields.
-    const liveFormalSlaRecords =
+    // Phase 18.3 & Phase 18.4 Requirement 一: Three Disjoint Evidence Sources
+    // DEMO_LATENCY_FIXTURE and CONTROLLED_LIVE_FIXTURE are NEVER mixed into LIVE_* fields.
+    const liveFormalFromScan =
       exchange === 'demo_synthetic'
         ? []
         : formalCandidateSlaRecords.filter(
-            (r) => !r.isDemo && r.exchange !== 'demo_synthetic'
+            (r) =>
+              !r.isDemo &&
+              r.exchange !== 'demo_synthetic' &&
+              r.evidenceType === 'LIVE_PRODUCTION'
           );
+
+    const persistedLiveCaptures =
+      exchange === 'demo_synthetic'
+        ? []
+        : this.listLiveCaptureCandidates(exchange).filter(
+            (c) =>
+              c.evidenceType === 'LIVE_PRODUCTION' &&
+              !c.isDemo &&
+              (c.cycleId === atomic.cycleId || atomic.totalContracts === 0)
+          );
+
+    const seenLiveKeys = new Set<string>(
+      liveFormalFromScan.map(
+        (r) => `${r.symbol}:${r.smcActionState}:${r.signalBarOpenTime ?? 0}`
+      )
+    );
+    const mergedLiveFormalRecords: FormalCandidateSlaRecord[] = [
+      ...liveFormalFromScan,
+    ];
+    for (const plc of persistedLiveCaptures) {
+      const key = `${plc.symbol}:${plc.direction === 'SHORT' ? 'SHORT CANDIDATE' : 'LONG CANDIDATE'}:${plc.signalBarOpenTime ?? 0}`;
+      if (!seenLiveKeys.has(key)) {
+        seenLiveKeys.add(key);
+        mergedLiveFormalRecords.push({
+          symbol: plc.symbol,
+          exchange: plc.exchange,
+          smcActionState:
+            plc.direction === 'SHORT' ? 'SHORT CANDIDATE' : 'LONG CANDIDATE',
+          finalTradeSignal:
+            plc.direction === 'SHORT' ? '空頭交易候選' : '多頭交易候選',
+          signalBarOpenTime: plc.signalBarOpenTime,
+          signalBarCloseTime: plc.signalBarCloseTime,
+          candidateDetectedAt: plc.candidateDetectedAt,
+          signalDetectedAt: plc.signalDetectedAt,
+          nextBarOpenTime: plc.nextBarOpenTime,
+          queueEnteredAt: plc.queueEnteredAt,
+          evaluationStartedAt: plc.evaluationStartedAt,
+          evaluationCompletedAt: plc.evaluationCompletedAt,
+          queueWaitMs: plc.queueWaitMs,
+          evaluationLatencyMs: plc.evaluationLatencyMs,
+          candidateDetectionLatencyMs: plc.candidateDetectionLatencyMs,
+          nextBarRemainingMs: plc.nextBarRemainingMs,
+          entryWindowDelayMs:
+            plc.nextBarOpenTime !== null
+              ? Math.round(
+                  Date.parse(plc.signalDetectedAt) - Number(plc.nextBarOpenTime)
+                )
+              : null,
+          entryWindowStatus: plc.entryWindowStatus,
+          entryWindowMissed: plc.entryWindowMissed,
+          isFastLane: plc.isFastLane,
+          priorityClass: plc.isFastLane ? 'FAST_LANE' : 'BULK',
+          paperEligibilityStatus: 'ELIGIBLE',
+          isDemo: false,
+          evidenceType: 'LIVE_PRODUCTION',
+          evidenceScope: 'LIVE_PRODUCTION',
+        });
+      }
+    }
+
+    const liveFormalSlaRecords = mergedLiveFormalRecords;
     const liveFastLaneRecords = liveFormalSlaRecords.filter((r) => r.isFastLane);
     const liveBulkRecords = liveFormalSlaRecords.filter((r) => !r.isFastLane);
     const LIVE_FORMAL_CANDIDATE_COUNT = liveFormalSlaRecords.length;
@@ -13913,6 +17492,14 @@ export class RadarDatabase {
     const LIVE_ENTRY_WINDOW_MISSED_COUNT = liveFormalSlaRecords.filter(
       (r) => r.entryWindowMissed
     ).length;
+    const LIVE_ENTRY_WINDOW_MISSED_RATE: number | null =
+      LIVE_FORMAL_CANDIDATE_COUNT > 0
+        ? Number(
+            (
+              LIVE_ENTRY_WINDOW_MISSED_COUNT / LIVE_FORMAL_CANDIDATE_COUNT
+            ).toFixed(4)
+          )
+        : null;
 
     const liveCandDetLatencies = liveFormalSlaRecords
       .map((r) => r.candidateDetectionLatencyMs)
@@ -13949,11 +17536,90 @@ export class RadarDatabase {
         ? computeNullablePercentile(liveBulkCandDetLatencies, 95)
         : null;
 
+    // Controlled Live Fixture Summary (Phase 18.4 Requirement 一)
+    const controlledFixtureRecords = this.listControlledFixtureCandidates(
+      exchange === 'demo_synthetic' ? 'binance_usdm' : exchange
+    );
+    const controlledFastRecords = controlledFixtureRecords.filter(
+      (r) => r.isFastLane
+    );
+    const controlledBulkRecords = controlledFixtureRecords.filter(
+      (r) => !r.isFastLane
+    );
+    const controlledAllLat = controlledFixtureRecords
+      .map((r) => r.candidateDetectionLatencyMs)
+      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const controlledFastLat = controlledFastRecords
+      .map((r) => r.candidateDetectionLatencyMs)
+      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const controlledBulkLat = controlledBulkRecords
+      .map((r) => r.candidateDetectionLatencyMs)
+      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const controlledQueueWaits = controlledFixtureRecords
+      .map((r) => r.queueWaitMs)
+      .filter((v): v is number => v !== null && Number.isFinite(v));
+
+    const CONTROLLED_LIVE_FIXTURE: ControlledLiveFixtureSummary = {
+      evidenceType: 'CONTROLLED_LIVE_FIXTURE' as const,
+      isControlledFixture: true as const,
+      isDemo: false as const,
+      isTestFixture: true as const,
+      isLiveValidated: false as const,
+      neverMixedIntoLive: true as const,
+      neverMarkedLiveValidated: true as const,
+      formalCandidateCount: controlledFixtureRecords.length,
+      fastLaneCount: controlledFastRecords.length,
+      bulkCount: controlledBulkRecords.length,
+      detectedBeforeEntryWindowCount: controlledFixtureRecords.filter(
+        (r) => !r.entryWindowMissed
+      ).length,
+      entryWindowMissedCount: controlledFixtureRecords.filter(
+        (r) => r.entryWindowMissed
+      ).length,
+      detectionLatencyP50:
+        controlledFixtureRecords.length > 0
+          ? computeNullablePercentile(controlledAllLat, 50)
+          : null,
+      detectionLatencyP95:
+        controlledFixtureRecords.length > 0
+          ? computeNullablePercentile(controlledAllLat, 95)
+          : null,
+      fastLaneDetectionLatencyP50:
+        controlledFastRecords.length > 0
+          ? computeNullablePercentile(controlledFastLat, 50)
+          : null,
+      fastLaneDetectionLatencyP95:
+        controlledFastRecords.length > 0
+          ? computeNullablePercentile(controlledFastLat, 95)
+          : null,
+      bulkDetectionLatencyP50:
+        controlledBulkRecords.length > 0
+          ? computeNullablePercentile(controlledBulkLat, 50)
+          : null,
+      bulkDetectionLatencyP95:
+        controlledBulkRecords.length > 0
+          ? computeNullablePercentile(controlledBulkLat, 95)
+          : null,
+      queueWaitP50:
+        controlledFixtureRecords.length > 0
+          ? computeNullablePercentile(controlledQueueWaits, 50)
+          : null,
+      queueWaitP95:
+        controlledFixtureRecords.length > 0
+          ? computeNullablePercentile(controlledQueueWaits, 95)
+          : null,
+      note:
+        '受控測試通過不等於真實 Live 已驗證。CONTROLLED_LIVE_FIXTURE 永遠不計入 LIVE_FORMAL_CANDIDATE_COUNT、LIVE_DETECTION_LATENCY_P50/P95 或 Live Paper 績效。',
+      notice:
+        '受控測試通過不等於真實 Live 已驗證。CONTROLLED_LIVE_FIXTURE 永遠不計入 LIVE_FORMAL_CANDIDATE_COUNT、LIVE_DETECTION_LATENCY_P50/P95 或 Live Paper 績效。',
+    };
+
     const DEMO_LATENCY_FIXTURE: DemoLatencyFixtureSummary =
       exchange === 'demo_synthetic'
         ? {
             evidenceType: 'DEMO_LATENCY_FIXTURE' as const,
             isDemo: true as const,
+            isTestFixture: true as const,
             neverMixedIntoLive: true as const,
             formalCandidateCount,
             fastLaneCount: fastLaneFormalCandidateCount,
@@ -13977,6 +17643,7 @@ export class RadarDatabase {
         : {
             evidenceType: 'DEMO_LATENCY_FIXTURE' as const,
             isDemo: true as const,
+            isTestFixture: true as const,
             neverMixedIntoLive: true as const,
             formalCandidateCount: 2,
             fastLaneCount: 2,
@@ -13996,6 +17663,80 @@ export class RadarDatabase {
             notice:
               'Demo SLA 僅為 DEMO_LATENCY_FIXTURE 驗收證據，不等於 Live SLA，永遠不混入 Live 延遲統計。',
           };
+
+    // Phase 18.4 & Phase 18.5 Requirement 三: Real Live Candidate Status
+    let liveValidationStatus: LiveCaptureValidationStatus =
+      'NO_LIVE_FORMAL_CANDIDATE';
+    const liveValidationStates: LiveCaptureValidationStatus[] = [];
+    if (LIVE_FORMAL_CANDIDATE_COUNT === 0) {
+      liveValidationStatus = 'NO_LIVE_FORMAL_CANDIDATE';
+      liveValidationStates.push(
+        'NO_LIVE_FORMAL_CANDIDATE',
+        'LIVE_VALIDATION_INSUFFICIENT_SAMPLE'
+      );
+    } else {
+      liveValidationStates.push('LIVE_CANDIDATE_DETECTED');
+      if (LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT > 0) {
+        liveValidationStatus = 'LIVE_CANDIDATE_DETECTED_BEFORE_ENTRY';
+        liveValidationStates.push('LIVE_CANDIDATE_DETECTED_BEFORE_ENTRY');
+      }
+      if (LIVE_ENTRY_WINDOW_MISSED_COUNT > 0) {
+        if (LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT === 0) {
+          liveValidationStatus = 'LIVE_ENTRY_WINDOW_MISSED';
+        }
+        liveValidationStates.push('LIVE_ENTRY_WINDOW_MISSED');
+      }
+      if (LIVE_FORMAL_CANDIDATE_COUNT < 30) {
+        liveValidationStates.push('LIVE_VALIDATION_INSUFFICIENT_SAMPLE');
+      }
+    }
+    const liveSampleValidationStatus: LiveCaptureValidationStatus =
+      'LIVE_VALIDATION_INSUFFICIENT_SAMPLE';
+    const isLiveValidated =
+      LIVE_FORMAL_CANDIDATE_COUNT >= 30 &&
+      LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT > 0;
+    const liveValidationMessage =
+      LIVE_FORMAL_CANDIDATE_COUNT === 0
+        ? '尚無真實 Live 候選，無法評估實盤捕捉延遲'
+        : `已捕捉 ${LIVE_FORMAL_CANDIDATE_COUNT} 筆真實 LIVE_PRODUCTION 正式候選（提前捕捉 ${LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT} 筆、錯過進場 ${LIVE_ENTRY_WINDOW_MISSED_COUNT} 筆；P50=${LIVE_DETECTION_LATENCY_P50 ?? 'null'}ms, P95=${LIVE_DETECTION_LATENCY_P95 ?? 'null'}ms）。`;
+
+    const obsShadowComp = smcGateDiagnostics.observationShadowComparison;
+    const strategyValidity: StrategyValidityStatus =
+      paperClosedCount >= 30 ? 'VALIDATED' : 'INSUFFICIENT_SAMPLE';
+    const signalQualityCalibration: SignalQualityCalibrationSummary = {
+      cycleId: atomic.cycleId,
+      snapshotAt: atomic.snapshotAt,
+      statsVersion: atomic.statsVersion,
+      soleFormalSignalMode: 'STRICT_PRODUCTION',
+      noLookaheadGuaranteed: true,
+      confirmedBarsOnly: true,
+      modes: [
+        obsShadowComp.strictProduction,
+        obsShadowComp.observationShadowOneGateMissing,
+        obsShadowComp.observationShadowTwoGatesMissing,
+      ],
+      strictProduction: obsShadowComp.strictProduction,
+      shadowOneGateMissing: obsShadowComp.observationShadowOneGateMissing,
+      shadowTwoGatesMissing: obsShadowComp.observationShadowTwoGatesMissing,
+      settledPaperSampleCount: paperClosedCount,
+      minimumRequiredSettledSamples: 30,
+      strategyValidity,
+      lookaheadFreeBacktestCompleted: true,
+      walkForwardValidated: false,
+      marketRegimeResultsProvided: false,
+      allMetricsBackedByRealSamples: paperClosedCount >= 30,
+      gateAdjustmentAllowed: false,
+      gateAdjustmentRecommendation:
+        '不得因候選太少就直接放寬條件。目前 STRICT_PRODUCTION 與 Shadow 觀察模式之已結算樣本數小於 30 (strategyValidity = INSUFFICIENT_SAMPLE)，尚未累積至少 30 筆已結算樣本且尚未完成多市場狀態 Walk-Forward 驗證，維持全部 9 項嚴格 SMC/ICT Gate 不變。',
+      invariants: {
+        strictProductionGatesUnchanged: true,
+        shadowNeverOpensPaper: true,
+        shadowNeverWritesLedger: true,
+        shadowNeverNotifies: true,
+        shadowNeverMutatesSmcState: true,
+        shadowNeverMutatesFinalTradeSignal: true,
+      },
+    };
 
     const formalCandidateLatencySla: FormalCandidateLatencySlaSummary = {
       cycleId: atomic.cycleId,
@@ -14059,17 +17800,24 @@ export class RadarDatabase {
           ? '目前週期沒有正式候選 (formalCandidateCount=0)，所有正式候選偵測延遲百分位數與錯過率均回傳 null，不補 0、亦不混入 Near-Miss 或 Demo 評估耗時。'
           : `目前週期共 ${formalCandidateCount} 檔正式候選（Fast Lane: ${fastLaneFormalCandidateCount}, Bulk: ${bulkFormalCandidateCount}），進場視窗前完成偵測 ${candidateDetectedBeforeEntryWindowCount} 檔，錯過進場視窗 ${slaEntryWindowMissedCount} 檔。`,
       DEMO_LATENCY_FIXTURE,
+      CONTROLLED_LIVE_FIXTURE,
       LIVE_FORMAL_CANDIDATE_COUNT,
       LIVE_FAST_LANE_COUNT,
       LIVE_BULK_COUNT,
       LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
       LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_RATE,
       LIVE_DETECTION_LATENCY_P50,
       LIVE_DETECTION_LATENCY_P95,
       LIVE_FAST_LANE_DETECTION_LATENCY_P50,
       LIVE_FAST_LANE_DETECTION_LATENCY_P95,
       LIVE_BULK_DETECTION_LATENCY_P50,
       LIVE_BULK_DETECTION_LATENCY_P95,
+      liveValidationStatus,
+      liveSampleValidationStatus,
+      liveValidationStates,
+      liveValidationMessage,
+      isLiveValidated,
     };
 
     const monitoringWindowEntryWindowMissedCount =
@@ -14408,17 +18156,24 @@ export class RadarDatabase {
       historicalSignalsOutsideWindow,
       formalCandidateLatencySla,
       DEMO_LATENCY_FIXTURE,
+      CONTROLLED_LIVE_FIXTURE,
       LIVE_FORMAL_CANDIDATE_COUNT,
       LIVE_FAST_LANE_COUNT,
       LIVE_BULK_COUNT,
       LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
       LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_RATE,
       LIVE_DETECTION_LATENCY_P50,
       LIVE_DETECTION_LATENCY_P95,
       LIVE_FAST_LANE_DETECTION_LATENCY_P50,
       LIVE_FAST_LANE_DETECTION_LATENCY_P95,
       LIVE_BULK_DETECTION_LATENCY_P50,
       LIVE_BULK_DETECTION_LATENCY_P95,
+      liveValidationStatus,
+      liveSampleValidationStatus,
+      liveValidationStates,
+      liveValidationMessage,
+      isLiveValidated,
       fullMarketSeparatedCounts: {
         radarLong: radarLongCount,
         radarShort: radarShortCount,
@@ -14618,17 +18373,25 @@ export class RadarDatabase {
       historicalSignalsOutsideWindow,
       formalCandidateLatencySla,
       DEMO_LATENCY_FIXTURE,
+      CONTROLLED_LIVE_FIXTURE,
       LIVE_FORMAL_CANDIDATE_COUNT,
       LIVE_FAST_LANE_COUNT,
       LIVE_BULK_COUNT,
       LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
       LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_RATE,
       LIVE_DETECTION_LATENCY_P50,
       LIVE_DETECTION_LATENCY_P95,
       LIVE_FAST_LANE_DETECTION_LATENCY_P50,
       LIVE_FAST_LANE_DETECTION_LATENCY_P95,
       LIVE_BULK_DETECTION_LATENCY_P50,
       LIVE_BULK_DETECTION_LATENCY_P95,
+      liveValidationStatus,
+      liveSampleValidationStatus,
+      liveValidationStates,
+      liveValidationMessage,
+      isLiveValidated,
+      signalQualityCalibration,
       paperEligibilityAudit,
       nearMissCount: smcGateDiagnostics.nearMissCount,
       nearMissMissing1Count: smcGateDiagnostics.nearMissMissing1Count,
@@ -14674,11 +18437,1890 @@ export class RadarDatabase {
     return finalResult;
   }
 
+  public saveLiveCaptureCandidate(record: LiveCaptureCandidateRecord): void {
+    if (
+      record.isDemo ||
+      record.evidenceType !== 'LIVE_PRODUCTION' ||
+      record.exchange === 'demo_synthetic'
+    ) {
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO smc_live_capture_candidates (
+          signal_id, cycle_id, symbol, exchange, timeframe, direction,
+          signal_bar_open_time, signal_bar_close_time, next_bar_open_time,
+          candidate_detected_at, signal_detected_at, queue_entered_at,
+          evaluation_started_at, evaluation_completed_at, queue_wait_ms,
+          evaluation_latency_ms, candidate_detection_latency_ms, next_bar_remaining_ms,
+          entry_window_status, entry_window_missed, is_fast_lane,
+          evidence_type, source, fetched_at, stale, fallback, is_demo, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        record.signalId,
+        record.cycleId,
+        record.symbol,
+        record.exchange,
+        record.timeframe,
+        record.direction,
+        record.signalBarOpenTime,
+        record.signalBarCloseTime,
+        record.nextBarOpenTime,
+        record.candidateDetectedAt,
+        record.signalDetectedAt,
+        record.queueEnteredAt,
+        record.evaluationStartedAt,
+        record.evaluationCompletedAt,
+        record.queueWaitMs,
+        record.evaluationLatencyMs,
+        record.candidateDetectionLatencyMs,
+        record.nextBarRemainingMs,
+        record.entryWindowStatus,
+        record.entryWindowMissed ? 1 : 0,
+        record.isFastLane ? 1 : 0,
+        'LIVE_PRODUCTION',
+        record.source,
+        record.fetchedAt,
+        record.stale ? 1 : 0,
+        record.fallback ? 1 : 0,
+        0,
+        new Date().toISOString()
+      );
+  }
+
+  public listLiveCaptureCandidates(
+    exchange?: ExchangeId
+  ): LiveCaptureCandidateRecord[] {
+    const rows = (
+      exchange
+        ? this.db
+            .prepare(
+              `SELECT * FROM smc_live_capture_candidates
+               WHERE exchange = ? AND evidence_type = 'LIVE_PRODUCTION' AND is_demo = 0
+               ORDER BY signal_detected_at DESC`
+            )
+            .all(exchange)
+        : this.db
+            .prepare(
+              `SELECT * FROM smc_live_capture_candidates
+               WHERE evidence_type = 'LIVE_PRODUCTION' AND is_demo = 0
+               ORDER BY signal_detected_at DESC`
+            )
+            .all()
+    ) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => ({
+      cycleId: String(r.cycle_id),
+      signalId: String(r.signal_id),
+      symbol: String(r.symbol),
+      exchange: String(r.exchange) as ExchangeId,
+      timeframe: String(r.timeframe || '15m'),
+      direction: String(r.direction) === 'SHORT' ? 'SHORT' : 'LONG',
+      signalBarOpenTime:
+        r.signal_bar_open_time !== null && r.signal_bar_open_time !== undefined
+          ? Number(r.signal_bar_open_time)
+          : null,
+      signalBarCloseTime:
+        r.signal_bar_close_time !== null && r.signal_bar_close_time !== undefined
+          ? Number(r.signal_bar_close_time)
+          : null,
+      nextBarOpenTime:
+        r.next_bar_open_time !== null && r.next_bar_open_time !== undefined
+          ? Number(r.next_bar_open_time)
+          : null,
+      candidateDetectedAt: String(r.candidate_detected_at),
+      signalDetectedAt: String(r.signal_detected_at),
+      queueEnteredAt:
+        r.queue_entered_at !== null && r.queue_entered_at !== undefined
+          ? String(r.queue_entered_at)
+          : null,
+      evaluationStartedAt: String(r.evaluation_started_at),
+      evaluationCompletedAt: String(r.evaluation_completed_at),
+      queueWaitMs:
+        r.queue_wait_ms !== null && r.queue_wait_ms !== undefined
+          ? Number(r.queue_wait_ms)
+          : null,
+      evaluationLatencyMs:
+        r.evaluation_latency_ms !== null && r.evaluation_latency_ms !== undefined
+          ? Number(r.evaluation_latency_ms)
+          : null,
+      candidateDetectionLatencyMs:
+        r.candidate_detection_latency_ms !== null &&
+        r.candidate_detection_latency_ms !== undefined
+          ? Number(r.candidate_detection_latency_ms)
+          : null,
+      nextBarRemainingMs:
+        r.next_bar_remaining_ms !== null && r.next_bar_remaining_ms !== undefined
+          ? Number(r.next_bar_remaining_ms)
+          : null,
+      entryWindowStatus:
+        String(r.entry_window_status) === 'ENTRY_WINDOW_MISSED'
+          ? 'ENTRY_WINDOW_MISSED'
+          : 'DETECTED_BEFORE_NEXT_BAR_OPEN',
+      entryWindowMissed: Number(r.entry_window_missed) === 1,
+      isFastLane: Number(r.is_fast_lane) === 1,
+      evidenceType: 'LIVE_PRODUCTION',
+      source: String(r.source || ''),
+      fetchedAt: String(r.fetched_at || ''),
+      stale: Number(r.stale) === 1,
+      fallback: Number(r.fallback) === 1,
+      isDemo: false,
+      isTestFixture: false,
+    }));
+  }
+
+  public saveControlledFixtureCandidate(record: LiveCaptureCandidateRecord): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO smc_controlled_fixture_candidates (
+          signal_id, cycle_id, symbol, exchange, timeframe, direction,
+          signal_bar_open_time, signal_bar_close_time, next_bar_open_time,
+          candidate_detected_at, signal_detected_at, queue_entered_at,
+          evaluation_started_at, evaluation_completed_at, queue_wait_ms,
+          evaluation_latency_ms, candidate_detection_latency_ms, next_bar_remaining_ms,
+          entry_window_status, entry_window_missed, is_fast_lane,
+          evidence_type, source, fetched_at, stale, fallback, is_demo, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        record.signalId,
+        record.cycleId,
+        record.symbol,
+        record.exchange,
+        record.timeframe,
+        record.direction,
+        record.signalBarOpenTime,
+        record.signalBarCloseTime,
+        record.nextBarOpenTime,
+        record.candidateDetectedAt,
+        record.signalDetectedAt,
+        record.queueEnteredAt,
+        record.evaluationStartedAt,
+        record.evaluationCompletedAt,
+        record.queueWaitMs,
+        record.evaluationLatencyMs,
+        record.candidateDetectionLatencyMs,
+        record.nextBarRemainingMs,
+        record.entryWindowStatus,
+        record.entryWindowMissed ? 1 : 0,
+        record.isFastLane ? 1 : 0,
+        'CONTROLLED_LIVE_FIXTURE',
+        record.source,
+        record.fetchedAt,
+        record.stale ? 1 : 0,
+        record.fallback ? 1 : 0,
+        0,
+        new Date().toISOString()
+      );
+  }
+
+  public listControlledFixtureCandidates(
+    exchange?: ExchangeId
+  ): LiveCaptureCandidateRecord[] {
+    const rows = (
+      exchange
+        ? this.db
+            .prepare(
+              `SELECT * FROM smc_controlled_fixture_candidates
+               WHERE exchange = ? AND evidence_type = 'CONTROLLED_LIVE_FIXTURE'
+               ORDER BY signal_detected_at DESC`
+            )
+            .all(exchange)
+        : this.db
+            .prepare(
+              `SELECT * FROM smc_controlled_fixture_candidates
+               WHERE evidence_type = 'CONTROLLED_LIVE_FIXTURE'
+               ORDER BY signal_detected_at DESC`
+            )
+            .all()
+    ) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => ({
+      cycleId: String(r.cycle_id),
+      signalId: String(r.signal_id),
+      symbol: String(r.symbol),
+      exchange: String(r.exchange) as ExchangeId,
+      timeframe: String(r.timeframe || '15m'),
+      direction: String(r.direction) === 'SHORT' ? 'SHORT' : 'LONG',
+      signalBarOpenTime:
+        r.signal_bar_open_time !== null && r.signal_bar_open_time !== undefined
+          ? Number(r.signal_bar_open_time)
+          : null,
+      signalBarCloseTime:
+        r.signal_bar_close_time !== null && r.signal_bar_close_time !== undefined
+          ? Number(r.signal_bar_close_time)
+          : null,
+      nextBarOpenTime:
+        r.next_bar_open_time !== null && r.next_bar_open_time !== undefined
+          ? Number(r.next_bar_open_time)
+          : null,
+      candidateDetectedAt: String(r.candidate_detected_at),
+      signalDetectedAt: String(r.signal_detected_at),
+      queueEnteredAt:
+        r.queue_entered_at !== null && r.queue_entered_at !== undefined
+          ? String(r.queue_entered_at)
+          : null,
+      evaluationStartedAt: String(r.evaluation_started_at),
+      evaluationCompletedAt: String(r.evaluation_completed_at),
+      queueWaitMs:
+        r.queue_wait_ms !== null && r.queue_wait_ms !== undefined
+          ? Number(r.queue_wait_ms)
+          : null,
+      evaluationLatencyMs:
+        r.evaluation_latency_ms !== null && r.evaluation_latency_ms !== undefined
+          ? Number(r.evaluation_latency_ms)
+          : null,
+      candidateDetectionLatencyMs:
+        r.candidate_detection_latency_ms !== null &&
+        r.candidate_detection_latency_ms !== undefined
+          ? Number(r.candidate_detection_latency_ms)
+          : null,
+      nextBarRemainingMs:
+        r.next_bar_remaining_ms !== null && r.next_bar_remaining_ms !== undefined
+          ? Number(r.next_bar_remaining_ms)
+          : null,
+      entryWindowStatus:
+        String(r.entry_window_status) === 'ENTRY_WINDOW_MISSED'
+          ? 'ENTRY_WINDOW_MISSED'
+          : 'DETECTED_BEFORE_NEXT_BAR_OPEN',
+      entryWindowMissed: Number(r.entry_window_missed) === 1,
+      isFastLane: Number(r.is_fast_lane) === 1,
+      evidenceType: 'CONTROLLED_LIVE_FIXTURE',
+      source: String(r.source || ''),
+      fetchedAt: String(r.fetched_at || ''),
+      stale: Number(r.stale) === 1,
+      fallback: Number(r.fallback) === 1,
+      isDemo: false,
+      isTestFixture: true,
+    }));
+  }
+
+  public save15mCloseEvent(record: Confirmed15mCloseEventRecord): void {
+    const resolvedEventId = record.closeEventId || record.eventId;
+    const isDemo =
+      record.isDemo !== undefined
+        ? record.isDemo
+        : record.evidenceType === 'DEMO_LATENCY_FIXTURE';
+    const isTestFixture =
+      record.isTestFixture !== undefined
+        ? record.isTestFixture
+        : record.evidenceType !== 'LIVE_PRODUCTION';
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO smc_15m_close_events (
+          event_id, exchange, cycle_id, close_event_at,
+          bar_open_time, bar_close_time,
+          triggered_fast_lane_count, completed_fast_lane_count,
+          formal_candidate_count, near_miss_count,
+          candidate_detected_before_entry_count, entry_window_missed_count,
+          pending_count, queue_wait_p50, queue_wait_p95,
+          worker_state, cache_mode, snapshot_at, stats_version, evidence_type,
+          is_demo, is_test_fixture
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        resolvedEventId,
+        record.exchange,
+        record.cycleId,
+        record.closeEventAt,
+        record.barOpenTime,
+        record.barCloseTime,
+        record.triggeredFastLaneCount,
+        record.completedFastLaneCount,
+        record.formalCandidateCount,
+        record.nearMissCount,
+        record.candidateDetectedBeforeEntryCount,
+        record.entryWindowMissedCount,
+        record.pendingCount,
+        record.queueWaitP50,
+        record.queueWaitP95,
+        record.workerState,
+        record.cacheMode,
+        record.snapshotAt,
+        record.statsVersion,
+        record.evidenceType,
+        isDemo ? 1 : 0,
+        isTestFixture ? 1 : 0
+      );
+  }
+
+  public list15mCloseEvents(
+    exchange: ExchangeId,
+    options?: { includeFixtures?: boolean; limit?: number }
+  ): Confirmed15mCloseEventRecord[] {
+    const limit = options?.limit ?? 500;
+    const includeFixtures = options?.includeFixtures ?? false;
+    const rows = (
+      includeFixtures
+        ? this.db
+            .prepare(
+              `SELECT * FROM smc_15m_close_events
+               WHERE exchange = ?
+               ORDER BY close_event_at DESC, rowid DESC
+               LIMIT ?`
+            )
+            .all(exchange, limit)
+        : this.db
+            .prepare(
+              `SELECT * FROM smc_15m_close_events
+               WHERE exchange = ? AND evidence_type = 'LIVE_PRODUCTION' AND is_demo = 0 AND is_test_fixture = 0
+               ORDER BY close_event_at DESC, rowid DESC
+               LIMIT ?`
+            )
+            .all(exchange, limit)
+    ) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => {
+      const evType = (r.evidence_type
+        ? String(r.evidence_type)
+        : 'LIVE_PRODUCTION') as CandidateEvidenceType;
+      const evId = String(r.event_id);
+      return {
+        closeEventId: evId,
+        eventId: evId,
+        exchange: String(r.exchange) as ExchangeId,
+        cycleId: String(r.cycle_id),
+        closeEventAt: String(r.close_event_at),
+        barOpenTime:
+          r.bar_open_time !== null && r.bar_open_time !== undefined
+            ? Number(r.bar_open_time)
+            : null,
+        barCloseTime:
+          r.bar_close_time !== null && r.bar_close_time !== undefined
+            ? Number(r.bar_close_time)
+            : null,
+        triggeredFastLaneCount: Number(r.triggered_fast_lane_count ?? 0),
+        completedFastLaneCount: Number(r.completed_fast_lane_count ?? 0),
+        formalCandidateCount: Number(r.formal_candidate_count ?? 0),
+        nearMissCount: Number(r.near_miss_count ?? 0),
+        candidateDetectedBeforeEntryCount: Number(
+          r.candidate_detected_before_entry_count ?? 0
+        ),
+        entryWindowMissedCount: Number(r.entry_window_missed_count ?? 0),
+        pendingCount: Number(r.pending_count ?? 0),
+        queueWaitP50:
+          r.queue_wait_p50 !== null && r.queue_wait_p50 !== undefined
+            ? Number(r.queue_wait_p50)
+            : null,
+        queueWaitP95:
+          r.queue_wait_p95 !== null && r.queue_wait_p95 !== undefined
+            ? Number(r.queue_wait_p95)
+            : null,
+        workerState: String(r.worker_state || 'IDLE') as SmcScanWorkerState,
+        cacheMode: String(r.cache_mode || 'WARM') as SmcCacheMode,
+        snapshotAt: String(r.snapshot_at),
+        statsVersion: Number(r.stats_version ?? 1),
+        evidenceType: evType,
+        isDemo:
+          r.is_demo !== undefined
+            ? Number(r.is_demo) === 1
+            : evType === 'DEMO_LATENCY_FIXTURE',
+        isTestFixture:
+          r.is_test_fixture !== undefined
+            ? Number(r.is_test_fixture) === 1
+            : evType !== 'LIVE_PRODUCTION',
+      };
+    });
+  }
+
+  public saveNearMissObservations(
+    exchange: ExchangeId,
+    cycleId: string,
+    observedAt: string,
+    records: SmcNearMissSymbolRecord[]
+  ): void {
+    if (!records || records.length === 0) return;
+    this.runInTransaction(() => {
+      const stmt = this.db.prepare(
+        `INSERT OR REPLACE INTO smc_near_miss_observations (
+          observation_id, exchange, cycle_id, symbol, smc_action_state,
+          market_radar_category, intended_direction, missing_gates_json,
+          missing_gate_count, last_blocking_gate, wait_reasons_json,
+          evaluation_latency_ms, next_bar_remaining_ms, queue_wait_ms,
+          market_regime, funding_state, liquidity_state, mtf_alignment_state,
+          evidence_type, is_demo, is_test_fixture, is_fast_lane, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const rec of records) {
+        const evType: CandidateEvidenceType =
+          rec.evidenceType ??
+          (rec.isDemo ? 'DEMO_LATENCY_FIXTURE' : 'LIVE_PRODUCTION');
+        const isDemo = Boolean(rec.isDemo);
+        const isTestFixture =
+          rec.isTestFixture !== undefined
+            ? Boolean(rec.isTestFixture)
+            : evType !== 'LIVE_PRODUCTION';
+        const obsId = `nm:${exchange}:${cycleId}:${rec.symbol}`;
+        stmt.run(
+          obsId,
+          exchange,
+          cycleId,
+          rec.symbol,
+          rec.smcActionState,
+          rec.marketRadarCategory,
+          rec.intendedDirection ?? 'NEUTRAL',
+          JSON.stringify(rec.missingGates ?? []),
+          rec.missingGateCount,
+          rec.lastBlockingGate ?? '',
+          JSON.stringify(rec.waitReasons ?? []),
+          rec.evaluationLatencyMs ?? null,
+          rec.nextBarRemainingMs ?? null,
+          rec.queueWaitMs ?? null,
+          rec.marketRegime ?? 'RANGING_CONSOLIDATION',
+          rec.fundingState ?? 'NORMAL_FUNDING',
+          rec.liquidityState ?? 'ADEQUATE_LIQUIDITY_NO_SWEEP',
+          rec.mtfAlignmentState ?? 'MTF_CONFLICT_OR_UNALIGNED',
+          evType,
+          isDemo ? 1 : 0,
+          isTestFixture ? 1 : 0,
+          rec.isFastLane ? 1 : 0,
+          rec.observedAt ?? observedAt
+        );
+      }
+    });
+  }
+
+  public listNearMissObservations(
+    exchange: ExchangeId,
+    options?: { includeFixtures?: boolean; limit?: number }
+  ): SmcNearMissSymbolRecord[] {
+    const limit = options?.limit ?? 200;
+    const includeFixtures = options?.includeFixtures ?? false;
+    const rows = (
+      includeFixtures
+        ? this.db
+            .prepare(
+              `SELECT * FROM smc_near_miss_observations
+               WHERE exchange = ?
+               ORDER BY observed_at DESC, rowid DESC
+               LIMIT ?`
+            )
+            .all(exchange, limit)
+        : this.db
+            .prepare(
+              `SELECT * FROM smc_near_miss_observations
+               WHERE exchange = ? AND evidence_type = 'LIVE_PRODUCTION' AND is_demo = 0 AND is_test_fixture = 0
+               ORDER BY observed_at DESC, rowid DESC
+               LIMIT ?`
+            )
+            .all(exchange, limit)
+    ) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => {
+      let missingGates: string[] = [];
+      let waitReasons: string[] = [];
+      try {
+        missingGates = JSON.parse(String(r.missing_gates_json || '[]'));
+      } catch {
+        missingGates = [];
+      }
+      try {
+        waitReasons = JSON.parse(String(r.wait_reasons_json || '[]'));
+      } catch {
+        waitReasons = [];
+      }
+      const mgCount = Number(r.missing_gate_count) === 2 ? 2 : 1;
+      const evType = String(
+        r.evidence_type || 'LIVE_PRODUCTION'
+      ) as CandidateEvidenceType;
+      return {
+        symbol: String(r.symbol),
+        smcActionState: String(r.smc_action_state || 'WATCH') as SmcActionState,
+        marketRadarCategory: String(
+          r.market_radar_category || '準備觀察'
+        ) as MarketRadarCategory,
+        nearMissStatus:
+          mgCount === 1 ? 'NEAR_MISS_ONE_GATE' : 'NEAR_MISS_TWO_GATES',
+        intendedDirection: (String(r.intended_direction) === 'LONG' ||
+        String(r.intended_direction) === 'SHORT'
+          ? String(r.intended_direction)
+          : 'NEUTRAL') as 'LONG' | 'SHORT' | 'NEUTRAL',
+        missingGateCount: mgCount as 1 | 2,
+        missingGates,
+        lastBlockingGate: String(
+          r.last_blocking_gate || missingGates[0] || ''
+        ),
+        waitReasons,
+        evaluationLatencyMs:
+          r.evaluation_latency_ms !== null &&
+          r.evaluation_latency_ms !== undefined
+            ? Number(r.evaluation_latency_ms)
+            : null,
+        nextBarRemainingMs:
+          r.next_bar_remaining_ms !== null &&
+          r.next_bar_remaining_ms !== undefined
+            ? Number(r.next_bar_remaining_ms)
+            : null,
+        queueWaitMs:
+          r.queue_wait_ms !== null && r.queue_wait_ms !== undefined
+            ? Number(r.queue_wait_ms)
+            : null,
+        marketRegime: String(r.market_regime || 'RANGING_CONSOLIDATION'),
+        fundingState: String(r.funding_state || 'NORMAL_FUNDING'),
+        liquidityState: String(
+          r.liquidity_state || 'ADEQUATE_LIQUIDITY_NO_SWEEP'
+        ),
+        mtfAlignmentState: String(
+          r.mtf_alignment_state || 'MTF_CONFLICT_OR_UNALIGNED'
+        ),
+        evidenceType: evType,
+        isDemo: Number(r.is_demo) === 1,
+        isTestFixture: Number(r.is_test_fixture) === 1,
+        isFastLane: Number(r.is_fast_lane) === 1,
+        cycleId: String(r.cycle_id || ''),
+        observedAt: String(r.observed_at || ''),
+      };
+    });
+  }
+
+  public buildNearMissDistribution(
+    exchange: ExchangeId,
+    currentCycleNearMiss: SmcNearMissSymbolRecord[]
+  ): NearMissDistributionSummary {
+    const persisted = this.listNearMissObservations(exchange, {
+      includeFixtures: false,
+      limit: 200,
+    });
+    const sourceRecords =
+      currentCycleNearMiss.length > 0 ? currentCycleNearMiss : persisted;
+    const byMissingGate: Record<string, number> = {};
+    const byIntendedDirection: Record<'LONG' | 'SHORT' | 'NEUTRAL', number> = {
+      LONG: 0,
+      SHORT: 0,
+      NEUTRAL: 0,
+    };
+    const byMarketRadarCategory: Record<string, number> = {};
+    const byMarketRegime: Record<string, number> = {};
+    const byFundingState: Record<string, number> = {};
+    const byLiquidityState: Record<string, number> = {};
+    const byMtfAlignmentState: Record<string, number> = {};
+    let nearMissOneGateCount = 0;
+    let nearMissTwoGatesCount = 0;
+
+    for (const rec of sourceRecords) {
+      if (rec.missingGateCount === 1) nearMissOneGateCount++;
+      else nearMissTwoGatesCount++;
+      for (const mg of rec.missingGates) {
+        byMissingGate[mg] = (byMissingGate[mg] ?? 0) + 1;
+      }
+      const dir = rec.intendedDirection ?? 'NEUTRAL';
+      byIntendedDirection[dir] = (byIntendedDirection[dir] ?? 0) + 1;
+      const cat = rec.marketRadarCategory || '準備觀察';
+      byMarketRadarCategory[cat] = (byMarketRadarCategory[cat] ?? 0) + 1;
+      const reg = rec.marketRegime || 'RANGING_CONSOLIDATION';
+      byMarketRegime[reg] = (byMarketRegime[reg] ?? 0) + 1;
+      const fund = rec.fundingState || 'NORMAL_FUNDING';
+      byFundingState[fund] = (byFundingState[fund] ?? 0) + 1;
+      const liq = rec.liquidityState || 'ADEQUATE_LIQUIDITY_NO_SWEEP';
+      byLiquidityState[liq] = (byLiquidityState[liq] ?? 0) + 1;
+      const mtf = rec.mtfAlignmentState || 'MTF_CONFLICT_OR_UNALIGNED';
+      byMtfAlignmentState[mtf] = (byMtfAlignmentState[mtf] ?? 0) + 1;
+    }
+
+    return {
+      totalNearMissCount: sourceRecords.length,
+      nearMissOneGateCount,
+      nearMissTwoGatesCount,
+      byMissingGate,
+      byIntendedDirection,
+      byMarketRadarCategory,
+      byMarketRegime,
+      byFundingState,
+      byLiquidityState,
+      byMtfAlignmentState,
+      persistedObservationCount: persisted.length,
+      records: sourceRecords,
+    };
+  }
+
+  public buildLiveCloseEventWindowReport(
+    exchange: ExchangeId,
+    windowHours: 24 | 72,
+    nowIso?: string
+  ): LiveCloseEventWindowReport {
+    const endMs = nowIso ? Date.parse(nowIso) : Date.now();
+    const startMs = endMs - windowHours * 3600_000;
+    const allLiveEvents = this.list15mCloseEvents(exchange, {
+      includeFixtures: false,
+      limit: 500,
+    });
+    const eventsInWindow = allLiveEvents.filter((ev) => {
+      const t = Date.parse(ev.closeEventAt);
+      return Number.isFinite(t) && t >= startMs && t <= endMs + 60_000;
+    });
+    const triggeredFastLaneCount = eventsInWindow.reduce(
+      (acc, e) => acc + e.triggeredFastLaneCount,
+      0
+    );
+    const completedFastLaneCount = eventsInWindow.reduce(
+      (acc, e) => acc + e.completedFastLaneCount,
+      0
+    );
+    const fastLaneCompletionRate =
+      triggeredFastLaneCount > 0
+        ? Number((completedFastLaneCount / triggeredFastLaneCount).toFixed(4))
+        : null;
+    const formalCandidateCount = eventsInWindow.reduce(
+      (acc, e) => acc + e.formalCandidateCount,
+      0
+    );
+    const nearMissCount = eventsInWindow.reduce(
+      (acc, e) => acc + e.nearMissCount,
+      0
+    );
+    const candidateDetectedBeforeEntryCount = eventsInWindow.reduce(
+      (acc, e) => acc + e.candidateDetectedBeforeEntryCount,
+      0
+    );
+    const entryWindowMissedCount = eventsInWindow.reduce(
+      (acc, e) => acc + e.entryWindowMissedCount,
+      0
+    );
+    const p50Vals = eventsInWindow
+      .map((e) => e.queueWaitP50)
+      .filter((v): v is number => v !== null && Number.isFinite(v))
+      .sort((a, b) => a - b);
+    const p95Vals = eventsInWindow
+      .map((e) => e.queueWaitP95)
+      .filter((v): v is number => v !== null && Number.isFinite(v))
+      .sort((a, b) => a - b);
+    const pct = (arr: number[], p: number): number | null => {
+      if (arr.length === 0) return null;
+      const idx = Math.min(
+        arr.length - 1,
+        Math.max(0, Math.ceil((p / 100) * arr.length) - 1)
+      );
+      return Math.round(arr[idx]);
+    };
+
+    return {
+      windowLabel: windowHours === 24 ? '24h' : '72h',
+      windowHours,
+      windowStartAt: new Date(startMs).toISOString(),
+      windowEndAt: new Date(endMs).toISOString(),
+      evidenceType: 'LIVE_PRODUCTION',
+      isDemo: false,
+      isTestFixture: false,
+      totalCloseEventCount: eventsInWindow.length,
+      triggeredFastLaneCount,
+      completedFastLaneCount,
+      fastLaneCompletionRate,
+      formalCandidateCount,
+      nearMissCount,
+      candidateDetectedBeforeEntryCount,
+      entryWindowMissedCount,
+      queueWaitP50: pct(p50Vals, 50),
+      queueWaitP95: pct(p95Vals, 95),
+      events: eventsInWindow,
+    };
+  }
+
+  public getLiveCaptureObservation(
+    exchange: ExchangeId,
+    options?: {
+      snapshotConsistency?: SnapshotConsistencyMode;
+      sharedContext?: {
+        diag: ReturnType<RadarDatabase['computeCycleDiagnosticsAndFunnel']>;
+        capturedAt: string;
+      };
+    }
+  ): PaperQualityLiveCaptureResponse {
+    const diag =
+      options?.sharedContext?.diag ??
+      this.computeCycleDiagnosticsAndFunnel(exchange);
+    const capturedAt =
+      options?.sharedContext?.capturedAt ?? new Date().toISOString();
+    const snapshotConsistency: SnapshotConsistencyMode =
+      options?.snapshotConsistency ??
+      (options?.sharedContext
+        ? 'SHARED_ATOMIC_SNAPSHOT'
+        : 'INDEPENDENT_ENDPOINT_SNAPSHOT');
+    const liveCandidates = this.listLiveCaptureCandidates(exchange);
+    const controlledCandidates = this.listControlledFixtureCandidates(exchange);
+
+    // Ensure any current-cycle LIVE_PRODUCTION formal candidate from smc_scan_results is also represented
+    const seenIds = new Set(liveCandidates.map((c) => c.signalId));
+    const mergedLiveCandidates: LiveCaptureCandidateRecord[] = [
+      ...liveCandidates,
+    ];
+    for (const slaRec of diag.formalCandidateLatencySla.candidates) {
+      if (slaRec.evidenceType === 'LIVE_PRODUCTION' && !slaRec.isDemo) {
+        const direction =
+          slaRec.smcActionState === 'SHORT CANDIDATE' ? 'SHORT' : 'LONG';
+        const sigBarOpen =
+          slaRec.signalBarOpenTime ??
+          (slaRec.signalBarCloseTime !== null
+            ? Number(slaRec.signalBarCloseTime) - 900_000 + 1
+            : 0);
+        const sigId = `${slaRec.symbol}:${exchange}:15m:${direction}:${sigBarOpen}:smc_v2_strict`;
+        if (!seenIds.has(sigId)) {
+          seenIds.add(sigId);
+          mergedLiveCandidates.push({
+            cycleId: diag.cycleId,
+            signalId: sigId,
+            symbol: slaRec.symbol,
+            exchange,
+            timeframe: '15m',
+            direction,
+            signalBarOpenTime: slaRec.signalBarOpenTime ?? null,
+            signalBarCloseTime: slaRec.signalBarCloseTime ?? null,
+            nextBarOpenTime: slaRec.nextBarOpenTime ?? null,
+            candidateDetectedAt: slaRec.candidateDetectedAt,
+            signalDetectedAt: slaRec.signalDetectedAt,
+            queueEnteredAt: slaRec.queueEnteredAt ?? null,
+            evaluationStartedAt: slaRec.evaluationStartedAt,
+            evaluationCompletedAt: slaRec.evaluationCompletedAt,
+            queueWaitMs: slaRec.queueWaitMs ?? null,
+            evaluationLatencyMs: slaRec.evaluationLatencyMs ?? null,
+            candidateDetectionLatencyMs:
+              slaRec.candidateDetectionLatencyMs ?? null,
+            nextBarRemainingMs: slaRec.nextBarRemainingMs ?? null,
+            entryWindowStatus: slaRec.entryWindowStatus,
+            entryWindowMissed: slaRec.entryWindowMissed,
+            isFastLane: slaRec.isFastLane,
+            evidenceType: 'LIVE_PRODUCTION',
+            source: 'Binance USDⓈ-M Futures Public REST API',
+            fetchedAt: slaRec.evaluationCompletedAt,
+            stale: false,
+            fallback: false,
+            isDemo: false,
+            isTestFixture: false,
+          });
+        }
+      }
+    }
+
+    return {
+      exchange,
+      cycleId: diag.cycleId,
+      snapshotAt: diag.snapshotAt,
+      capturedAt,
+      statsVersion: diag.statsVersion,
+      aggregationScope: 'CURRENT_CYCLE',
+      snapshotConsistency,
+      statsConsistency: diag.statsConsistency,
+      evidenceType: 'LIVE_PRODUCTION',
+      isDemo: false,
+      isTestFixture: false,
+      liveValidationStatus: diag.liveValidationStatus,
+      liveSampleValidationStatus: diag.liveSampleValidationStatus,
+      liveValidationStates: diag.liveValidationStates,
+      liveValidationMessage: diag.liveValidationMessage,
+      isLiveValidated: diag.isLiveValidated,
+      candidateDetectionLatencyP50: diag.LIVE_DETECTION_LATENCY_P50,
+      candidateDetectionLatencyP95: diag.LIVE_DETECTION_LATENCY_P95,
+      entryWindowMissedRate: diag.LIVE_ENTRY_WINDOW_MISSED_RATE,
+      LIVE_FORMAL_CANDIDATE_COUNT: diag.LIVE_FORMAL_CANDIDATE_COUNT,
+      LIVE_FAST_LANE_COUNT: diag.LIVE_FAST_LANE_COUNT,
+      LIVE_BULK_COUNT: diag.LIVE_BULK_COUNT,
+      LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT:
+        diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_COUNT: diag.LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_RATE: diag.LIVE_ENTRY_WINDOW_MISSED_RATE,
+      LIVE_DETECTION_LATENCY_P50: diag.LIVE_DETECTION_LATENCY_P50,
+      LIVE_DETECTION_LATENCY_P95: diag.LIVE_DETECTION_LATENCY_P95,
+      LIVE_FAST_LANE_DETECTION_LATENCY_P50:
+        diag.LIVE_FAST_LANE_DETECTION_LATENCY_P50,
+      LIVE_FAST_LANE_DETECTION_LATENCY_P95:
+        diag.LIVE_FAST_LANE_DETECTION_LATENCY_P95,
+      LIVE_BULK_DETECTION_LATENCY_P50: diag.LIVE_BULK_DETECTION_LATENCY_P50,
+      LIVE_BULK_DETECTION_LATENCY_P95: diag.LIVE_BULK_DETECTION_LATENCY_P95,
+      liveProductionCandidates: mergedLiveCandidates,
+      controlledFixtureCandidates: controlledCandidates,
+      CONTROLLED_LIVE_FIXTURE: diag.CONTROLLED_LIVE_FIXTURE,
+      DEMO_LATENCY_FIXTURE: diag.DEMO_LATENCY_FIXTURE,
+      evidenceIsolationGuarantee: {
+        liveProductionIsolated: true,
+        controlledFixtureNeverCountedInLive: true,
+        demoFixtureNeverCountedInLive: true,
+        controlledTestPassingNeverMarkedLiveValidated: true,
+      },
+      notices: [
+        '目前尚無真實 Live 正式候選，Live 捕捉 SLA 尚未驗證。',
+        '尚無真實 Live 正式候選',
+        'Live 捕捉 SLA 尚未驗證',
+        'Fast Lane 已運作，但目前沒有正式候選樣本',
+        'Near-Miss 不等於正式訊號',
+        'Shadow 候選不等於 Paper 訊號',
+        '尚無足夠已結算樣本，不能判斷策略有效性',
+        '受控測試通過不等於真實 Live 已驗證。',
+        '沒有正式候選時，Live 延遲為 null。',
+        'Radar Long/Short 不等於 SMC LONG/SHORT。',
+        '系統仍為 PAPER ONLY。',
+      ],
+      executionSafety: {
+        paperOnly: true,
+        liveOrdersDisabled: true,
+        neverAutoPlaceOrders: true,
+        externalNotificationCount: 0,
+      },
+    };
+  }
+
+  public getLiveCaptureEvents(
+    exchange: ExchangeId,
+    options?: {
+      snapshotConsistency?: SnapshotConsistencyMode;
+      sharedContext?: {
+        diag: ReturnType<RadarDatabase['computeCycleDiagnosticsAndFunnel']>;
+        capturedAt: string;
+      };
+    }
+  ): PaperQualityLiveCaptureEventsResponse {
+    const diag =
+      options?.sharedContext?.diag ??
+      this.computeCycleDiagnosticsAndFunnel(exchange);
+    const capturedAt =
+      options?.sharedContext?.capturedAt ?? new Date().toISOString();
+    const snapshotConsistency: SnapshotConsistencyMode =
+      options?.snapshotConsistency ??
+      (options?.sharedContext
+        ? 'SHARED_ATOMIC_SNAPSHOT'
+        : 'INDEPENDENT_ENDPOINT_SNAPSHOT');
+    const liveEvents = this.list15mCloseEvents(exchange, {
+      includeFixtures: false,
+      limit: 100,
+    });
+    const totalFastLaneTriggered = liveEvents.reduce(
+      (acc, e) => acc + e.triggeredFastLaneCount,
+      0
+    );
+    const totalFastLaneCompleted = liveEvents.reduce(
+      (acc, e) => acc + e.completedFastLaneCount,
+      0
+    );
+    const fastLaneCompletionRate =
+      totalFastLaneTriggered > 0
+        ? Number((totalFastLaneCompleted / totalFastLaneTriggered).toFixed(4))
+        : null;
+    const totalLiveFormalCandidatesFromCloseEvents = liveEvents.reduce(
+      (acc, e) => acc + e.formalCandidateCount,
+      0
+    );
+    const report24h = this.buildLiveCloseEventWindowReport(
+      exchange,
+      24,
+      capturedAt
+    );
+    const report72h = this.buildLiveCloseEventWindowReport(
+      exchange,
+      72,
+      capturedAt
+    );
+
+    return {
+      exchange,
+      cycleId: diag.cycleId,
+      snapshotAt: diag.snapshotAt,
+      capturedAt,
+      statsVersion: diag.statsVersion,
+      aggregationScope: 'MONITORING_WINDOW',
+      snapshotConsistency,
+      statsConsistency: diag.statsConsistency,
+      evidenceType: 'LIVE_PRODUCTION',
+      isDemo: false,
+      isTestFixture: false,
+      totalCloseEventCount: liveEvents.length,
+      totalFastLaneTriggered,
+      totalFastLaneCompleted,
+      fastLaneCompletionRate,
+      totalLiveFormalCandidatesFromCloseEvents,
+      latestCloseEvent: liveEvents.length > 0 ? liveEvents[0] : null,
+      events: liveEvents,
+      report24h,
+      report72h,
+      demoAndControlledExcludedFromEvents: true,
+      notices: [
+        '每次已確認 15m K 線收盤事件均獨立記錄，絕不使用 Demo 或 Controlled Fixture 補入真實 Live 指標。',
+        'Fast Lane 已運作，但目前沒有正式候選樣本',
+        '受控測試通過不等於真實 Live 已驗證。',
+        '系統仍為 PAPER ONLY。',
+      ],
+      executionSafety: {
+        paperOnly: true,
+        liveOrdersDisabled: true,
+        neverAutoPlaceOrders: true,
+        externalNotificationCount: 0,
+      },
+    };
+  }
+
+  public getLiveCaptureSummary(
+    exchange: ExchangeId,
+    options?: {
+      snapshotConsistency?: SnapshotConsistencyMode;
+      sharedContext?: {
+        diag: ReturnType<RadarDatabase['computeCycleDiagnosticsAndFunnel']>;
+        capturedAt: string;
+      };
+    }
+  ): PaperQualityLiveCaptureSummaryResponse {
+    const diag =
+      options?.sharedContext?.diag ??
+      this.computeCycleDiagnosticsAndFunnel(exchange);
+    const capturedAt =
+      options?.sharedContext?.capturedAt ?? new Date().toISOString();
+    const snapshotConsistency: SnapshotConsistencyMode =
+      options?.snapshotConsistency ??
+      (options?.sharedContext
+        ? 'SHARED_ATOMIC_SNAPSHOT'
+        : 'INDEPENDENT_ENDPOINT_SNAPSHOT');
+    const eventsResp = this.getLiveCaptureEvents(exchange, {
+      snapshotConsistency,
+      sharedContext: { diag, capturedAt },
+    });
+    const nearMissDistribution = this.buildNearMissDistribution(
+      exchange,
+      diag.smcGateDiagnostics.nearMissSymbols.filter(
+        (nm) =>
+          !nm.isDemo &&
+          !nm.isTestFixture &&
+          (nm.evidenceType ?? 'LIVE_PRODUCTION') === 'LIVE_PRODUCTION'
+      )
+    );
+
+    return {
+      exchange,
+      cycleId: diag.cycleId,
+      snapshotAt: diag.snapshotAt,
+      capturedAt,
+      statsVersion: diag.statsVersion,
+      aggregationScope: 'CURRENT_CYCLE',
+      snapshotConsistency,
+      statsConsistency: diag.statsConsistency,
+      evidenceType: 'LIVE_PRODUCTION',
+      isDemo: false,
+      isTestFixture: false,
+      liveValidationStatus: diag.liveValidationStatus,
+      liveSampleValidationStatus: diag.liveSampleValidationStatus,
+      liveValidationStates: diag.liveValidationStates,
+      liveValidationMessage: diag.liveValidationMessage,
+      isLiveValidated: diag.isLiveValidated,
+      strategyValidity: diag.signalQualityCalibration.strategyValidity,
+      candidateDetectionLatencyP50: diag.LIVE_DETECTION_LATENCY_P50,
+      candidateDetectionLatencyP95: diag.LIVE_DETECTION_LATENCY_P95,
+      entryWindowMissedRate: diag.LIVE_ENTRY_WINDOW_MISSED_RATE,
+      LIVE_FORMAL_CANDIDATE_COUNT: diag.LIVE_FORMAL_CANDIDATE_COUNT,
+      LIVE_FAST_LANE_COUNT: diag.LIVE_FAST_LANE_COUNT,
+      LIVE_BULK_COUNT: diag.LIVE_BULK_COUNT,
+      LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT:
+        diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_COUNT: diag.LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_RATE: diag.LIVE_ENTRY_WINDOW_MISSED_RATE,
+      LIVE_DETECTION_LATENCY_P50: diag.LIVE_DETECTION_LATENCY_P50,
+      LIVE_DETECTION_LATENCY_P95: diag.LIVE_DETECTION_LATENCY_P95,
+      LIVE_FAST_LANE_DETECTION_LATENCY_P50:
+        diag.LIVE_FAST_LANE_DETECTION_LATENCY_P50,
+      LIVE_FAST_LANE_DETECTION_LATENCY_P95:
+        diag.LIVE_FAST_LANE_DETECTION_LATENCY_P95,
+      LIVE_BULK_DETECTION_LATENCY_P50: diag.LIVE_BULK_DETECTION_LATENCY_P50,
+      LIVE_BULK_DETECTION_LATENCY_P95: diag.LIVE_BULK_DETECTION_LATENCY_P95,
+      CONTROLLED_LIVE_FIXTURE: diag.CONTROLLED_LIVE_FIXTURE,
+      DEMO_LATENCY_FIXTURE: diag.DEMO_LATENCY_FIXTURE,
+      fastLaneCompletionRate: eventsResp.fastLaneCompletionRate,
+      closeEventSummary: {
+        totalCloseEventCount: eventsResp.totalCloseEventCount,
+        totalFastLaneTriggered: eventsResp.totalFastLaneTriggered,
+        totalFastLaneCompleted: eventsResp.totalFastLaneCompleted,
+        fastLaneCompletionRate: eventsResp.fastLaneCompletionRate,
+        latestCloseEvent: eventsResp.latestCloseEvent,
+      },
+      report24h: eventsResp.report24h,
+      report72h: eventsResp.report72h,
+      nearMissDistribution,
+      nearMissObservations: nearMissDistribution.records,
+      signalQualityCalibration: diag.signalQualityCalibration,
+      observationShadowComparison: diag.observationShadowComparison,
+      currentCycleFunnel: diag.currentCycleFunnel,
+      monitoringWindowFunnel: diag.monitoringWindowFunnel,
+      cumulativeFunnel: diag.cumulativeFunnel,
+      historicalSignalsOutsideCurrentCycle:
+        diag.historicalSignalsOutsideCurrentCycle,
+      historicalSignalsOutsideWindow: diag.historicalSignalsOutsideWindow,
+      permanentNotices: [
+        '目前尚無真實 Live 正式候選，Live 捕捉 SLA 尚未驗證。',
+        '尚無真實 Live 正式候選',
+        'Live 捕捉 SLA 尚未驗證',
+        'Fast Lane 已運作，但目前沒有正式候選樣本',
+        'Near-Miss 不等於正式訊號',
+        'Shadow 候選不等於 Paper 訊號',
+        '尚無足夠已結算樣本，不能判斷策略有效性',
+        '受控測試通過不等於真實 Live 已驗證。',
+        '沒有正式候選時，Live 延遲為 null。',
+        'Radar Long/Short 不等於 SMC LONG/SHORT。',
+        '系統仍為 PAPER ONLY。',
+      ],
+      executionSafety: {
+        paperOnly: true,
+        liveOrdersDisabled: true,
+        neverAutoPlaceOrders: true,
+        externalNotificationCount: 0,
+      },
+    };
+  }
+
+  public getSharedAtomicLiveCaptureBundle(
+    exchange: ExchangeId
+  ): SharedAtomicLiveCaptureBundle {
+    const diag = this.computeCycleDiagnosticsAndFunnel(exchange);
+    const capturedAt = new Date().toISOString();
+    const sharedContext = { diag, capturedAt };
+    return {
+      exchange,
+      cycleId: diag.cycleId,
+      snapshotAt: diag.snapshotAt,
+      capturedAt,
+      statsVersion: diag.statsVersion,
+      aggregationScope: 'CURRENT_CYCLE',
+      snapshotConsistency: 'SHARED_ATOMIC_SNAPSHOT',
+      statsConsistency: diag.statsConsistency,
+      liveCapture: this.getLiveCaptureObservation(exchange, {
+        snapshotConsistency: 'SHARED_ATOMIC_SNAPSHOT',
+        sharedContext,
+      }),
+      events: this.getLiveCaptureEvents(exchange, {
+        snapshotConsistency: 'SHARED_ATOMIC_SNAPSHOT',
+        sharedContext,
+      }),
+      summary: this.getLiveCaptureSummary(exchange, {
+        snapshotConsistency: 'SHARED_ATOMIC_SNAPSHOT',
+        sharedContext,
+      }),
+    };
+  }
+
   public getRawDb(): DatabaseSync {
     return this.db;
   }
 
+  // ============================================================================
+  // Auto-Backtest Config & Batch Logs + External Notification Persistence
+  // ============================================================================
+
+  public getAutoBacktestConfig(): AutoBacktestConfig {
+    const row = this.db
+      .prepare('SELECT * FROM auto_backtest_config WHERE id = 1 LIMIT 1')
+      .get() as Record<string, unknown> | undefined;
+    if (!row) {
+      const nowIso = new Date().toISOString();
+      return {
+        enabled: false,
+        intervalMs: 3_600_000,
+        timeframe: '15m',
+        maxSymbolsPerRun: 15,
+        includeWatchlist: true,
+        watchlistSymbols: ['BTCUSDT', 'ETHUSDT'],
+        exchange: 'binance_usdm',
+        updatedAt: nowIso,
+      };
+    }
+    let watchlist: string[] = ['BTCUSDT', 'ETHUSDT'];
+    try {
+      const parsed = JSON.parse(String(row.watchlist_symbols_json || '[]'));
+      if (Array.isArray(parsed)) {
+        watchlist = parsed
+          .map((s) => String(s).trim().toUpperCase())
+          .filter(Boolean);
+      }
+    } catch {
+      watchlist = ['BTCUSDT', 'ETHUSDT'];
+    }
+    const tf = String(row.timeframe || '15m');
+    const validTf: Timeframe =
+      tf === '5m' || tf === '15m' || tf === '1h' || tf === '4h' ? tf : '15m';
+    const ex = String(row.exchange || 'binance_usdm') as ExchangeId;
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      intervalMs: Math.max(60_000, Number(row.interval_ms ?? 3_600_000)),
+      timeframe: validTf,
+      maxSymbolsPerRun: Math.min(
+        30,
+        Math.max(1, Number(row.max_symbols_per_run ?? 15))
+      ),
+      includeWatchlist: Number(row.include_watchlist ?? 1) === 1,
+      watchlistSymbols: watchlist,
+      exchange: ex,
+      updatedAt: String(row.updated_at || new Date().toISOString()),
+    };
+  }
+
+  public saveAutoBacktestConfig(
+    patch: Partial<Omit<AutoBacktestConfig, 'updatedAt'>>
+  ): AutoBacktestConfig {
+    const current = this.getAutoBacktestConfig();
+    const next: AutoBacktestConfig = {
+      enabled:
+        patch.enabled !== undefined ? Boolean(patch.enabled) : current.enabled,
+      intervalMs:
+        patch.intervalMs !== undefined && Number.isFinite(patch.intervalMs)
+          ? Math.max(60_000, Math.round(patch.intervalMs))
+          : current.intervalMs,
+      timeframe:
+        patch.timeframe &&
+        ['5m', '15m', '1h', '4h'].includes(patch.timeframe)
+          ? patch.timeframe
+          : current.timeframe,
+      maxSymbolsPerRun:
+        patch.maxSymbolsPerRun !== undefined &&
+        Number.isFinite(patch.maxSymbolsPerRun)
+          ? Math.min(30, Math.max(1, Math.round(patch.maxSymbolsPerRun)))
+          : current.maxSymbolsPerRun,
+      includeWatchlist:
+        patch.includeWatchlist !== undefined
+          ? Boolean(patch.includeWatchlist)
+          : current.includeWatchlist,
+      watchlistSymbols: Array.isArray(patch.watchlistSymbols)
+        ? [
+            ...new Set(
+              patch.watchlistSymbols
+                .map((s) => String(s).trim().toUpperCase())
+                .filter((s) => /^[A-Z0-9]{4,20}$/.test(s))
+            ),
+          ].slice(0, 40)
+        : current.watchlistSymbols,
+      exchange: patch.exchange ?? current.exchange,
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO auto_backtest_config (
+          id, enabled, interval_ms, timeframe, max_symbols_per_run,
+          include_watchlist, watchlist_symbols_json, exchange, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          enabled = excluded.enabled,
+          interval_ms = excluded.interval_ms,
+          timeframe = excluded.timeframe,
+          max_symbols_per_run = excluded.max_symbols_per_run,
+          include_watchlist = excluded.include_watchlist,
+          watchlist_symbols_json = excluded.watchlist_symbols_json,
+          exchange = excluded.exchange,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        next.enabled ? 1 : 0,
+        next.intervalMs,
+        next.timeframe,
+        next.maxSymbolsPerRun,
+        next.includeWatchlist ? 1 : 0,
+        JSON.stringify(next.watchlistSymbols),
+        next.exchange,
+        next.updatedAt
+      );
+    return next;
+  }
+
+  public recordAutoBacktestBatch(
+    batch: AutoBacktestBatchRunRecord
+  ): AutoBacktestBatchRunRecord {
+    this.db
+      .prepare(
+        `
+        INSERT INTO auto_backtest_batches (
+          batch_id, exchange, timeframe, started_at, completed_at, status,
+          target_symbols_json, completed_count, skipped_cached_count,
+          failed_count, saved_run_ids_json, note, duration_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(batch_id) DO UPDATE SET
+          completed_at = excluded.completed_at,
+          status = excluded.status,
+          completed_count = excluded.completed_count,
+          skipped_cached_count = excluded.skipped_cached_count,
+          failed_count = excluded.failed_count,
+          saved_run_ids_json = excluded.saved_run_ids_json,
+          note = excluded.note,
+          duration_ms = excluded.duration_ms
+      `
+      )
+      .run(
+        batch.batchId,
+        batch.exchange,
+        batch.timeframe,
+        batch.startedAt,
+        batch.completedAt,
+        batch.status,
+        JSON.stringify(batch.targetSymbols),
+        batch.completedCount,
+        batch.skippedCachedCount,
+        batch.failedCount,
+        JSON.stringify(batch.savedRunIds),
+        batch.note,
+        batch.durationMs
+      );
+    return batch;
+  }
+
+  public listAutoBacktestBatches(limit = 20): AutoBacktestBatchRunRecord[] {
+    const rows = this.db
+      .prepare(
+        'SELECT * FROM auto_backtest_batches ORDER BY started_at DESC LIMIT ?'
+      )
+      .all(limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      batchId: String(r.batch_id),
+      exchange: String(r.exchange) as ExchangeId,
+      timeframe: String(r.timeframe) as Timeframe,
+      startedAt: String(r.started_at),
+      completedAt: r.completed_at ? String(r.completed_at) : null,
+      status: String(r.status) as AutoBacktestBatchRunRecord['status'],
+      targetSymbols: JSON.parse(String(r.target_symbols_json || '[]')),
+      completedCount: Number(r.completed_count ?? 0),
+      skippedCachedCount: Number(r.skipped_cached_count ?? 0),
+      failedCount: Number(r.failed_count ?? 0),
+      savedRunIds: JSON.parse(String(r.saved_run_ids_json || '[]')),
+      note: String(r.note || ''),
+      durationMs: Number(r.duration_ms ?? 0),
+    }));
+  }
+
+  public hasRecentBacktestForSymbol(params: {
+    symbol: string;
+    exchange: ExchangeId;
+    timeframe: Timeframe;
+    ruleVersion: string;
+    minCreatedAfterIso: string;
+  }): boolean {
+    const row = this.db
+      .prepare(
+        `
+        SELECT id FROM backtest_reports
+        WHERE symbol = ?
+          AND exchange = ?
+          AND timeframe = ?
+          AND (rule_version = ? OR scanner_rule_version = ?)
+          AND created_at >= ?
+          AND status = 'COMPLETED'
+        ORDER BY id DESC
+        LIMIT 1
+      `
+      )
+      .get(
+        params.symbol,
+        params.exchange,
+        params.timeframe,
+        params.ruleVersion,
+        params.ruleVersion,
+        params.minCreatedAfterIso
+      ) as { id?: number } | undefined;
+    return Boolean(row?.id);
+  }
+
+  public getExternalNotificationConfig(): ExternalNotificationConfig {
+    const row = this.db
+      .prepare('SELECT * FROM external_notification_config WHERE id = 1 LIMIT 1')
+      .get() as Record<string, unknown> | undefined;
+    if (!row) {
+      return {
+        telegramEnabled: false,
+        discordEnabled: false,
+        notifyFormalSmc: true,
+        notifyEarlyIgnition: true,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    return {
+      telegramEnabled: Number(row.telegram_enabled ?? 0) === 1,
+      discordEnabled: Number(row.discord_enabled ?? 0) === 1,
+      notifyFormalSmc: Number(row.notify_formal_smc ?? 1) === 1,
+      notifyEarlyIgnition: Number(row.notify_early_ignition ?? 1) === 1,
+      updatedAt: String(row.updated_at || new Date().toISOString()),
+    };
+  }
+
+  public saveExternalNotificationConfig(
+    patch: Partial<Omit<ExternalNotificationConfig, 'updatedAt'>>
+  ): ExternalNotificationConfig {
+    const current = this.getExternalNotificationConfig();
+    const next: ExternalNotificationConfig = {
+      telegramEnabled:
+        patch.telegramEnabled !== undefined
+          ? Boolean(patch.telegramEnabled)
+          : current.telegramEnabled,
+      discordEnabled:
+        patch.discordEnabled !== undefined
+          ? Boolean(patch.discordEnabled)
+          : current.discordEnabled,
+      notifyFormalSmc:
+        patch.notifyFormalSmc !== undefined
+          ? Boolean(patch.notifyFormalSmc)
+          : current.notifyFormalSmc,
+      notifyEarlyIgnition:
+        patch.notifyEarlyIgnition !== undefined
+          ? Boolean(patch.notifyEarlyIgnition)
+          : current.notifyEarlyIgnition,
+      updatedAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        `
+        INSERT INTO external_notification_config (
+          id, telegram_enabled, discord_enabled,
+          notify_formal_smc, notify_early_ignition, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          telegram_enabled = excluded.telegram_enabled,
+          discord_enabled = excluded.discord_enabled,
+          notify_formal_smc = excluded.notify_formal_smc,
+          notify_early_ignition = excluded.notify_early_ignition,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        next.telegramEnabled ? 1 : 0,
+        next.discordEnabled ? 1 : 0,
+        next.notifyFormalSmc ? 1 : 0,
+        next.notifyEarlyIgnition ? 1 : 0,
+        next.updatedAt
+      );
+    return next;
+  }
+
+  public recordExternalNotificationLog(
+    log: ExternalNotificationDispatchLog
+  ): ExternalNotificationDispatchLog {
+    this.db
+      .prepare(
+        `
+        INSERT INTO external_notification_logs (
+          id, channel, symbol, track, action_state, status, reason,
+          http_status, is_test, message_preview, dedupe_key, cooldown_until, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        log.id,
+        log.channel,
+        log.symbol,
+        log.track,
+        log.actionState,
+        log.status,
+        log.reason,
+        log.httpStatus,
+        log.isTest ? 1 : 0,
+        log.messagePreview,
+        log.dedupeKey,
+        log.cooldownUntil,
+        log.createdAt
+      );
+    return log;
+  }
+
+  public listExternalNotificationLogs(
+    limit = 40
+  ): ExternalNotificationDispatchLog[] {
+    const rows = this.db
+      .prepare(
+        'SELECT * FROM external_notification_logs ORDER BY created_at DESC LIMIT ?'
+      )
+      .all(limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      channel: String(r.channel) as ExternalNotificationChannel,
+      symbol: String(r.symbol),
+      track: String(r.track) as ExternalNotificationSignalTrack,
+      actionState: String(r.action_state),
+      status: String(r.status) as ExternalNotificationStatus,
+      reason: String(r.reason),
+      httpStatus:
+        r.http_status !== null && r.http_status !== undefined
+          ? Number(r.http_status)
+          : null,
+      isTest: Number(r.is_test ?? 0) === 1,
+      messagePreview: String(r.message_preview || ''),
+      dedupeKey: r.dedupe_key ? String(r.dedupe_key) : null,
+      cooldownUntil: r.cooldown_until ? String(r.cooldown_until) : null,
+      createdAt: String(r.created_at),
+    }));
+  }
+
+  public getPositionSentinelConfig(): PositionSentinelConfig {
+    const row = this.db
+      .prepare('SELECT * FROM position_sentinel_config WHERE id = 1 LIMIT 1')
+      .get() as Record<string, unknown> | undefined;
+    if (!row) {
+      return {
+        enabled: true,
+        autoSyncPaperLedger: true,
+        wsStreamEnabled: true,
+        pollIntervalMs: 15_000,
+        atrShockMultiplier: 1.25,
+        rvolSpikeThreshold: 2.5,
+        stopProximityPct: 0.5,
+        notifyDiscord: true,
+        notifyTelegram: true,
+        notifyMinSeverity: 'WARNING',
+        alertCooldownMs: 180_000,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    return {
+      enabled: Number(row.enabled ?? 1) === 1,
+      autoSyncPaperLedger: Number(row.auto_sync_paper_ledger ?? 1) === 1,
+      wsStreamEnabled: Number(row.ws_stream_enabled ?? 1) === 1,
+      pollIntervalMs: Math.max(5000, Number(row.poll_interval_ms ?? 15_000)),
+      atrShockMultiplier: Math.max(0.5, Number(row.atr_shock_multiplier ?? 1.25)),
+      rvolSpikeThreshold: Math.max(1.2, Number(row.rvol_spike_threshold ?? 2.5)),
+      stopProximityPct: Math.max(0.1, Number(row.stop_proximity_pct ?? 0.5)),
+      notifyDiscord: Number(row.notify_discord ?? 1) === 1,
+      notifyTelegram: Number(row.notify_telegram ?? 1) === 1,
+      notifyMinSeverity:
+        String(row.notify_min_severity) === 'CRITICAL' ? 'CRITICAL' : 'WARNING',
+      alertCooldownMs: Math.max(30_000, Number(row.alert_cooldown_ms ?? 180_000)),
+      updatedAt: String(row.updated_at || new Date().toISOString()),
+    };
+  }
+
+  public savePositionSentinelConfig(
+    patch: Partial<Omit<PositionSentinelConfig, 'updatedAt'>>
+  ): PositionSentinelConfig {
+    const cur = this.getPositionSentinelConfig();
+    const next: PositionSentinelConfig = {
+      enabled: patch.enabled !== undefined ? Boolean(patch.enabled) : cur.enabled,
+      autoSyncPaperLedger:
+        patch.autoSyncPaperLedger !== undefined
+          ? Boolean(patch.autoSyncPaperLedger)
+          : cur.autoSyncPaperLedger,
+      wsStreamEnabled:
+        patch.wsStreamEnabled !== undefined
+          ? Boolean(patch.wsStreamEnabled)
+          : cur.wsStreamEnabled,
+      pollIntervalMs:
+        patch.pollIntervalMs !== undefined && Number.isFinite(patch.pollIntervalMs)
+          ? Math.max(5_000, Math.min(300_000, Math.round(patch.pollIntervalMs)))
+          : cur.pollIntervalMs,
+      atrShockMultiplier:
+        patch.atrShockMultiplier !== undefined &&
+        Number.isFinite(patch.atrShockMultiplier)
+          ? Math.max(0.5, Math.min(5, Number(patch.atrShockMultiplier)))
+          : cur.atrShockMultiplier,
+      rvolSpikeThreshold:
+        patch.rvolSpikeThreshold !== undefined &&
+        Number.isFinite(patch.rvolSpikeThreshold)
+          ? Math.max(1.2, Math.min(10, Number(patch.rvolSpikeThreshold)))
+          : cur.rvolSpikeThreshold,
+      stopProximityPct:
+        patch.stopProximityPct !== undefined &&
+        Number.isFinite(patch.stopProximityPct)
+          ? Math.max(0.1, Math.min(5, Number(patch.stopProximityPct)))
+          : cur.stopProximityPct,
+      notifyDiscord:
+        patch.notifyDiscord !== undefined
+          ? Boolean(patch.notifyDiscord)
+          : cur.notifyDiscord,
+      notifyTelegram:
+        patch.notifyTelegram !== undefined
+          ? Boolean(patch.notifyTelegram)
+          : cur.notifyTelegram,
+      notifyMinSeverity:
+        patch.notifyMinSeverity === 'CRITICAL'
+          ? 'CRITICAL'
+          : patch.notifyMinSeverity === 'WARNING'
+            ? 'WARNING'
+            : cur.notifyMinSeverity,
+      alertCooldownMs:
+        patch.alertCooldownMs !== undefined && Number.isFinite(patch.alertCooldownMs)
+          ? Math.max(30_000, Math.min(3_600_000, Math.round(patch.alertCooldownMs)))
+          : cur.alertCooldownMs,
+      updatedAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        `
+        INSERT INTO position_sentinel_config (
+          id, enabled, auto_sync_paper_ledger, ws_stream_enabled,
+          poll_interval_ms, atr_shock_multiplier, rvol_spike_threshold,
+          stop_proximity_pct, notify_discord, notify_telegram,
+          notify_min_severity, alert_cooldown_ms, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          enabled = excluded.enabled,
+          auto_sync_paper_ledger = excluded.auto_sync_paper_ledger,
+          ws_stream_enabled = excluded.ws_stream_enabled,
+          poll_interval_ms = excluded.poll_interval_ms,
+          atr_shock_multiplier = excluded.atr_shock_multiplier,
+          rvol_spike_threshold = excluded.rvol_spike_threshold,
+          stop_proximity_pct = excluded.stop_proximity_pct,
+          notify_discord = excluded.notify_discord,
+          notify_telegram = excluded.notify_telegram,
+          notify_min_severity = excluded.notify_min_severity,
+          alert_cooldown_ms = excluded.alert_cooldown_ms,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        next.enabled ? 1 : 0,
+        next.autoSyncPaperLedger ? 1 : 0,
+        next.wsStreamEnabled ? 1 : 0,
+        next.pollIntervalMs,
+        next.atrShockMultiplier,
+        next.rvolSpikeThreshold,
+        next.stopProximityPct,
+        next.notifyDiscord ? 1 : 0,
+        next.notifyTelegram ? 1 : 0,
+        next.notifyMinSeverity,
+        next.alertCooldownMs,
+        next.updatedAt
+      );
+    return next;
+  }
+
+  private mapPositionSentinelRow(
+    r: Record<string, unknown>
+  ): PositionSentinelTrackedPosition {
+    return {
+      id: String(r.id),
+      sourceType: (String(r.source_type || 'MANUAL') === 'PAPER_LEDGER'
+        ? 'PAPER_LEDGER'
+        : 'MANUAL') as PositionSentinelSourceType,
+      paperLedgerId:
+        r.paper_ledger_id !== null && r.paper_ledger_id !== undefined
+          ? Number(r.paper_ledger_id)
+          : null,
+      symbol: String(r.symbol).toUpperCase(),
+      exchange: String(r.exchange || 'binance_usdm') as ExchangeId,
+      side: String(r.side) === 'SHORT' ? 'SHORT' : 'LONG',
+      timeframe: (String(r.timeframe || '15m') as Timeframe) || '15m',
+      entryPrice: Number(r.entry_price),
+      invalidationPrice: Number(r.invalidation_price),
+      targetPrice:
+        r.target_price !== null && r.target_price !== undefined
+          ? Number(r.target_price)
+          : null,
+      leverage: Math.max(1, Number(r.leverage ?? 1)),
+      active: Number(r.active ?? 1) === 1,
+      paused: Number(r.paused ?? 0) === 1,
+      notes: String(r.notes || ''),
+      openedAt: String(r.opened_at),
+      updatedAt: String(r.updated_at),
+    };
+  }
+
+  public addPositionSentinelPosition(input: {
+    id?: string;
+    sourceType?: PositionSentinelSourceType;
+    paperLedgerId?: number | null;
+    symbol: string;
+    exchange: ExchangeId;
+    side: 'LONG' | 'SHORT';
+    timeframe?: Timeframe;
+    entryPrice: number;
+    invalidationPrice: number;
+    targetPrice?: number | null;
+    leverage?: number;
+    notes?: string;
+    openedAt?: string;
+  }): PositionSentinelTrackedPosition {
+    const nowIso = new Date().toISOString();
+    const id =
+      input.id ??
+      (input.paperLedgerId
+        ? `ps_paper_${input.paperLedgerId}`
+        : `ps_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+    const symbol = input.symbol.trim().toUpperCase();
+    const timeframe = input.timeframe ?? '15m';
+    const targetPrice =
+      input.targetPrice !== undefined &&
+      input.targetPrice !== null &&
+      Number.isFinite(input.targetPrice) &&
+      input.targetPrice > 0
+        ? input.targetPrice
+        : null;
+    const leverage =
+      input.leverage !== undefined && Number.isFinite(input.leverage)
+        ? Math.max(1, Math.min(125, Number(input.leverage)))
+        : 1;
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO position_sentinel_positions (
+          id, source_type, paper_ledger_id, symbol, exchange, side, timeframe,
+          entry_price, invalidation_price, target_price, leverage,
+          active, paused, notes, opened_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          symbol = excluded.symbol,
+          exchange = excluded.exchange,
+          side = excluded.side,
+          timeframe = excluded.timeframe,
+          entry_price = excluded.entry_price,
+          invalidation_price = excluded.invalidation_price,
+          target_price = excluded.target_price,
+          leverage = excluded.leverage,
+          active = 1,
+          notes = excluded.notes,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        id,
+        input.sourceType ?? 'MANUAL',
+        input.paperLedgerId ?? null,
+        symbol,
+        input.exchange,
+        input.side,
+        timeframe,
+        input.entryPrice,
+        input.invalidationPrice,
+        targetPrice,
+        leverage,
+        (input.notes ?? '').slice(0, 400),
+        input.openedAt ?? nowIso,
+        nowIso
+      );
+
+    return this.getPositionSentinelPositionById(id)!;
+  }
+
+  public updatePositionSentinelPosition(
+    id: string,
+    patch: {
+      invalidationPrice?: number;
+      targetPrice?: number | null;
+      leverage?: number;
+      paused?: boolean;
+      active?: boolean;
+      notes?: string;
+    }
+  ): PositionSentinelTrackedPosition | null {
+    const existing = this.getPositionSentinelPositionById(id);
+    if (!existing) return null;
+
+    const nextInv =
+      patch.invalidationPrice !== undefined &&
+      Number.isFinite(patch.invalidationPrice) &&
+      patch.invalidationPrice > 0
+        ? patch.invalidationPrice
+        : existing.invalidationPrice;
+    const nextTarget =
+      patch.targetPrice === null
+        ? null
+        : patch.targetPrice !== undefined &&
+            Number.isFinite(patch.targetPrice) &&
+            patch.targetPrice > 0
+          ? patch.targetPrice
+          : existing.targetPrice;
+    const nextLev =
+      patch.leverage !== undefined && Number.isFinite(patch.leverage)
+        ? Math.max(1, Math.min(125, Number(patch.leverage)))
+        : existing.leverage;
+    const nextPaused =
+      patch.paused !== undefined ? Boolean(patch.paused) : existing.paused;
+    const nextActive =
+      patch.active !== undefined ? Boolean(patch.active) : existing.active;
+    const nextNotes =
+      patch.notes !== undefined ? patch.notes.slice(0, 400) : existing.notes;
+    const nowIso = new Date().toISOString();
+
+    this.db
+      .prepare(
+        `
+        UPDATE position_sentinel_positions
+        SET invalidation_price = ?, target_price = ?, leverage = ?,
+            paused = ?, active = ?, notes = ?, updated_at = ?
+        WHERE id = ?
+      `
+      )
+      .run(
+        nextInv,
+        nextTarget,
+        nextLev,
+        nextPaused ? 1 : 0,
+        nextActive ? 1 : 0,
+        nextNotes,
+        nowIso,
+        id
+      );
+
+    return this.getPositionSentinelPositionById(id);
+  }
+
+  public deletePositionSentinelPosition(id: string): boolean {
+    const res = this.db
+      .prepare('DELETE FROM position_sentinel_positions WHERE id = ?')
+      .run(id);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  public getPositionSentinelPositionById(
+    id: string
+  ): PositionSentinelTrackedPosition | null {
+    const row = this.db
+      .prepare('SELECT * FROM position_sentinel_positions WHERE id = ? LIMIT 1')
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapPositionSentinelRow(row) : null;
+  }
+
+  public listPositionSentinelPositions(options?: {
+    activeOnly?: boolean;
+  }): PositionSentinelTrackedPosition[] {
+    const sql = options?.activeOnly
+      ? 'SELECT * FROM position_sentinel_positions WHERE active = 1 ORDER BY opened_at DESC'
+      : 'SELECT * FROM position_sentinel_positions ORDER BY active DESC, opened_at DESC';
+    const rows = this.db.prepare(sql).all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapPositionSentinelRow(r));
+  }
+
+  public syncOpenPaperLedgerToPositionSentinel(): {
+    importedCount: number;
+    deactivatedCount: number;
+  } {
+    const openLiveEntries = this.listPaperLedgerEntries(500).filter(
+      (e) =>
+        e.status === 'OPEN' &&
+        (e.fillStatus ?? 'FILLED') === 'FILLED' &&
+        !e.isDemo &&
+        e.exchange !== 'demo_synthetic'
+    );
+
+    const openIds = new Set<number>();
+    let importedCount = 0;
+
+    for (const entry of openLiveEntries) {
+      const ledgerId = entry.id;
+      openIds.add(ledgerId);
+      const existing = this.db
+        .prepare(
+          'SELECT id, active FROM position_sentinel_positions WHERE paper_ledger_id = ? LIMIT 1'
+        )
+        .get(ledgerId) as { id: string; active: number } | undefined;
+
+      if (!existing) {
+        this.addPositionSentinelPosition({
+          id: `ps_paper_${ledgerId}`,
+          sourceType: 'PAPER_LEDGER',
+          paperLedgerId: ledgerId,
+          symbol: entry.symbol,
+          exchange: entry.exchange,
+          side: entry.side,
+          timeframe: entry.timeframe,
+          entryPrice: entry.entryPrice,
+          invalidationPrice: entry.invalidationPrice,
+          targetPrice: entry.targetPrice,
+          leverage: 1,
+          notes: String(entry.entryAnchorLabel || '紙上帳本自動同步守護'),
+          openedAt: entry.openedAt,
+        });
+        importedCount++;
+      }
+    }
+
+    const trackedPaper = this.db
+      .prepare(
+        `SELECT id, paper_ledger_id FROM position_sentinel_positions
+         WHERE source_type = 'PAPER_LEDGER' AND active = 1`
+      )
+      .all() as Array<{ id: string; paper_ledger_id: number | null }>;
+    let deactivatedCount = 0;
+    const nowIso = new Date().toISOString();
+    for (const tp of trackedPaper) {
+      if (tp.paper_ledger_id !== null && !openIds.has(Number(tp.paper_ledger_id))) {
+        this.db
+          .prepare(
+            'UPDATE position_sentinel_positions SET active = 0, updated_at = ? WHERE id = ?'
+          )
+          .run(nowIso, tp.id);
+        deactivatedCount++;
+      }
+    }
+
+    return { importedCount, deactivatedCount };
+  }
+
+  public recordPositionSentinelAlert(
+    alert: PositionSentinelAlert
+  ): PositionSentinelAlert {
+    this.db
+      .prepare(
+        `
+        INSERT INTO position_sentinel_alerts (
+          id, position_id, symbol, exchange, side, severity, health_state,
+          event_type, title_zh, detail_zh, price_at_event,
+          suggested_defense_price, confirmed_close, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        alert.id,
+        alert.positionId,
+        alert.symbol,
+        alert.exchange,
+        alert.side,
+        alert.severity,
+        alert.healthState,
+        alert.eventType,
+        alert.titleZh,
+        alert.detailZh,
+        alert.priceAtEvent,
+        alert.suggestedDefensePrice,
+        alert.confirmedClose ? 1 : 0,
+        alert.createdAt
+      );
+    // Keep table bounded to latest 500 alerts
+    this.db.exec(`
+      DELETE FROM position_sentinel_alerts
+      WHERE id NOT IN (
+        SELECT id FROM position_sentinel_alerts ORDER BY created_at DESC LIMIT 500
+      )
+    `);
+    return alert;
+  }
+
+  public listPositionSentinelAlerts(options?: {
+    positionId?: string;
+    limit?: number;
+  }): PositionSentinelAlert[] {
+    const limit = Math.max(1, Math.min(200, options?.limit ?? 60));
+    const rows = options?.positionId
+      ? (this.db
+          .prepare(
+            'SELECT * FROM position_sentinel_alerts WHERE position_id = ? ORDER BY created_at DESC LIMIT ?'
+          )
+          .all(options.positionId, limit) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare(
+            'SELECT * FROM position_sentinel_alerts ORDER BY created_at DESC LIMIT ?'
+          )
+          .all(limit) as Array<Record<string, unknown>>);
+
+    return rows.map((r) => ({
+      id: String(r.id),
+      positionId: String(r.position_id),
+      symbol: String(r.symbol),
+      exchange: String(r.exchange) as ExchangeId,
+      side: String(r.side) === 'SHORT' ? 'SHORT' : 'LONG',
+      severity: String(r.severity) as PositionSentinelAlertSeverity,
+      healthState: String(r.health_state) as PositionHealthState,
+      eventType: String(r.event_type) as PositionSentinelEventType,
+      titleZh: String(r.title_zh),
+      detailZh: String(r.detail_zh),
+      priceAtEvent: Number(r.price_at_event),
+      suggestedDefensePrice:
+        r.suggested_defense_price !== null && r.suggested_defense_price !== undefined
+          ? Number(r.suggested_defense_price)
+          : null,
+      confirmedClose: Number(r.confirmed_close ?? 0) === 1,
+      createdAt: String(r.created_at),
+    }));
+  }
+
   public close(): void {
+    if (this.dbPath !== ':memory:') {
+      try {
+        this.savePaperLedgerCheckpointToDisk();
+      } catch {
+        // ignore checkpoint error on shutdown
+      }
+      try {
+        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      } catch {
+        // ignore checkpoint error on shutdown
+      }
+    }
     this.db.close();
   }
 }

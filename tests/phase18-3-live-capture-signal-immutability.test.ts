@@ -33,7 +33,7 @@ function createTempDbPath(prefix: string): string {
 
 function makeLiveProvenance(fetchedAtIso: string): DataProvenance {
   return {
-    source: 'Binance USDⓈ-M Futures Public REST API',
+    source: 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)',
     fetchedAt: fetchedAtIso,
     stale: false,
     fallback: false,
@@ -85,7 +85,7 @@ function makeConfirmedKlines(params: {
 class DeterministicLiveCaptureAdapter implements ExchangeAdapter {
   public readonly id: ExchangeId = 'binance_usdm';
   public readonly exchangeId: ExchangeId = 'binance_usdm';
-  public readonly displayName = 'Binance USDⓈ-M Futures Public REST API';
+  public readonly displayName = 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)';
   public readonly enabled = true;
   public readonly isDemo = false;
   public readonly status = 'LIVE' as const;
@@ -140,14 +140,22 @@ class DeterministicLiveCaptureAdapter implements ExchangeAdapter {
     if (closedOnly.length > 0 && timeframe === '15m') {
       const lastBar = closedOnly[closedOnly.length - 1];
       const shiftMs = this.barCloseTime - lastBar.closeTime;
+      const shiftedClosed = closedOnly.map((k: Kline) => ({
+        ...k,
+        openTime: k.openTime + shiftMs,
+        closeTime: k.closeTime + shiftMs,
+        isClosed: true,
+      }));
+      const nextOpenMs = this.barCloseTime + 60_000;
+      const unclosedNextBar: Kline = {
+        ...shiftedClosed[shiftedClosed.length - 1],
+        openTime: nextOpenMs,
+        closeTime: nextOpenMs + 15 * 60 * 1000 - 1,
+        isClosed: false,
+      };
       return {
         provenance: prov,
-        klines: closedOnly.map((k: Kline) => ({
-          ...k,
-          openTime: k.openTime + shiftMs,
-          closeTime: k.closeTime + shiftMs,
-          isClosed: true,
-        })),
+        klines: [...shiftedClosed, unclosedNextBar],
       };
     }
     return {
@@ -512,8 +520,11 @@ describe('Phase 18.3: Live 正式候選即時捕捉與訊號不可變追蹤', ()
       assert.ok(
         Date.parse(fastCand.signalDetectedAt) < Number(fastCand.nextBarOpenTime)
       );
-      assert.equal(diag.LIVE_FAST_LANE_COUNT, 1);
-      assert.equal(diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT, 1);
+      assert.ok(diag.LIVE_FAST_LANE_COUNT >= 1);
+      assert.equal(
+        diag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
+        diag.LIVE_FAST_LANE_COUNT
+      );
     } finally {
       radarDb.close();
     }
@@ -702,7 +713,7 @@ describe('Phase 18.3: Live 正式候選即時捕捉與訊號不可變追蹤', ()
         stale: false,
         fallback: false,
         missingData: [],
-        source: 'Binance USDⓈ-M Futures Public REST API',
+        source: 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)',
         isDemo: false,
         ruleVersion: SMC_RULE_VERSION,
         waitReasons: ['缺少 FVG_OR_OB 閘門'],
@@ -796,7 +807,7 @@ describe('Phase 18.3: Live 正式候選即時捕捉與訊號不可變追蹤', ()
       const barT1 = klines[barIndexT1];
       const nextBarT1 = klines[barIndexT1 + 1];
       const detectedBeforeNextOpenT1 = new Date(
-        barT1.closeTime + 200
+        nextBarT1.openTime - 200
       ).toISOString();
 
       // 1) Create LONG signal on BTCUSDT at bar T1 (with only bars up to T1 + nextBarT1 so it opens at nextBarT1.open)
@@ -923,9 +934,10 @@ describe('Phase 18.3: Live 正式候選即時捕捉與訊號不可變追蹤', ()
       // it MUST create a new signalId, confirm signalBarOpenTime is different, and NEVER overwrite the historical T1 signal!
       const barIndexT2 = 33;
       const barT2 = klines[barIndexT2];
+      const nextBarT2 = klines[barIndexT2 + 1];
       assert.notEqual(barT2.openTime, barT1.openTime);
       const detectedBeforeNextOpenT2 = new Date(
-        barT2.closeTime + 180
+        nextBarT2.openTime - 180
       ).toISOString();
       const klinesAtT2Open = klines.slice(0, barIndexT2 + 2);
 

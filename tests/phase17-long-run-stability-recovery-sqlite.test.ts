@@ -9,6 +9,8 @@ import {
   ExchangeAdapter,
   ExchangeApiUnavailableError,
 } from '../server/adapters/ExchangeAdapter.ts';
+import { BacktestDatabase } from '../server/db/BacktestDatabase.ts';
+import { PaperMonitorDatabase } from '../server/db/PaperMonitorDatabase.ts';
 import { RadarDatabase } from '../server/db/RadarDatabase.ts';
 import { runMarketScan } from '../server/engine/MarketScanner.ts';
 import { SMC_RULE_VERSION } from '../server/engine/SmcRuleEngine.ts';
@@ -1752,10 +1754,190 @@ describe('Phase 17: 長時間 Live Paper 掃描穩定性、Worker 恢復、SQLit
     scanner.stop();
     db.close();
   });
+
+  it('22. SQLite "file is not a database" (SQLITE_NOTADB) 啟動恢復、備份還原、SQLITE_BUSY 區分與運行時自動重連測試', async () => {
+    // 1. Error classification: SQLITE_BUSY must NEVER be treated as corruption; file is not a database MUST be treated as corruption
+    assert.equal(
+      RadarDatabase.isSqliteBusyError({
+        code: 'ERR_SQLITE_ERROR',
+        errcode: 5,
+        message: 'database is locked',
+      }),
+      true
+    );
+    assert.equal(
+      RadarDatabase.isSqliteCorruptionError({
+        code: 'ERR_SQLITE_ERROR',
+        errcode: 5,
+        message: 'database is locked',
+      }),
+      false
+    );
+    assert.equal(
+      RadarDatabase.isSqliteCorruptionError({
+        code: 'ERR_SQLITE_ERROR',
+        errcode: 26,
+        message: 'file is not a database',
+      }),
+      true
+    );
+
+    // 2. Startup recovery when main SQLite file is overwritten with non-SQLite garbage ("file is not a database") + valid .backup.sqlite exists
+    const corruptWithBackupPath = path.join(tmpDir, 'p17-notadb-backup.sqlite');
+    const seedDb = new RadarDatabase(corruptWithBackupPath);
+    seedDb.addPaperLedgerEntry({
+      symbol: 'BTCUSDT',
+      exchange: 'binance_usdm',
+      timeframe: '15m',
+      side: 'LONG',
+      category: '多頭候選',
+      actionState: 'LONG CANDIDATE',
+      entryPrice: 95000,
+      invalidationPrice: 93500,
+      targetPrice: 98000,
+      ruleVersion: SMC_RULE_VERSION,
+      evidences: ['Backup recovery verification'],
+      notes: 'Preserve across NOTADB backup restore',
+      provenance: {
+        source: 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)',
+        fetchedAt: new Date().toISOString(),
+        stale: false,
+        fallback: false,
+        missingData: [],
+        isDemo: false,
+      },
+    });
+    const backupCheck = seedDb.performDatabaseHealthCheck('binance_usdm', {
+      runBackup: true,
+    });
+    assert.equal(backupCheck.backupFileVerified, true);
+    seedDb.close();
+
+    // Corrupt main file header -> triggers ERR_SQLITE_ERROR: file is not a database
+    fs.writeFileSync(corruptWithBackupPath, Buffer.from('NOT_A_VALID_SQLITE_HEADER_BYTES'));
+    const recoveredFromBackup = new RadarDatabase(corruptWithBackupPath);
+    const restoredLedger = recoveredFromBackup.listPaperLedgerEntries(10);
+    assert.equal(restoredLedger.length, 1);
+    assert.equal(restoredLedger[0].symbol, 'BTCUSDT');
+    assert.equal(
+      recoveredFromBackup.performDatabaseHealthCheck('binance_usdm').integrityCheck,
+      'ok'
+    );
+    recoveredFromBackup.close();
+
+    // 3. Startup recovery when main DB is 0 bytes (empty file) without backup -> clean schema recreate instead of crash
+    const zeroByteDbPath = path.join(tmpDir, 'p17-notadb-empty.sqlite');
+    fs.writeFileSync(zeroByteDbPath, Buffer.alloc(0));
+    const recoveredEmpty = new RadarDatabase(zeroByteDbPath);
+    assert.equal(
+      recoveredEmpty.performDatabaseHealthCheck('binance_usdm').integrityCheck,
+      'ok'
+    );
+    recoveredEmpty.close();
+
+    // 4. Runtime recovery when open handle encounters "file is not a database" and sibling DB wrappers stay synchronized
+    const runtimeDbPath = path.join(tmpDir, 'p17-runtime-notadb.sqlite');
+    const runtimeRadarDb = new RadarDatabase(runtimeDbPath);
+    const runtimePaperDb = new PaperMonitorDatabase(runtimeRadarDb);
+    const runtimeBacktestDb = new BacktestDatabase(runtimeRadarDb);
+
+    // Replace file on disk cleanly and verify runtime recovery reopens + syncs sibling wrappers
+    runtimeRadarDb.performDatabaseHealthCheck('binance_usdm', { runBackup: true });
+    const recoveredRuntime = runtimeRadarDb.recoverFromRuntimeSqliteError(
+      Object.assign(new Error('file is not a database'), {
+        code: 'ERR_SQLITE_ERROR',
+      }),
+      'binance_usdm'
+    );
+    assert.equal(recoveredRuntime, true);
+    assert.equal(runtimeRadarDb.getSmcScanQueueStats('binance_usdm').totalJobs >= 0, true);
+    assert.equal(Array.isArray(runtimePaperDb.listTrackedSignals({ exchange: 'binance_usdm' })), true);
+    assert.equal(Array.isArray(runtimeBacktestDb.listBacktestRuns(10)), true);
+    assert.equal(Array.isArray(runtimeBacktestDb.listSignalEvidencesByRunId('nonexistent')), true);
+
+    // Also test SmcBatchScanService.checkAndTriggerConfirmed15mBarClose survives runtime DB error cleanly
+    const adapter = createCustomizableLiveAdapter('binance_usdm');
+    const scanner = new SmcBatchScanService({
+      adapters: {
+        binance_usdm: adapter,
+        bybit_linear: adapter,
+        bingx_swap: adapter,
+        demo_synthetic: adapter,
+      },
+      db: runtimeRadarDb,
+      recoverOnStart: false,
+    });
+    const triggered = await scanner.checkAndTriggerConfirmed15mBarClose(
+      'binance_usdm',
+      Date.now()
+    );
+    assert.equal(typeof triggered, 'boolean');
+    scanner.stop();
+    runtimeRadarDb.close();
+  });
+
+  it('23. checkAndTriggerConfirmed15mBarClose 遇到 runtime database disk image is malformed 自動修復並重試測試', async () => {
+    const dbPath = path.join(tmpDir, 'p17-15m-close-malformed.sqlite');
+    const db = new RadarDatabase(dbPath);
+    db.performDatabaseHealthCheck('binance_usdm', { runBackup: true });
+
+    const adapter = createCustomizableLiveAdapter('binance_usdm');
+    const scanner = new SmcBatchScanService({
+      adapters: {
+        binance_usdm: adapter,
+        bybit_linear: adapter,
+        bingx_swap: adapter,
+        demo_synthetic: adapter,
+      },
+      db,
+      recoverOnStart: false,
+    });
+
+    const originalGetStats = db.getSmcScanQueueStats.bind(db);
+    let injectedOnce = false;
+    (db as unknown as { getSmcScanQueueStats: typeof originalGetStats }).getSmcScanQueueStats = (
+      exchange
+    ) => {
+      if (!injectedOnce) {
+        injectedOnce = true;
+        throw Object.assign(new Error('database disk image is malformed'), {
+          code: 'ERR_SQLITE_ERROR',
+          errcode: 11,
+        });
+      }
+      return originalGetStats(exchange);
+    };
+
+    const consoleErrors: string[] = [];
+    const originalConsoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      consoleErrors.push(args.map(String).join(' '));
+    };
+
+    try {
+      const bar15mMs = 15 * 60 * 1000;
+      const boundaryPlus10s = Math.floor(Date.now() / bar15mMs) * bar15mMs + 10_000;
+      const result = await scanner.checkAndTriggerConfirmed15mBarClose(
+        'binance_usdm',
+        boundaryPlus10s
+      );
+      assert.equal(typeof result, 'boolean');
+      assert.equal(injectedOnce, true);
+      assert.equal(
+        consoleErrors.some((msg) =>
+          msg.includes('checkAndTriggerConfirmed15mBarClose error')
+        ),
+        false,
+        'Recovered runtime SQLite corruption should not emit noisy console.error'
+      );
+      assert.equal(
+        db.performDatabaseHealthCheck('binance_usdm').integrityCheck,
+        'ok'
+      );
+    } finally {
+      console.error = originalConsoleError;
+      scanner.stop();
+      db.close();
+    }
+  });
 });
-
-
-
-
-
-

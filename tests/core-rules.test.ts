@@ -21,14 +21,34 @@ import {
 } from '../server/adapters/NotificationAdapter.ts';
 import { RadarDatabase } from '../server/db/RadarDatabase.ts';
 import { BacktestEngine } from '../server/engine/BacktestEngine.ts';
+import {
+  computeBtcCorrelationAnalysis,
+  computeTimeframeBtcCorrelation,
+} from '../server/engine/BtcCorrelationEngine.ts';
 import { evaluateCrossExchangeDivergence } from '../server/engine/CrossExchangeDivergenceEngine.ts';
+import { computeDerivativesStructure } from '../server/engine/DerivativesStructureEngine.ts';
+import {
+  classifyUtcTradingSession,
+  computeKeyLevelsAndSession,
+} from '../server/engine/KeyLevelsSessionEngine.ts';
+import {
+  computeMarketMicrostructure,
+  simulateOrderBookSlippage,
+} from '../server/engine/MicrostructureEngine.ts';
+import {
+  classifySymbolSector,
+  computeMarketBreadthAndSectors,
+} from '../server/engine/SectorBreadthEngine.ts';
 import {
   LOW_LIQUIDITY_POLICY,
   MAX_ALLOWED_SPREAD_PERCENT,
   MIN_QUOTE_VOLUME_24H,
   runMarketScan,
 } from '../server/engine/MarketScanner.ts';
-import { evaluateSmcStructure } from '../server/engine/SmcRuleEngine.ts';
+import {
+  computeEntryZoneAnalysis,
+  evaluateSmcStructure,
+} from '../server/engine/SmcRuleEngine.ts';
 import {
   calculateMad,
   calculateMedian,
@@ -51,7 +71,7 @@ import {
   enforceProvenanceIntegrity,
   isVerifiedLivePublicApiSource,
 } from '../server/utils/provenanceQuarantine.ts';
-import { DataProvenance, MarketTicker } from '../src/types/market.ts';
+import { DataProvenance, Kline, MarketTicker } from '../src/types/market.ts';
 
 // Explicitly marked test fixture provenance (never isDemo: false)
 const testFixtureProvenance: DataProvenance = {
@@ -2772,7 +2792,838 @@ describe('12. 第一層市場雷達與第二層 SMC/ICT 分類分離與 finalTra
     });
     assert.equal(validCandidateRes.status, 'PREVIEW_DRY_RUN');
   });
+
+  it('10. BtcCorrelationEngine：驗證 BTCUSDT 與山寨幣歷史已收盤 K 線重合性、Pearson r、下跌同步率、Beta、反向連動與樣本不足誠實判定', () => {
+    const baseOpen = 1_700_000_000_000;
+    const stepMs = 15 * 60_000;
+    const mkBar = (idx: number, close: number, isClosed = true) => ({
+      openTime: baseOpen + idx * stepMs,
+      open: close * 0.999,
+      high: close * 1.005,
+      low: close * 0.995,
+      close,
+      volume: 1000,
+      closeTime: baseOpen + idx * stepMs + stepMs - 1,
+      quoteVolume: 1_000_000,
+      isClosed,
+    });
+
+    const btcSeries = [mkBar(0, 100)];
+    const coupledAltSeries = [mkBar(0, 10)];
+    const inverseAltSeries = [mkBar(0, 50)];
+    const returns = [
+      0.01, -0.015, 0.02, -0.01, 0.008, -0.02, 0.015, 0.005, -0.012, 0.018,
+      -0.009, 0.011, -0.014, 0.016, -0.008, 0.012, -0.01, 0.014, -0.007, 0.013,
+    ];
+    for (let i = 0; i < returns.length; i++) {
+      const r = returns[i];
+      const prevBtc = btcSeries[btcSeries.length - 1].close;
+      const prevCoupled = coupledAltSeries[coupledAltSeries.length - 1].close;
+      const prevInverse = inverseAltSeries[inverseAltSeries.length - 1].close;
+      btcSeries.push(mkBar(i + 1, prevBtc * (1 + r)));
+      coupledAltSeries.push(mkBar(i + 1, prevCoupled * (1 + r * 1.5)));
+      inverseAltSeries.push(mkBar(i + 1, prevInverse * (1 - r * 1.1)));
+    }
+    // Append an unclosed bar that diverges wildly — must be ignored
+    btcSeries.push(mkBar(returns.length + 1, 100, false));
+    coupledAltSeries.push(mkBar(returns.length + 1, 999999, false));
+
+    const coupledAnalysis = computeBtcCorrelationAnalysis({
+      symbol: 'SOLUSDT',
+      primaryTimeframe: '15m',
+      symbolKlinesByTimeframe: { '15m': coupledAltSeries, '1h': coupledAltSeries },
+      btcKlinesByTimeframe: { '15m': btcSeries, '1h': btcSeries },
+    });
+    assert.equal(coupledAnalysis.status, 'READY');
+    assert.equal(coupledAnalysis.tier, 'HIGH_COUPLED');
+    assert.equal(coupledAnalysis.alignedBars15m, 21);
+    assert.ok((coupledAnalysis.pearson15m ?? 0) > 0.99);
+    assert.equal(coupledAnalysis.directionalOverlap15m, 100);
+    assert.equal(coupledAnalysis.downsideOverlap15m, 100);
+    assert.ok((coupledAnalysis.beta15m ?? 0) > 1.4 && (coupledAnalysis.beta15m ?? 0) < 1.6);
+    assert.ok((coupledAnalysis.byTimeframe['15m']?.series?.length ?? 0) === 21);
+
+    const inverseAnalysis = computeBtcCorrelationAnalysis({
+      symbol: 'INVUSDT',
+      primaryTimeframe: '15m',
+      symbolKlinesByTimeframe: { '15m': inverseAltSeries },
+      btcKlinesByTimeframe: { '15m': btcSeries },
+    });
+    assert.equal(inverseAnalysis.status, 'READY');
+    assert.equal(inverseAnalysis.tier, 'INVERSE');
+    assert.ok((inverseAnalysis.pearson15m ?? 0) < -0.95);
+    assert.equal(inverseAnalysis.directionalOverlap15m, 0);
+
+    const insufficientMetric = computeTimeframeBtcCorrelation(
+      '15m',
+      coupledAltSeries.slice(0, 10),
+      btcSeries.slice(0, 10)
+    );
+    assert.equal(insufficientMetric.status, 'INSUFFICIENT_DATA');
+    assert.equal(insufficientMetric.pearsonCorrelation, null);
+    assert.equal(insufficientMetric.directionalOverlapRate, null);
+
+    const btcSelf = computeBtcCorrelationAnalysis({
+      symbol: 'BTCUSDT',
+      primaryTimeframe: '15m',
+      symbolKlinesByTimeframe: { '15m': btcSeries },
+      btcKlinesByTimeframe: { '15m': btcSeries },
+    });
+    assert.equal(btcSelf.isBenchmark, true);
+    assert.equal(btcSelf.tier, 'BENCHMARK_BTC');
+    assert.equal(btcSelf.pearson15m, 1);
+  });
+
+  it('11. DerivativesStructureEngine：驗證 OI×價格四象限、真實 Taker CVD 買賣背離、資金費率擠壓與清算池估算，以及資料缺失誠實回報 UNAVAILABLE', () => {
+    const baseOpen = 1_700_000_000_000;
+    const stepMs = 15 * 60_000;
+    const klines = Array.from({ length: 20 }, (_, i) => {
+      // Price drifts down overall while second half has strong taker buy absorption
+      const close = i < 10 ? 105 - i * 0.6 : 99 - (i - 10) * 0.25;
+      const buyRatio = i < 10 ? 0.42 : 0.68;
+      const quoteVolume = 1_000_000;
+      return {
+        openTime: baseOpen + i * stepMs,
+        open: close + 0.2,
+        high: i === 5 ? 108 : close + 1.1,
+        low: i === 14 ? 93 : close - 1.0,
+        close,
+        volume: 10_000,
+        closeTime: baseOpen + i * stepMs + stepMs - 1,
+        quoteVolume,
+        takerBuyVolume: 10_000 * buyRatio,
+        takerBuyQuoteVolume: quoteVolume * buyRatio,
+        isClosed: true,
+      };
+    });
+
+    const oiSeries = klines.map((k, i) => ({
+      symbol: 'SOLUSDT',
+      timestamp: k.openTime,
+      openInterest: 100_000 + i * 2_000,
+      openInterestValue: (100_000 + i * 2_000) * k.close,
+      fetchedAt: new Date().toISOString(),
+      source: 'TEST',
+      isDemo: true,
+    }));
+
+    const fundingSeries = [
+      {
+        symbol: 'SOLUSDT',
+        timestamp: baseOpen,
+        fundingRate: -0.0001,
+        fetchedAt: new Date().toISOString(),
+        source: 'TEST',
+        isDemo: true,
+      },
+      {
+        symbol: 'SOLUSDT',
+        timestamp: baseOpen + 8 * 3600_000,
+        fundingRate: -0.00035,
+        fetchedAt: new Date().toISOString(),
+        source: 'TEST',
+        isDemo: true,
+      },
+    ];
+
+    const res = computeDerivativesStructure({
+      symbol: 'SOLUSDT',
+      timeframe: '15m',
+      lastPrice: 97,
+      atr14: 1.5,
+      klines,
+      oiSeries,
+      fundingSeries,
+      currentOiValue: 13_000_000,
+      currentFundingRate: -0.00035,
+    });
+
+    assert.equal(res.oiRegime.status, 'READY');
+    assert.equal(res.oiRegime.regime, 'SHORT_BUILDUP');
+    assert.equal(res.cvd.status, 'READY');
+    assert.equal(res.cvd.divergence, 'BULLISH_ABSORPTION');
+    assert.equal(res.funding.status, 'READY');
+    assert.equal(res.funding.squeezeBias, 'SHORT_SQUEEZE_RISK');
+    assert.ok(res.liquidityClusters.some((c) => c.side === 'BUY_SIDE_LIQ'));
+    assert.ok(res.liquidityClusters.some((c) => c.side === 'SELL_SIDE_LIQ'));
+
+    // Missing takerBuyQuoteVolume & missing OI must report UNAVAILABLE honestly
+    const bareKlines = klines.map(({ takerBuyVolume, takerBuyQuoteVolume, ...rest }) => rest);
+    const unavailableRes = computeDerivativesStructure({
+      symbol: 'NO_CVD_USDT',
+      timeframe: '15m',
+      lastPrice: 97,
+      klines: bareKlines,
+      oiSeries: [],
+      fundingSeries: [],
+      currentFundingRate: null,
+    });
+    assert.equal(unavailableRes.oiRegime.status, 'UNAVAILABLE');
+    assert.equal(unavailableRes.cvd.status, 'UNAVAILABLE');
+    assert.equal(unavailableRes.funding.status, 'UNAVAILABLE');
+  });
+
+  it('12. SectorBreadthEngine：驗證板塊分類、全市場廣度指標與輪動排行榜計算', () => {
+    assert.equal(classifySymbolSector('1000PEPE', '1000PEPEUSDT').key, 'MEME');
+    assert.equal(classifySymbolSector('BTC', 'BTCUSDT').key, 'BTC_ETH');
+    assert.equal(classifySymbolSector('TAO', 'TAOUSDT').key, 'AI');
+    assert.equal(classifySymbolSector('UNI', 'UNIUSDT').key, 'DEFI');
+
+    const tickers: MarketTicker[] = [
+      {
+        symbol: 'BTCUSDT',
+        baseAsset: 'BTC',
+        quoteAsset: 'USDT',
+        lastPrice: 90_000,
+        bidPrice: 89_995,
+        askPrice: 90_005,
+        priceChangePercent24h: 3.5,
+        quoteVolume24h: 8_000_000_000,
+        fundingRate: 0.0001,
+        nextFundingTime: Date.now(),
+        openInterest: null,
+        openInterestValue: null,
+        provenance: testFixtureProvenance,
+      },
+      {
+        symbol: 'TAOUSDT',
+        baseAsset: 'TAO',
+        quoteAsset: 'USDT',
+        lastPrice: 520,
+        bidPrice: 519.8,
+        askPrice: 520.2,
+        priceChangePercent24h: 8.2,
+        quoteVolume24h: 450_000_000,
+        fundingRate: 0.0001,
+        nextFundingTime: Date.now(),
+        openInterest: null,
+        openInterestValue: null,
+        provenance: testFixtureProvenance,
+      },
+      {
+        symbol: '1000PEPEUSDT',
+        baseAsset: '1000PEPE',
+        quoteAsset: 'USDT',
+        lastPrice: 0.02,
+        bidPrice: 0.01999,
+        askPrice: 0.02001,
+        priceChangePercent24h: -2.4,
+        quoteVolume24h: 600_000_000,
+        fundingRate: 0.0001,
+        nextFundingTime: Date.now(),
+        openInterest: null,
+        openInterestValue: null,
+        provenance: testFixtureProvenance,
+      },
+    ];
+
+    const scan = runMarketScan(tickers, testFixtureProvenance, { mode: 'demo' });
+    const { marketBreadth, sectorRotation } = computeMarketBreadthAndSectors(
+      scan.candidates
+    );
+    assert.equal(marketBreadth.totalSymbols, 3);
+    assert.equal(marketBreadth.advancingCount, 2);
+    assert.equal(marketBreadth.decliningCount, 1);
+    assert.equal(sectorRotation[0].key, 'AI');
+    assert.equal(sectorRotation[0].topLeaderSymbol, 'TAOUSDT');
+  });
+
+  it('13. MicrostructureEngine：驗證期現基差狀態、盤口 OBI 失衡、巨鯨掛單牆、市價滑點模擬與無資料誠實降級', () => {
+    const evaluatedAt = new Date().toISOString();
+    const bids = Array.from({ length: 20 }, (_, i) => ({
+      price: 100 - (i + 1) * 0.03,
+      quantity: i === 3 ? 2500 : 200, // huge bid wall at level 4 ($250k)
+    }));
+    const asks = Array.from({ length: 20 }, (_, i) => ({
+      price: 100 + (i + 1) * 0.03,
+      quantity: 120,
+    }));
+
+    const slip = simulateOrderBookSlippage(asks, 50_000, 100);
+    assert.ok(slip.slippageBps !== null && slip.slippageBps > 0);
+    assert.equal(slip.depthCovered, true);
+
+    const ready = computeMarketMicrostructure({
+      symbol: 'SOLUSDT',
+      perpPrice: 100.2,
+      perpQuoteVolume24h: 800_000_000,
+      spotTicker: {
+        symbol: 'SOLUSDT',
+        spotSymbol: 'SOLUSDT',
+        priceMultiplier: 1,
+        spotPrice: 100.0,
+        spotQuoteVolume24h: 100_000_000,
+        spotPriceChangePercent24h: 2.1,
+        provenance: testFixtureProvenance,
+      },
+      orderbook: {
+        symbol: 'SOLUSDT',
+        bids,
+        asks,
+        provenance: testFixtureProvenance,
+      },
+      evaluatedAt,
+    });
+
+    assert.equal(ready.spotPerpBasis.status, 'READY');
+    assert.equal(ready.spotPerpBasis.regime, 'PERP_OVERHEATED_PREMIUM');
+    assert.equal(ready.spotPerpBasis.perpToSpotVolumeRatio, 8);
+    assert.equal(ready.orderbook.status, 'READY');
+    assert.ok((ready.orderbook.obi50bpsPct ?? 0) > 20);
+    assert.ok(ready.orderbook.bidWalls.length >= 1);
+    assert.equal(ready.orderbook.slippageTiers.length, 3);
+
+    const unavailable = computeMarketMicrostructure({
+      symbol: 'FUTURESONLYUSDT',
+      perpPrice: 50,
+      perpQuoteVolume24h: 20_000_000,
+      spotTicker: null,
+      orderbook: null,
+      evaluatedAt,
+    });
+    assert.equal(unavailable.spotPerpBasis.status, 'UNAVAILABLE');
+    assert.equal(unavailable.spotPerpBasis.regime, 'UNAVAILABLE');
+    assert.equal(unavailable.orderbook.status, 'UNAVAILABLE');
+  });
+
+  it('14. KeyLevelsSessionEngine：驗證 PDH/PDL、日/週開盤價、日內錨定 VWAP ±1σ、Killzone 分類與費率結算預警', () => {
+    // Fixed Wednesday 2026-11-18 14:30 UTC (US_EQUITY_OPEN)
+    const nowMs = Date.UTC(2026, 10, 18, 14, 30, 0);
+    const evaluatedAt = new Date(nowMs).toISOString();
+    const hourMs = 3600_000;
+    const todayStart = Date.UTC(2026, 10, 18, 0, 0, 0);
+    const yesterdayStart = todayStart - 24 * hourMs;
+    const mondayStart = Date.UTC(2026, 10, 16, 0, 0, 0);
+
+    // Build 1h klines covering yesterday (24h) + today (15h)
+    const klines1h: Kline[] = [];
+    for (let h = 0; h < 24; h++) {
+      const openTime = yesterdayStart + h * hourMs;
+      klines1h.push({
+        openTime,
+        open: 100,
+        high: h === 10 ? 112 : 104, // PDH = 112
+        low: h === 5 ? 92 : 98, // PDL = 92
+        close: 101,
+        volume: 1000,
+        closeTime: openTime + hourMs - 1,
+        quoteVolume: 101_000,
+        isClosed: true,
+      });
+    }
+    for (let h = 0; h < 15; h++) {
+      const openTime = todayStart + h * hourMs;
+      const base = h === 0 ? 105 : 108 + h * 0.25;
+      klines1h.push({
+        openTime,
+        open: base,
+        high: base + 1,
+        low: base - 1,
+        close: base + 0.5,
+        volume: 1200,
+        closeTime: openTime + hourMs - 1,
+        quoteVolume: 130_000,
+        isClosed: h < 14,
+      });
+    }
+
+    const klines4h: Kline[] = [
+      {
+        openTime: mondayStart,
+        open: 99.5, // Weekly Open = 99.5
+        high: 102,
+        low: 98,
+        close: 101,
+        volume: 4000,
+        closeTime: mondayStart + 4 * hourMs - 1,
+        quoteVolume: 400_000,
+        isClosed: true,
+      },
+    ];
+
+    const res = computeKeyLevelsAndSession({
+      symbol: 'SOLUSDT',
+      primaryTimeframe: '1h',
+      lastPrice: 111.7, // within 0.65% of PDH (112)
+      primaryKlines: klines1h,
+      klines1h,
+      klines4h,
+      nextFundingTime: nowMs + 10 * 60 * 1000, // 10 min left -> warning soon
+      nowMs,
+      evaluatedAt,
+    });
+
+    assert.equal(res.pdh, 112);
+    assert.equal(res.pdl, 92);
+    assert.equal(res.dailyOpen, 105);
+    assert.equal(res.weeklyOpen, 99.5);
+    assert.ok(res.vwap !== null && res.vwap > 105 && res.vwap < 113);
+    assert.ok(res.vwapUpper1 !== null && res.vwapUpper1 >= res.vwap);
+    assert.ok(res.vwapLower1 !== null && res.vwapLower1 <= res.vwap);
+    assert.equal(res.session.activeSession, 'US_EQUITY_OPEN');
+    assert.equal(res.session.fundingWarningSoon, true);
+    assert.ok(res.proximityWarningZh?.includes('PDH'));
+    assert.equal(classifyUtcTradingSession(8).activeSession, 'LONDON_KILLZONE');
+    assert.equal(classifyUtcTradingSession(2).activeSession, 'ASIA');
+  });
 });
+
+describe('早鳥起漲偵測 (Early Ignition) 與 防追高回踩區間評估 (Entry Zone / Anti-Chase)', () => {
+  it('1. computeEntryZoneAnalysis 在價格偏離 FVG/OB 超過 2x ATR 時輸出 OVEREXTENDED 並對比追價 vs 回踩 R:R，回踩區間內則輸出 IN_DISCOUNT_ZONE', () => {
+    const fvg = {
+      detected: true,
+      direction: 'BULL' as const,
+      bottom: 100,
+      top: 102,
+      mitigated: false,
+      candleTime: Date.now() - 60_000,
+      description: 'Bullish FVG [100–102]',
+    };
+    const ob = {
+      detected: true,
+      direction: 'BULL' as const,
+      low: 98.5,
+      high: 100,
+      candleTime: Date.now() - 120_000,
+      description: 'Bullish OB [98.5–100]',
+    };
+    const sweep = {
+      detected: true,
+      side: 'SELL_SIDE_SWEPT' as const,
+      sweptLevel: 98,
+      candleTime: Date.now() - 180_000,
+      description: 'Sweep @ 98',
+    };
+
+    const overextended = computeEntryZoneAnalysis({
+      direction: 'LONG',
+      currentPrice: 108, // +6 above zoneTop=102 -> 3.0x ATR (atr=2)
+      atr14: 2,
+      fvg,
+      orderBlock: ob,
+      liquiditySweep: sweep,
+    });
+
+    assert.equal(overextended.status, 'OVEREXTENDED');
+    assert.equal(overextended.anchorType, 'FVG');
+    assert.equal(overextended.distanceToZoneAtr, 3);
+    assert.ok(
+      overextended.pullbackRR !== null &&
+        overextended.chaseRR !== null &&
+        overextended.pullbackRR > overextended.chaseRR,
+      '延伸過度時，回踩掛單盈虧比必須明顯優於現價追單'
+    );
+
+    const pullback = computeEntryZoneAnalysis({
+      direction: 'LONG',
+      currentPrice: 101, // inside [100, 102]
+      atr14: 2,
+      fvg,
+      orderBlock: ob,
+      liquiditySweep: sweep,
+    });
+
+    assert.equal(pullback.status, 'IN_DISCOUNT_ZONE');
+    assert.equal(pullback.distanceToZoneAtr, 0);
+  });
+
+  it('2. MarketScanner 早鳥起漲偵測只捕捉溫和漲幅剛放量標的、排除 24h 已暴漲末班車，且絕不更動嚴格 SMC 狀態', () => {
+    const nowIso = new Date().toISOString();
+    const prov = {
+      source: 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)',
+      fetchedAt: nowIso,
+      stale: false,
+      fallback: false,
+      missingData: [] as string[],
+      isDemo: false,
+    };
+
+    const earlyBaseline = Array.from({ length: 35 }, (_, idx) => 1_000_000 + (idx % 5) * 150_000);
+    earlyBaseline.push(2_400_000); // fresh RVOL ~1.85x, Z ~ 3.5
+    const chaseBaseline = Array.from({ length: 35 }, (_, idx) => 1_000_000 + (idx % 5) * 150_000);
+    chaseBaseline.push(2_600_000);
+
+    const tickers: MarketTicker[] = [
+      {
+        symbol: 'BTCUSDT',
+        baseAsset: 'BTC',
+        quoteAsset: 'USDT',
+        lastPrice: 90000,
+        bidPrice: 89999,
+        askPrice: 90001,
+        priceChangePercent24h: 0.8,
+        quoteVolume24h: 10_000_000_000,
+        fundingRate: 0.0001,
+        nextFundingTime: Date.now() + 3600_000,
+        openInterest: 50000,
+        openInterestValue: 4_500_000_000,
+        provenance: prov,
+      },
+      {
+        symbol: 'EARLYUSDT',
+        baseAsset: 'EARLY',
+        quoteAsset: 'USDT',
+        lastPrice: 10,
+        bidPrice: 9.995,
+        askPrice: 10.005,
+        priceChangePercent24h: 3.2, // sweet-spot early move
+        quoteVolume24h: 80_000_000,
+        fundingRate: 0.0001,
+        nextFundingTime: Date.now() + 3600_000,
+        openInterest: 1_000_000,
+        openInterestValue: 10_000_000,
+        provenance: prov,
+      },
+      {
+        symbol: 'LATECHASEUSDT',
+        baseAsset: 'LATECHASE',
+        quoteAsset: 'USDT',
+        lastPrice: 20,
+        bidPrice: 19.99,
+        askPrice: 20.01,
+        priceChangePercent24h: 18.5, // already ran 18.5% -> excluded from early bird
+        quoteVolume24h: 90_000_000,
+        fundingRate: 0.0001,
+        nextFundingTime: Date.now() + 3600_000,
+        openInterest: 1_000_000,
+        openInterestValue: 20_000_000,
+        provenance: prov,
+      },
+    ];
+
+    const histMap = new Map<string, number[]>([
+      ['EARLYUSDT', earlyBaseline],
+      ['LATECHASEUSDT', chaseBaseline],
+    ]);
+
+    const scan = runMarketScan(tickers, prov, {
+      mode: 'live',
+      exchange: 'binance_usdm',
+      volumeTimeframe: '15m',
+      historicalVolumeMap: histMap,
+    });
+
+    const earlyCand = scan.candidates.find((c) => c.symbol === 'EARLYUSDT');
+    const lateCand = scan.candidates.find((c) => c.symbol === 'LATECHASEUSDT');
+    assert.ok(earlyCand?.earlyIgnition);
+    assert.equal(earlyCand.earlyIgnition.status, 'IGNITION_LONG');
+    assert.equal(earlyCand.smcActionState, 'PENDING');
+    assert.equal(earlyCand.finalTradeSignal, 'NONE');
+
+    assert.ok(lateCand?.earlyIgnition);
+    assert.equal(lateCand.earlyIgnition.status, 'NONE');
+  });
+
+  it('3. 多軌紙上帳本 (早鳥 vs 正式 SMC 現價 vs FVG/OB 回踩限價)：WAITING_LIMIT 觸價轉成交與分軌勝率 Delta 統計與 Live/Demo 隔離', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'paper_tracks_'));
+    const db = new RadarDatabase(path.join(tmpDir, 'test.db'));
+    const liveProv = {
+      source: 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)',
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [] as string[],
+      isDemo: false,
+    };
+    const demoProv = {
+      source: 'DEMO_SYNTHETIC_DATASET',
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [] as string[],
+      isDemo: true,
+    };
+
+    try {
+      // 1) Pullback Limit order waiting at 100 (stop 95, target 110 -> +2R)
+      const pullbackEntry = db.addPaperLedgerEntry({
+        symbol: 'ETHUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'SMC_PULLBACK_LIMIT',
+        fillStatus: 'WAITING_LIMIT',
+        entryAnchorLabel: '未回補多頭 FVG 折價區',
+        entryPrice: 100,
+        invalidationPrice: 95,
+        targetPrice: 110,
+        ruleVersion: 'v2-test',
+        evidences: ['FVG Pullback'],
+        provenance: liveProv,
+      });
+      assert.equal(pullbackEntry.fillStatus, 'WAITING_LIMIT');
+      assert.equal(pullbackEntry.filledAt, null);
+
+      // Price is 105 (above 100): must stay WAITING_LIMIT with 0R
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['ETHUSDT', 105]])
+      );
+      let checked = db.getPaperLedgerEntryById(pullbackEntry.id)!;
+      assert.equal(checked.fillStatus, 'WAITING_LIMIT');
+      assert.equal(checked.status, 'OPEN');
+      assert.equal(checked.pnlR, 0);
+
+      // Price pulls back to 99.5 (<= 100): fills immediately
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['ETHUSDT', 99.5]])
+      );
+      checked = db.getPaperLedgerEntryById(pullbackEntry.id)!;
+      assert.equal(checked.fillStatus, 'FILLED');
+      assert.ok(checked.filledAt !== null);
+      assert.equal(checked.status, 'OPEN');
+
+      // Price rallies to 111 (>= 110 target): closes as CLOSED_WIN
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['ETHUSDT', 111]])
+      );
+      checked = db.getPaperLedgerEntryById(pullbackEntry.id)!;
+      assert.equal(checked.status, 'CLOSED_WIN');
+      assert.ok(checked.pnlR >= 2);
+
+      // 2) Formal SMC Market Chase entry that loses (-1R)
+      const marketEntry = db.addPaperLedgerEntry({
+        symbol: 'SOLUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'FORMAL_SMC_MARKET',
+        entryPrice: 100,
+        invalidationPrice: 95,
+        targetPrice: 110,
+        ruleVersion: 'v2-test',
+        evidences: ['Chase'],
+        provenance: liveProv,
+      });
+      db.closePaperLedgerEntry(marketEntry.id, 95);
+
+      // 3) Early Ignition entry that wins (+1.5R)
+      const earlyEntry = db.addPaperLedgerEntry({
+        symbol: 'LINKUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '準備觀察',
+        actionState: 'WAIT',
+        strategyTrack: 'EARLY_IGNITION',
+        entryPrice: 10,
+        invalidationPrice: 9,
+        targetPrice: 12.2,
+        ruleVersion: 'v2-test',
+        evidences: ['Early Ignition'],
+        provenance: liveProv,
+      });
+      db.closePaperLedgerEntry(earlyEntry.id, 11.5);
+
+      // 4) Demo entry must be excluded from LIVE_ONLY track comparison
+      const demoEntry = db.addPaperLedgerEntry({
+        symbol: 'XRPUSDT',
+        exchange: 'demo_synthetic',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'FORMAL_SMC_MARKET',
+        entryPrice: 2,
+        invalidationPrice: 1.9,
+        targetPrice: 2.3,
+        ruleVersion: 'v2-test',
+        evidences: ['Demo'],
+        provenance: demoProv,
+      });
+      db.closePaperLedgerEntry(demoEntry.id, 2.3);
+
+      const liveStats = db.getPaperTrackComparisonStats(false);
+      assert.equal(liveStats.scope, 'LIVE_ONLY');
+      assert.equal(liveStats.totalIncludedEntries, 3);
+      assert.equal(liveStats.totalDemoExcluded, 1);
+      assert.equal(liveStats.leaderTrack, 'SMC_PULLBACK_LIMIT');
+      assert.ok(
+        liveStats.pullbackVsChaseDeltaR !== null &&
+          liveStats.pullbackVsChaseDeltaR > 2.5,
+        '回踩進場應顯著優於現價追高進場'
+      );
+
+      const earlyTrack = liveStats.tracks.find(
+        (t) => t.track === 'EARLY_IGNITION'
+      )!;
+      assert.equal(earlyTrack.winRatePercent, 100);
+      assert.equal(earlyTrack.avgPnlR, 1.5);
+
+      const allStats = db.getPaperTrackComparisonStats(true);
+      assert.equal(allStats.totalIncludedEntries, 4);
+      assert.equal(allStats.totalDemoExcluded, 0);
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('4. 回踩限價單生命週期：TTL 自動過期、先行達標踏空作廢 (TARGET_MISSED)、延長 TTL 與觸價率統計', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'paper_limit_ttl_'));
+    const db = new RadarDatabase(path.join(tmpDir, 'test.db'));
+    const liveProv = {
+      source: 'Binance USDⓈ-M Futures REST (https://fapi.binance.com)',
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      fallback: false,
+      missingData: [] as string[],
+      isDemo: false,
+    };
+
+    try {
+      // A) TTL timeout auto-expiry
+      const nowMs = Date.now();
+      const shortTtlLimit = db.addPaperLedgerEntry({
+        symbol: 'BTCUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'SMC_PULLBACK_LIMIT',
+        fillStatus: 'WAITING_LIMIT',
+        entryAnchorLabel: 'FVG 回踩',
+        ttlMinutes: 60,
+        expiresAt: new Date(nowMs + 60 * 60_000).toISOString(),
+        entryPrice: 90000,
+        invalidationPrice: 88000,
+        targetPrice: 96000,
+        ruleVersion: 'v2-test',
+        evidences: ['TTL test'],
+        provenance: liveProv,
+      });
+      assert.ok(shortTtlLimit.expiresAt !== null);
+
+      // Extend TTL by +120m -> expiresAt advances
+      const extended = db.extendPaperLimitTtl(shortTtlLimit.id, 120)!;
+      assert.ok(
+        Date.parse(extended.expiresAt!) >
+          Date.parse(shortTtlLimit.expiresAt!) + 100 * 60_000,
+        'extendPaperLimitTtl 應有效延長到期時間'
+      );
+
+      // Advance clock past extended expiresAt -> auto expires as TTL_TIMEOUT (0R)
+      const afterTimeoutIso = new Date(
+        Date.parse(extended.expiresAt!) + 60_000
+      ).toISOString();
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['BTCUSDT', 91500]]),
+        afterTimeoutIso
+      );
+      const expiredTtlEntry = db.getPaperLedgerEntryById(shortTtlLimit.id)!;
+      assert.equal(expiredTtlEntry.status, 'CLOSED_EXPIRED');
+      assert.equal(expiredTtlEntry.expiredReason, 'TTL_TIMEOUT');
+      assert.equal(expiredTtlEntry.fillStatus, 'WAITING_LIMIT');
+      assert.equal(expiredTtlEntry.pnlR, 0);
+
+      // B) Target missed before pullback fill -> TARGET_MISSED auto-expiry
+      const missedTargetLimit = db.addPaperLedgerEntry({
+        symbol: 'SOLUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'SMC_PULLBACK_LIMIT',
+        fillStatus: 'WAITING_LIMIT',
+        entryAnchorLabel: 'OB 回踩',
+        ttlMinutes: 240,
+        entryPrice: 100,
+        invalidationPrice: 95,
+        targetPrice: 112,
+        ruleVersion: 'v2-test',
+        evidences: ['Target missed test'],
+        provenance: liveProv,
+      });
+      // Price rallies to 113 (>= target 112) without ever dipping to 100
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['SOLUSDT', 113]])
+      );
+      const missedEntry = db.getPaperLedgerEntryById(missedTargetLimit.id)!;
+      assert.equal(missedEntry.status, 'CLOSED_EXPIRED');
+      assert.equal(missedEntry.expiredReason, 'TARGET_MISSED');
+      assert.equal(missedEntry.pnlR, 0);
+
+      // C) Filled winner for fillRatePercent = 1 / (1 + 2) = 33.3%
+      const filledWin = db.addPaperLedgerEntry({
+        symbol: 'ETHUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'SMC_PULLBACK_LIMIT',
+        fillStatus: 'WAITING_LIMIT',
+        ttlMinutes: 240,
+        entryPrice: 3000,
+        invalidationPrice: 2900,
+        targetPrice: 3200,
+        ruleVersion: 'v2-test',
+        evidences: ['Filled winner'],
+        provenance: liveProv,
+      });
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['ETHUSDT', 2990]])
+      );
+      db.updateOpenPaperEntriesWithPrices(
+        'binance_usdm',
+        new Map([['ETHUSDT', 3210]])
+      );
+      const filledChecked = db.getPaperLedgerEntryById(filledWin.id)!;
+      assert.equal(filledChecked.fillStatus, 'FILLED');
+      assert.equal(filledChecked.status, 'CLOSED_WIN');
+
+      // D) Manual cancel on an active WAITING_LIMIT sets CLOSED_EXPIRED / MANUAL_CANCEL
+      const manualCancelLimit = db.addPaperLedgerEntry({
+        symbol: 'AVAXUSDT',
+        exchange: 'binance_usdm',
+        timeframe: '15m',
+        side: 'LONG',
+        category: '多頭候選',
+        actionState: 'LONG CANDIDATE',
+        strategyTrack: 'SMC_PULLBACK_LIMIT',
+        fillStatus: 'WAITING_LIMIT',
+        ttlMinutes: 240,
+        entryPrice: 40,
+        invalidationPrice: 38,
+        targetPrice: 46,
+        ruleVersion: 'v2-test',
+        evidences: ['Manual cancel'],
+        provenance: liveProv,
+      });
+      const cancelled = db.closePaperLedgerEntry(manualCancelLimit.id, 42)!;
+      assert.equal(cancelled.status, 'CLOSED_EXPIRED');
+      assert.equal(cancelled.expiredReason, 'MANUAL_CANCEL');
+      assert.equal(cancelled.pnlR, 0);
+
+      const stats = db.getPaperTrackComparisonStats(false);
+      const pullbackTrack = stats.tracks.find(
+        (t) => t.track === 'SMC_PULLBACK_LIMIT'
+      )!;
+      assert.equal(pullbackTrack.filledCount, 1);
+      assert.equal(pullbackTrack.expiredLimitCount, 3);
+      assert.equal(pullbackTrack.fillRatePercent, 25);
+      assert.equal(pullbackTrack.winRatePercent, 100);
+      assert.equal(pullbackTrack.closedCount, 1);
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+
 
 
 

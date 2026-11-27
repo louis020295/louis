@@ -12,10 +12,16 @@ import {
   evaluateSmcStructure,
   SMC_RULE_VERSION,
 } from '../engine/SmcRuleEngine.ts';
-import { evaluateHistoricalVolumeAnomaly } from '../engine/VolumeAnomalyEngine.ts';
+import {
+  evaluateHistoricalVolumeAnomaly,
+  extractPriorConfirmedBaselineWindow,
+  MIN_HISTORY_SAMPLES,
+} from '../engine/VolumeAnomalyEngine.ts';
+import { evaluateBtcMarketRegime } from '../engine/BtcCorrelationEngine.ts';
 import {
   CandidateDiagnosisStatus,
   CurrentLiveCycleSnapshot,
+  DataProvenance,
   EvaluationAggregationMode,
   ExchangeId,
   FinalTradeSignal,
@@ -39,6 +45,7 @@ import {
   PaperMonitorRunRecord,
   PaperMonitorStatusResponse,
   PaperMonitorWorkerState,
+  ScanCategory,
   PaperQualityCumulativeEventsBreakdown,
   PaperQualityCycleDetailRecord,
   PaperQualityCycleGateStat,
@@ -149,6 +156,8 @@ export class PaperShadowMonitor {
     regimeTotalSymbols: number;
     evaluationUniverseSize: number;
   }> | null = null;
+  private lastSyncedStatsVersionByExchange = new Map<ExchangeId, number>();
+  private latestBtcChange24hByExchange = new Map<ExchangeId, number | null>();
 
   public readonly ruleVersion = `${SMC_RULE_VERSION}+${MARKET_SCAN_RULE_VERSION}`;
 
@@ -608,6 +617,10 @@ export class PaperShadowMonitor {
     };
   }
 
+  public getWindowStatusLight(nowMs = Date.now()): MonitoringWindowStatus {
+    return this.refreshWindowLifecycle(nowMs).windowStatus;
+  }
+
   public markWindowInterrupted(
     reason = '監控視窗於滿 24 小時前中斷',
     nowMs = Date.now()
@@ -721,6 +734,27 @@ export class PaperShadowMonitor {
     return this.getStatus();
   }
 
+  private isBatchScannerPaused(): boolean {
+    return (
+      this.smcBatchScanner.getWorkerState(this.activeExchange) === 'PAUSED'
+    );
+  }
+
+  private shouldAbortCycle(): boolean {
+    return (
+      this.workerState === 'PAUSED' ||
+      this.workerState === 'STOPPED' ||
+      this.isBatchScannerPaused()
+    );
+  }
+
+  public async waitForIdleCycle(timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.isExecutingCycle && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   public async resume(options?: {
     runImmediateCycle?: boolean;
     maxSymbolsPerCycle?: number;
@@ -792,11 +826,18 @@ export class PaperShadowMonitor {
       return;
     }
     this.loopTimer = setTimeout(() => {
-      void this.runSingleCycle({ maxSymbolsToEvaluate: 6 }).finally(() => {
-        if (this.workerState === 'RUNNING' || this.workerState === 'STARTED') {
-          this.scheduleNextTick();
-        }
-      });
+      void this.runSingleCycle({ maxSymbolsToEvaluate: 6 })
+        .catch((err) => {
+          if (RadarDatabase.isSqliteCorruptionError(err)) {
+            this.radarDb.recoverFromRuntimeSqliteError(err, this.activeExchange);
+          }
+          console.error('[PaperShadowMonitor] Scheduled cycle error:', err);
+        })
+        .finally(() => {
+          if (this.workerState === 'RUNNING' || this.workerState === 'STARTED') {
+            this.scheduleNextTick();
+          }
+        });
     }, this.intervalMs);
   }
 
@@ -812,6 +853,9 @@ export class PaperShadowMonitor {
     simulateHttpStatus?: 429 | 503;
   }): Promise<PaperMonitorStatusResponse> {
     if (this.isExecutingCycle) {
+      return this.getStatus();
+    }
+    if (this.workerState === 'PAUSED' || this.isBatchScannerPaused()) {
       return this.getStatus();
     }
     this.isExecutingCycle = true;
@@ -857,6 +901,9 @@ export class PaperShadowMonitor {
           '安全攔截：偵測到 snapshot.provenance.isDemo === true，嚴禁混入 Live 影子運行'
         );
       }
+      if (this.shouldAbortCycle()) {
+        return this.getStatus();
+      }
 
       // Record live volume snapshot & update open paper positions
       this.radarDb.recordTickerVolumeSnapshot(
@@ -890,25 +937,107 @@ export class PaperShadowMonitor {
       this.finalCategorySmcMismatchCount =
         preScan.finalCategorySmcMismatchCount;
 
-      // Enqueue universe into SmcBatchScanService, run priority cache prewarm, and ensure background batch worker is running
-      this.smcBatchScanner.enqueueMarketUniverse({
-        exchange: this.activeExchange,
-        tickers: snapshot.tickers,
-        candidates: preScan.candidates,
-        watchlistSymbols: DEFAULT_PRIORITY_WATCHLIST,
-        radarScanDurationMs,
-        lastFullRadarScanAt,
-      });
-      await this.smcBatchScanner.prewarmFastLaneCache({
-        exchange: this.activeExchange,
-        mode: 'live',
-      });
-      this.smcBatchScanner.resumeScan(this.activeExchange, 'live', true);
+      if (this.shouldAbortCycle()) {
+        return this.getStatus();
+      }
+
+      const currentQueueStats = this.radarDb.getSmcScanQueueStats(
+        this.activeExchange
+      );
+      const hasActiveQueueInFlight =
+        currentQueueStats.totalJobs > 0 &&
+        (currentQueueStats.queuedCount > 0 ||
+          currentQueueStats.runningJobCount > 0 ||
+          currentQueueStats.rateLimitedCount > 0);
+
+      const latestWindowKey = this.radarDb.getLatestActiveWindowKey(
+        this.activeExchange
+      );
+      const current15mWindowKey = this.smcBatchScanner.computeWindowKey();
+      const extract15mBucket = (wk: string | null): number | null => {
+        if (!wk) return null;
+        const winM = /^win_(\d{12,})$/.exec(wk);
+        if (winM) return Math.floor(Number(winM[1]) / 900_000) * 900_000;
+        const w15M = /^win15m_(\d+)$/.exec(wk);
+        if (w15M) return Number(w15M[1]) * 900_000;
+        return null;
+      };
+      const latestBucketMs = extract15mBucket(latestWindowKey);
+      const currentBucketMs = extract15mBucket(current15mWindowKey);
+      const currentWindowAlreadyCompleted =
+        currentQueueStats.totalJobs > 0 &&
+        currentQueueStats.pendingCount === 0 &&
+        currentQueueStats.failedCount === 0 &&
+        latestBucketMs !== null &&
+        currentBucketMs !== null &&
+        latestBucketMs >= currentBucketMs;
+
+      if (!hasActiveQueueInFlight && !currentWindowAlreadyCompleted) {
+        // Enqueue universe into SmcBatchScanService, run priority cache prewarm, and ensure background batch worker is running
+        this.smcBatchScanner.enqueueMarketUniverse({
+          exchange: this.activeExchange,
+          tickers: snapshot.tickers,
+          candidates: preScan.candidates,
+          watchlistSymbols: DEFAULT_PRIORITY_WATCHLIST,
+          radarScanDurationMs,
+          lastFullRadarScanAt,
+        });
+        await this.smcBatchScanner.prewarmFastLaneCache({
+          exchange: this.activeExchange,
+          mode: 'live',
+        });
+      }
+      if (this.shouldAbortCycle()) {
+        return this.getStatus();
+      }
+      if (
+        this.smcBatchScanner.getWorkerState(this.activeExchange) !== 'RUNNING'
+      ) {
+        this.smcBatchScanner.resumeScan(this.activeExchange, 'live', true, {
+          preserveForeground: true,
+        });
+      }
 
       this.scanRunId = this.radarDb.getSmcScanRunId(this.activeExchange);
+      const btcTicker =
+        snapshot.tickers.find((t) => t.symbol === 'BTCUSDT') ?? null;
+      const btcChange24hNow =
+        btcTicker && Number.isFinite(btcTicker.priceChangePercent24h)
+          ? btcTicker.priceChangePercent24h
+          : null;
+      this.latestBtcChange24hByExchange.set(
+        this.activeExchange,
+        btcChange24hNow
+      );
+      const btcCached15mCycle = this.radarDb.getSmcCandlesCache(
+        this.activeExchange,
+        'BTCUSDT',
+        '15m'
+      );
+      const btcCached1hCycle = this.radarDb.getSmcCandlesCache(
+        this.activeExchange,
+        'BTCUSDT',
+        '1h'
+      );
+      const cycleBtcRegime = evaluateBtcMarketRegime({
+        btcChange24h: btcChange24hNow,
+        btcKlines15m: btcCached15mCycle?.klines,
+        btcKlines1h: btcCached1hCycle?.klines,
+      });
 
-      // Select top priority symbols + any symbols with open CREATED/PAPER_OPENED signals to evaluate
+      // Select top priority symbols + any symbols with open CREATED/PAPER_OPENED or recent deferred ENTRY_WINDOW_MISSED signals
       const maxSyms = options?.maxSymbolsToEvaluate ?? 6;
+      const deferredWindowCutoffMs = Date.now() - 60 * 60_000;
+      const recentMissedSignals = this.paperMonitorDb
+        .listTrackedSignals({
+          exchange: this.activeExchange,
+          status: 'ENTRY_WINDOW_MISSED',
+          limit: 20,
+        })
+        .filter((s) => {
+          const ts = Date.parse(s.signalDetectedAt || s.evaluatedAt);
+          return Number.isFinite(ts) && ts >= deferredWindowCutoffMs;
+        });
       const openSignals = [
         ...this.paperMonitorDb.listTrackedSignals({
           exchange: this.activeExchange,
@@ -925,6 +1054,7 @@ export class PaperShadowMonitor {
           status: 'PAPER_OPENED',
           limit: 20,
         }),
+        ...recentMissedSignals,
       ];
 
       const symbolSet = new Set<string>();
@@ -943,6 +1073,9 @@ export class PaperShadowMonitor {
       const symbolsToEvaluate = Array.from(symbolSet).slice(0, maxSyms);
 
       for (const symbol of symbolsToEvaluate) {
+        if (this.shouldAbortCycle()) {
+          break;
+        }
         const ticker = snapshot.tickers.find((t) => t.symbol === symbol);
         if (!ticker) continue;
 
@@ -1027,6 +1160,11 @@ export class PaperShadowMonitor {
           if (!allCacheHit) {
             const nowCacheMs = Date.now();
             const oiExpIso = new Date(nowCacheMs + 15 * 60_000).toISOString();
+            const resolvedOi = oiRes.openInterest ?? ticker.openInterest ?? null;
+            const resolvedOiValue =
+              oiRes.openInterestValue ?? ticker.openInterestValue ?? null;
+            const hasValidOi =
+              resolvedOi !== null && resolvedOi !== undefined;
             const saveTfCache = (
               tf: '5m' | '15m' | '1h' | '4h',
               res: typeof k15mRes,
@@ -1035,31 +1173,38 @@ export class PaperShadowMonitor {
               const closed = res.klines.filter((k) => k.isClosed);
               const lastClosed =
                 closed.length > 0 ? closed[closed.length - 1] : null;
+              const is15m = tf === '15m';
+              const tfProvenance = is15m
+                ? {
+                    ...res.provenance,
+                    stale: res.provenance.stale || oiRes.provenance.stale,
+                    fallback: res.provenance.fallback || oiRes.provenance.fallback,
+                  }
+                : res.provenance;
               this.radarDb.saveSmcCandlesCache({
                 symbol,
                 exchange: this.activeExchange,
                 timeframe: tf,
-                klines: res.klines.slice(-60),
-                openInterest: oiRes.openInterest ?? ticker.openInterest,
-                openInterestValue:
-                  oiRes.openInterestValue ?? ticker.openInterestValue,
+                klines: closed.slice(-90),
+                openInterest: resolvedOi,
+                openInterestValue: resolvedOiValue,
                 fundingRate: ticker.fundingRate,
                 nextFundingTime: ticker.nextFundingTime,
-                oiFetchedAt: res.provenance.fetchedAt,
-                oiExpiresAt: oiExpIso,
+                oiFetchedAt: is15m && hasValidOi ? oiRes.provenance.fetchedAt : null,
+                oiExpiresAt: is15m && hasValidOi ? oiExpIso : null,
                 dataTimestamp: lastClosed ? lastClosed.closeTime : nowCacheMs,
                 fetchedAt: res.provenance.fetchedAt,
                 expiresAt: new Date(nowCacheMs + ttlMs).toISOString(),
-                stale: res.provenance.stale,
-                fallback: res.provenance.fallback,
-                missingData: res.provenance.missingData,
-                source: res.provenance.source,
+                stale: tfProvenance.stale,
+                fallback: tfProvenance.fallback,
+                missingData: tfProvenance.missingData,
+                source: tfProvenance.source,
                 isDemo: false,
                 ruleVersion: SMC_RULE_VERSION,
                 windowKey: lastClosed
                   ? `win_${Math.floor(lastClosed.closeTime / 300_000)}`
                   : `win_${Math.floor(nowCacheMs / 300_000)}`,
-                provenance: res.provenance,
+                provenance: tfProvenance,
               });
             };
             saveTfCache('5m', k5mRes, 5 * 60_000);
@@ -1079,20 +1224,21 @@ export class PaperShadowMonitor {
             );
           }
 
-          const current15mVol =
-            confirmed15m.length > 0
-              ? confirmed15m[confirmed15m.length - 1].quoteVolume
-              : null;
-          const prior30Vols =
-            confirmed15m.length >= 31
-              ? confirmed15m.slice(-31, -1).map((k) => k.quoteVolume)
-              : confirmed15m.slice(0, -1).map((k) => k.quoteVolume);
+          const confirmed15mVols = confirmed15m.map((k) => k.quoteVolume);
+          const extractedWindow =
+            confirmed15mVols.length > 0
+              ? extractPriorConfirmedBaselineWindow(
+                  confirmed15mVols,
+                  confirmed15mVols.length - 1,
+                  MIN_HISTORY_SAMPLES
+                )
+              : { currentVolume: null, historicalVolumes: [] };
 
           const histVol = evaluateHistoricalVolumeAnomaly({
             symbol,
             exchange: this.activeExchange,
-            currentVolume: current15mVol ?? 0,
-            historicalVolumes: prior30Vols,
+            currentVolume: extractedWindow.currentVolume,
+            historicalVolumes: extractedWindow.historicalVolumes,
             volumeTimeframe: '15m',
             baseProvenance: k15mRes.provenance,
           });
@@ -1100,6 +1246,20 @@ export class PaperShadowMonitor {
           const preCandidate = preScan.candidates.find(
             (c) => c.symbol === symbol
           );
+          const isLowLiquidity =
+            preCandidate?.isLowLiquidity ??
+            ticker.quoteVolume24h < 15_000_000;
+          const extremeFunding =
+            preCandidate?.extremeFunding ??
+            (ticker.fundingRate !== null &&
+              Math.abs(ticker.fundingRate) >= 0.0005);
+          const lowLiquidityHighVolatility =
+            preCandidate?.lowLiquidityHighVolatility ??
+            (isLowLiquidity && Math.abs(ticker.priceChangePercent24h) >= 12.0);
+          const historyGatePassed =
+            histVol.status === 'READY' &&
+            !histVol.baselineUnstable &&
+            histVol.sampleCount >= MIN_HISTORY_SAMPLES;
 
           const smcAnalysis = evaluateSmcStructure({
             symbol,
@@ -1112,10 +1272,9 @@ export class PaperShadowMonitor {
             },
             openInterest: oiRes.openInterest ?? ticker.openInterest,
             historicalVolume: histVol,
-            isLowLiquidity: preCandidate?.isLowLiquidity ?? false,
-            extremeFunding: preCandidate?.extremeFunding ?? false,
-            lowLiquidityHighVolatility:
-              preCandidate?.lowLiquidityHighVolatility ?? false,
+            isLowLiquidity,
+            extremeFunding,
+            lowLiquidityHighVolatility,
             requireFullMultiTimeframe: true,
             provenance: k15mRes.provenance,
           });
@@ -1153,10 +1312,22 @@ export class PaperShadowMonitor {
                   ? '雷達多頭觀察'
                   : '雷達空頭觀察');
 
+          const missingData = [
+            ...new Set([
+              ...(k15mRes.provenance.missingData || []),
+              ...(oiRes.provenance.missingData || []),
+            ]),
+          ];
+
           let finalTradeSignal: FinalTradeSignal = 'NONE';
           if (
             smcAnalysis.smcEvaluationStatus === 'EVALUATED' &&
             smcAnalysis.actionState === 'LONG CANDIDATE' &&
+            !isLowLiquidity &&
+            !extremeFunding &&
+            !lowLiquidityHighVolatility &&
+            historyGatePassed &&
+            missingData.length === 0 &&
             smcAnalysis.waitReasons.length === 0 &&
             !k15mRes.provenance.stale &&
             !k15mRes.provenance.fallback
@@ -1173,6 +1344,11 @@ export class PaperShadowMonitor {
           } else if (
             smcAnalysis.smcEvaluationStatus === 'EVALUATED' &&
             smcAnalysis.actionState === 'SHORT CANDIDATE' &&
+            !isLowLiquidity &&
+            !extremeFunding &&
+            !lowLiquidityHighVolatility &&
+            historyGatePassed &&
+            missingData.length === 0 &&
             smcAnalysis.waitReasons.length === 0 &&
             !k15mRes.provenance.stale &&
             !k15mRes.provenance.fallback
@@ -1197,14 +1373,6 @@ export class PaperShadowMonitor {
               );
             }
           }
-
-          // Persist SMC scan result into RadarDatabase so status snapshot stays fresh
-          const missingData = [
-            ...new Set([
-              ...(k15mRes.provenance.missingData || []),
-              ...(oiRes.provenance.missingData || []),
-            ]),
-          ];
           const isCandidateSig =
             smcAnalysis.actionState === 'LONG CANDIDATE' ||
             smcAnalysis.actionState === 'SHORT CANDIDATE' ||
@@ -1216,9 +1384,11 @@ export class PaperShadowMonitor {
                 : 'ENTRY_WINDOW_MISSED'
               : 'NOT_APPLICABLE';
 
-          const currentSymbolJob = this.radarDb
-            .listSmcScanJobs(this.activeExchange, 600)
-            .find((j) => j.symbol === symbol);
+          const currentSymbolJob = this.radarDb.listSymbolSmcJobHistory(
+            this.activeExchange,
+            symbol,
+            1
+          )[0];
           const resolvedPriorityTier =
             currentSymbolJob?.priorityTier ??
             (DEFAULT_PRIORITY_WATCHLIST.includes(symbol) ? 1 : 6);
@@ -1233,6 +1403,10 @@ export class PaperShadowMonitor {
             ? 'FAST_LANE'
             : 'BULK';
           const resolvedPrewarmWaitMs = currentSymbolJob?.prewarmWaitMs ?? 0;
+
+          if (this.shouldAbortCycle()) {
+            break;
+          }
 
           this.radarDb.saveSmcScanResult(
             {
@@ -1290,7 +1464,23 @@ export class PaperShadowMonitor {
             );
           }
 
-          // Settle any existing open signals for this symbol first
+          const isAltSymbol = symbol !== 'BTCUSDT';
+          const btcBlocksAltLong =
+            isAltSymbol &&
+            smcAnalysis.actionState === 'LONG CANDIDATE' &&
+            cycleBtcRegime.blocksLongAlts;
+          const btcBlocksAltShort =
+            isAltSymbol &&
+            smcAnalysis.actionState === 'SHORT CANDIDATE' &&
+            cycleBtcRegime.blocksShortAlts;
+          const btcRegimeBlockedReason =
+            btcBlocksAltLong || btcBlocksAltShort
+              ? cycleBtcRegime.warningZh
+              : null;
+          const overextendedBlocked =
+            smcAnalysis.entryZoneAnalysis?.status === 'OVEREXTENDED';
+
+          // Settle any existing open signals (and recent deferred missed signals) for this symbol first
           const symbolOpenSignals = openSignals.filter(
             (s) => s.symbol === symbol
           );
@@ -1299,6 +1489,10 @@ export class PaperShadowMonitor {
               signalId: openSig.signalId,
               klines: k15mRes.klines,
               atr14: smcAnalysis.atr14,
+              tradeHorizonClass: smcAnalysis.tradeHorizon?.category,
+              allowDeferredFutureBarEntry: true,
+              currentTimeMs: evalEndMs,
+              fundingRatePer8h: ticker.fundingRate,
             });
           }
 
@@ -1344,9 +1538,37 @@ export class PaperShadowMonitor {
             evidences: passedEvidences,
             score: preCandidate?.score ?? 50,
             isBacktest: false,
+            allowDeferredFutureBarEntry: true,
+            currentTimeMs: evalEndMs,
             recordBlockedInDb: false,
-            enqueueSandboxNotifications: finalTradeSignal !== 'NONE',
+            enqueueSandboxNotifications:
+              finalTradeSignal !== 'NONE' && !btcRegimeBlockedReason,
+            overextendedBlocked,
+            btcRegimeBlockedReason,
+            tradeHorizonClass: smcAnalysis.tradeHorizon?.category,
           });
+
+          if (
+            finalTradeSignal !== 'NONE' &&
+            !btcRegimeBlockedReason &&
+            (smcAnalysis.actionState === 'LONG CANDIDATE' ||
+              smcAnalysis.actionState === 'SHORT CANDIDATE') &&
+            !k15mRes.provenance.stale &&
+            !k15mRes.provenance.fallback
+          ) {
+            this.maybeCreatePullbackLimitPaperOrder({
+              exchange: this.activeExchange,
+              symbol,
+              category: radarCat,
+              actionState: smcAnalysis.actionState,
+              analysis: smcAnalysis,
+              evidences: passedEvidences,
+              provenance: {
+                ...k15mRes.provenance,
+                missingData,
+              },
+            });
+          }
         } catch (symErr) {
           if (
             symErr instanceof ExchangeApiUnavailableError &&
@@ -1357,16 +1579,18 @@ export class PaperShadowMonitor {
         }
       }
 
-      const doneIso = new Date().toISOString();
-      this.lastScanAt = doneIso;
-      this.lastHeartbeatAt = doneIso;
-      this.nextScanAt = new Date(Date.now() + this.intervalMs).toISOString();
-      this.cyclesCompleted++;
-      this.lastError = null;
-      this.workerState = 'RUNNING';
-      this.syncCompletedSmcCyclesIntoWindow();
-      this.refreshWindowLifecycle();
-      this.persistRunState();
+      if (!this.shouldAbortCycle()) {
+        const doneIso = new Date().toISOString();
+        this.lastScanAt = doneIso;
+        this.lastHeartbeatAt = doneIso;
+        this.nextScanAt = new Date(Date.now() + this.intervalMs).toISOString();
+        this.cyclesCompleted++;
+        this.lastError = null;
+        this.workerState = 'RUNNING';
+        this.syncCompletedSmcCyclesIntoWindow();
+        this.refreshWindowLifecycle();
+        this.persistRunState();
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.lastHeartbeatAt = new Date().toISOString();
@@ -1413,30 +1637,52 @@ export class PaperShadowMonitor {
       );
       const klines = cached15m?.klines ?? [];
 
+      const btcCached15m = this.radarDb.getSmcCandlesCache(
+        exchange,
+        'BTCUSDT',
+        '15m'
+      );
+      const btcCached1h = this.radarDb.getSmcCandlesCache(
+        exchange,
+        'BTCUSDT',
+        '1h'
+      );
+      const btcRegime = evaluateBtcMarketRegime({
+        btcChange24h: this.latestBtcChange24hByExchange.get(exchange) ?? null,
+        btcKlines15m: btcCached15m?.klines,
+        btcKlines1h: btcCached1h?.klines,
+      });
+      const isAltBatchSymbol = symbol !== 'BTCUSDT';
+      const btcBlocksLong =
+        isAltBatchSymbol &&
+        resultRecord.smcActionState === 'LONG CANDIDATE' &&
+        btcRegime.blocksLongAlts;
+      const btcBlocksShort =
+        isAltBatchSymbol &&
+        resultRecord.smcActionState === 'SHORT CANDIDATE' &&
+        btcRegime.blocksShortAlts;
+      const btcRegimeBlockedReason =
+        btcBlocksLong || btcBlocksShort ? btcRegime.warningZh : null;
+      const overextendedBlocked =
+        analysis.entryZoneAnalysis?.status === 'OVEREXTENDED';
+      const horizonClass = analysis.tradeHorizon?.category;
+
       if (klines.length > 0) {
-        const openSignals = [
-          ...this.paperMonitorDb.listTrackedSignals({
+        const openSignals =
+          this.paperMonitorDb.listOpenTrackedSignalsForSymbol(
             exchange,
-            status: 'CREATED',
-            limit: 50,
-          }),
-          ...this.paperMonitorDb.listTrackedSignals({
-            exchange,
-            status: 'PENDING_NEXT_ENTRY',
-            limit: 50,
-          }),
-          ...this.paperMonitorDb.listTrackedSignals({
-            exchange,
-            status: 'PAPER_OPENED',
-            limit: 50,
-          }),
-        ].filter((s) => s.symbol === symbol);
+            symbol,
+            { includeDeferredMissed: true }
+          );
 
         for (const openSig of openSignals) {
           this.outcomeTracker.settleSignalWithKlines({
             signalId: openSig.signalId,
             klines,
             atr14: analysis.atr14,
+            tradeHorizonClass: horizonClass,
+            allowDeferredFutureBarEntry: true,
+            currentTimeMs: Date.now(),
           });
         }
       }
@@ -1445,6 +1691,15 @@ export class PaperShadowMonitor {
         .filter((e) => e.passed)
         .map((e) => `${e.code}:${e.label}`);
 
+      const klinesForEval =
+        typeof resultRecord.signalBarCloseTime === 'number' &&
+        resultRecord.signalBarCloseTime > 0
+          ? klines.filter(
+              (k) => !k.isClosed || k.closeTime <= resultRecord.signalBarCloseTime!
+            )
+          : klines;
+
+      const evalNowMs = Date.now();
       this.outcomeTracker.evaluateAndTrackSignal({
         monitorRunId: this.monitorRunId,
         scanRunId: this.radarDb.getSmcScanRunId(exchange),
@@ -1460,7 +1715,11 @@ export class PaperShadowMonitor {
         ruleVersion: this.ruleVersion,
         snapshotAt: resultRecord.dataFetchedAt,
         evaluatedAt: resultRecord.evaluatedAt,
-        klines,
+        signalDetectedAt:
+          resultRecord.signalDetectedAt ?? resultRecord.evaluatedAt,
+        candidateDetectedAt:
+          resultRecord.candidateDetectedAt ?? resultRecord.evaluatedAt,
+        klines: klinesForEval.length > 0 ? klinesForEval : klines,
         atr14: analysis.atr14,
         openInterest: cached15m?.openInterest ?? 500_000,
         fundingRate: 0.0001,
@@ -1476,12 +1735,132 @@ export class PaperShadowMonitor {
         evidences: passedEvidences,
         score: resultRecord.finalTradeSignal !== 'NONE' ? 82 : 50,
         isBacktest: false,
+        allowDeferredFutureBarEntry: true,
+        currentTimeMs: evalNowMs,
         recordBlockedInDb: false,
-        enqueueSandboxNotifications: resultRecord.finalTradeSignal !== 'NONE',
+        enqueueSandboxNotifications:
+          resultRecord.finalTradeSignal !== 'NONE' && !btcRegimeBlockedReason,
+        overextendedBlocked,
+        btcRegimeBlockedReason,
+        tradeHorizonClass: horizonClass,
       });
+
+      if (
+        resultRecord.finalTradeSignal !== 'NONE' &&
+        !btcRegimeBlockedReason &&
+        (resultRecord.smcActionState === 'LONG CANDIDATE' ||
+          resultRecord.smcActionState === 'SHORT CANDIDATE') &&
+        !resultRecord.stale &&
+        !resultRecord.fallback
+      ) {
+        this.maybeCreatePullbackLimitPaperOrder({
+          exchange,
+          symbol,
+          category: resultRecord.marketRadarCategory ?? '準備觀察',
+          actionState: resultRecord.smcActionState,
+          analysis,
+          evidences: passedEvidences,
+          provenance: {
+            source: resultRecord.source,
+            fetchedAt: resultRecord.dataFetchedAt,
+            stale: resultRecord.stale,
+            fallback: resultRecord.fallback,
+            missingData: resultRecord.missingData,
+            isDemo: false,
+          },
+        });
+      }
     } catch {
       // Do not interrupt batch worker on tracker callback
     }
+  }
+
+  private maybeCreatePullbackLimitPaperOrder(params: {
+    exchange: ExchangeId;
+    symbol: string;
+    category: MarketRadarCategory;
+    actionState: 'LONG CANDIDATE' | 'SHORT CANDIDATE';
+    analysis: SmcAnalysisResult;
+    evidences: string[];
+    provenance: DataProvenance;
+  }): void {
+    const zone = params.analysis.entryZoneAnalysis;
+    if (
+      !zone ||
+      zone.idealPullbackEntry === null ||
+      zone.stopLossPrice === null ||
+      zone.targetPrice === null ||
+      !Number.isFinite(zone.idealPullbackEntry) ||
+      zone.idealPullbackEntry <= 0 ||
+      !Number.isFinite(zone.stopLossPrice) ||
+      zone.stopLossPrice <= 0 ||
+      !Number.isFinite(zone.targetPrice) ||
+      zone.targetPrice <= 0 ||
+      (zone.pullbackRR ?? 0) < 1.2
+    ) {
+      return;
+    }
+
+    const side: 'LONG' | 'SHORT' =
+      params.actionState === 'LONG CANDIDATE' ? 'LONG' : 'SHORT';
+    if (
+      side === 'LONG' &&
+      !(
+        zone.stopLossPrice < zone.idealPullbackEntry &&
+        zone.idealPullbackEntry < zone.targetPrice
+      )
+    ) {
+      return;
+    }
+    if (
+      side === 'SHORT' &&
+      !(
+        zone.stopLossPrice > zone.idealPullbackEntry &&
+        zone.idealPullbackEntry > zone.targetPrice
+      )
+    ) {
+      return;
+    }
+
+    const cutoffMs = Date.now() - 60 * 60_000;
+    const existing = this.radarDb.listPaperLedgerEntries(120);
+    const hasActiveOrRecent = existing.some(
+      (e) =>
+        !e.isDemo &&
+        e.exchange === params.exchange &&
+        e.symbol === params.symbol &&
+        e.side === side &&
+        e.strategyTrack === 'SMC_PULLBACK_LIMIT' &&
+        ((e.status === 'OPEN' && e.fillStatus === 'WAITING_LIMIT') ||
+          Date.parse(e.openedAt) >= cutoffMs)
+    );
+    if (hasActiveOrRecent) {
+      return;
+    }
+
+    const mappedCategory: ScanCategory =
+      side === 'LONG' ? '多頭候選' : '空頭候選';
+
+    this.radarDb.addPaperLedgerEntry({
+      symbol: params.symbol,
+      exchange: params.exchange,
+      timeframe: '15m',
+      side,
+      category: mappedCategory,
+      actionState: params.actionState,
+      strategyTrack: 'SMC_PULLBACK_LIMIT',
+      fillStatus: 'WAITING_LIMIT',
+      entryAnchorLabel: zone.anchorLabel || `${zone.anchorType} 回踩掛單`,
+      ttlMinutes: 120,
+      entryPrice: zone.idealPullbackEntry,
+      invalidationPrice: zone.stopLossPrice,
+      targetPrice: zone.targetPrice,
+      ruleVersion: this.ruleVersion,
+      evidences: params.evidences,
+      notes: `[PAPER ONLY] 自動掛單追蹤 FVG/OB 回踩限價進場 (${zone.anchorLabel} @ ${zone.idealPullbackEntry}, R:R 1:${zone.pullbackRR ?? '-'})`,
+      provenance: params.provenance,
+      costConfig: { entryOrderType: 'LIMIT' },
+    });
   }
 
   public syncEvaluatedCandidatesToOutcomeTracker(
@@ -1491,6 +1870,10 @@ export class PaperShadowMonitor {
       return;
     }
     try {
+      const currentStatsVer = this.radarDb.getSmcStatsVersion(exchange);
+      if (this.lastSyncedStatsVersionByExchange.get(exchange) === currentStatsVer) {
+        return;
+      }
       const results = this.radarDb
         .listSmcScanResults(exchange)
         .filter(
@@ -1499,6 +1882,7 @@ export class PaperShadowMonitor {
             (r.smcActionState === 'LONG CANDIDATE' ||
               r.smcActionState === 'SHORT CANDIDATE')
         );
+      this.lastSyncedStatsVersionByExchange.set(exchange, currentStatsVer);
       if (results.length === 0) {
         return;
       }
@@ -1533,7 +1917,10 @@ export class PaperShadowMonitor {
     }
   }
 
-  private buildSeparatedSnapshots(nowMs = Date.now()): {
+  private buildSeparatedSnapshots(
+    nowMs = Date.now(),
+    preloadedAllSignals?: PaperTrackedSignalRecord[]
+  ): {
     windowFinalSnapshot: WindowFinalSnapshot | null;
     currentLiveCycleSnapshot: CurrentLiveCycleSnapshot;
     latestScanSnapshot: LatestScanSnapshot;
@@ -1554,11 +1941,13 @@ export class PaperShadowMonitor {
           ? cycles[cycles.length - 1]
           : null;
 
-    const allSignals = this.paperMonitorDb.listTrackedSignals({
-      exchange: this.activeExchange,
-      includeBlocked: true,
-      limit: 5000,
-    });
+    const allSignals =
+      preloadedAllSignals ??
+      this.paperMonitorDb.listTrackedSignals({
+        exchange: this.activeExchange,
+        includeBlocked: true,
+        limit: 5000,
+      });
     const tradableSignals = allSignals.filter((s) => s.status !== 'BLOCKED');
     const longSignals = tradableSignals.filter((s) => s.direction === 'LONG');
     const shortSignals = tradableSignals.filter((s) => s.direction === 'SHORT');
@@ -1776,7 +2165,7 @@ export class PaperShadowMonitor {
     const allSignals = this.paperMonitorDb.listTrackedSignals({
       exchange: this.activeExchange,
       includeBlocked: true,
-      limit: 2000,
+      limit: 5000,
     });
     const outboxList = this.paperMonitorDb.listNotificationOutbox({
       exchange: this.activeExchange,
@@ -1842,7 +2231,7 @@ export class PaperShadowMonitor {
       windowFinalSnapshot,
       currentLiveCycleSnapshot,
       latestScanSnapshot,
-    } = this.buildSeparatedSnapshots(nowMs);
+    } = this.buildSeparatedSnapshots(nowMs, allSignals);
 
     const progressDiag = this.smcBatchScanner.getProgressAndHealth(
       this.activeExchange,
@@ -2117,6 +2506,7 @@ export class PaperShadowMonitor {
         0,
       formalCandidateLatencySla: progressDiag.formalCandidateLatencySla,
       DEMO_LATENCY_FIXTURE: progressDiag.DEMO_LATENCY_FIXTURE,
+      CONTROLLED_LIVE_FIXTURE: progressDiag.CONTROLLED_LIVE_FIXTURE,
       LIVE_FORMAL_CANDIDATE_COUNT:
         progressDiag.LIVE_FORMAL_CANDIDATE_COUNT ?? 0,
       LIVE_FAST_LANE_COUNT: progressDiag.LIVE_FAST_LANE_COUNT ?? 0,
@@ -2125,6 +2515,8 @@ export class PaperShadowMonitor {
         progressDiag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT ?? 0,
       LIVE_ENTRY_WINDOW_MISSED_COUNT:
         progressDiag.LIVE_ENTRY_WINDOW_MISSED_COUNT ?? 0,
+      LIVE_ENTRY_WINDOW_MISSED_RATE:
+        progressDiag.LIVE_ENTRY_WINDOW_MISSED_RATE ?? null,
       LIVE_DETECTION_LATENCY_P50:
         progressDiag.LIVE_DETECTION_LATENCY_P50 ?? null,
       LIVE_DETECTION_LATENCY_P95:
@@ -2137,6 +2529,20 @@ export class PaperShadowMonitor {
         progressDiag.LIVE_BULK_DETECTION_LATENCY_P50 ?? null,
       LIVE_BULK_DETECTION_LATENCY_P95:
         progressDiag.LIVE_BULK_DETECTION_LATENCY_P95 ?? null,
+      liveValidationStatus:
+        progressDiag.liveValidationStatus ?? 'NO_LIVE_FORMAL_CANDIDATE',
+      liveSampleValidationStatus:
+        progressDiag.liveSampleValidationStatus ??
+        'LIVE_VALIDATION_INSUFFICIENT_SAMPLE',
+      liveValidationStates: progressDiag.liveValidationStates ?? [
+        'NO_LIVE_FORMAL_CANDIDATE',
+        'LIVE_VALIDATION_INSUFFICIENT_SAMPLE',
+      ],
+      liveValidationMessage:
+        progressDiag.liveValidationMessage ??
+        '尚無真實 Live 候選，無法評估實盤捕捉延遲',
+      isLiveValidated: progressDiag.isLiveValidated ?? false,
+      signalQualityCalibration: progressDiag.signalQualityCalibration,
       fastLaneFormalCandidateCount:
         progressDiag.fastLaneFormalCandidateCount ?? 0,
       bulkFormalCandidateCount: progressDiag.bulkFormalCandidateCount ?? 0,
@@ -6899,12 +7305,14 @@ export class PaperShadowMonitor {
       historicalSignalsOutsideWindow: cycleDiag.historicalSignalsOutsideWindow,
       formalCandidateLatencySla: cycleDiag.formalCandidateLatencySla,
       DEMO_LATENCY_FIXTURE: cycleDiag.DEMO_LATENCY_FIXTURE,
+      CONTROLLED_LIVE_FIXTURE: cycleDiag.CONTROLLED_LIVE_FIXTURE,
       LIVE_FORMAL_CANDIDATE_COUNT: cycleDiag.LIVE_FORMAL_CANDIDATE_COUNT,
       LIVE_FAST_LANE_COUNT: cycleDiag.LIVE_FAST_LANE_COUNT,
       LIVE_BULK_COUNT: cycleDiag.LIVE_BULK_COUNT,
       LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT:
         cycleDiag.LIVE_DETECTED_BEFORE_ENTRY_WINDOW_COUNT,
       LIVE_ENTRY_WINDOW_MISSED_COUNT: cycleDiag.LIVE_ENTRY_WINDOW_MISSED_COUNT,
+      LIVE_ENTRY_WINDOW_MISSED_RATE: cycleDiag.LIVE_ENTRY_WINDOW_MISSED_RATE,
       LIVE_DETECTION_LATENCY_P50: cycleDiag.LIVE_DETECTION_LATENCY_P50,
       LIVE_DETECTION_LATENCY_P95: cycleDiag.LIVE_DETECTION_LATENCY_P95,
       LIVE_FAST_LANE_DETECTION_LATENCY_P50:
@@ -6915,6 +7323,12 @@ export class PaperShadowMonitor {
         cycleDiag.LIVE_BULK_DETECTION_LATENCY_P50,
       LIVE_BULK_DETECTION_LATENCY_P95:
         cycleDiag.LIVE_BULK_DETECTION_LATENCY_P95,
+      liveValidationStatus: cycleDiag.liveValidationStatus,
+      liveSampleValidationStatus: cycleDiag.liveSampleValidationStatus,
+      liveValidationStates: cycleDiag.liveValidationStates,
+      liveValidationMessage: cycleDiag.liveValidationMessage,
+      isLiveValidated: cycleDiag.isLiveValidated,
+      signalQualityCalibration: cycleDiag.signalQualityCalibration,
       currentGateStats,
       currentGatePassRates,
       scopedGateStatistics: cycleDiag.scopedGateStatistics,
@@ -7462,6 +7876,65 @@ export class PaperShadowMonitor {
       signals: report90d.signals,
       signalHistory: sigHist90d.signalHistory,
     };
+  }
+
+  public getLiveCaptureObservation(
+    exchange: ExchangeId = this.activeExchange,
+    options?: {
+      snapshotConsistency?:
+        | 'INDEPENDENT_ENDPOINT_SNAPSHOT'
+        | 'SHARED_ATOMIC_SNAPSHOT';
+    }
+  ) {
+    if (exchange === 'demo_synthetic') {
+      throw new Error(
+        '安全攔截：Live 候選觀測端點嚴禁使用 demo_synthetic 模擬資料'
+      );
+    }
+    return this.radarDb.getLiveCaptureObservation(exchange, options);
+  }
+
+  public getLiveCaptureEvents(
+    exchange: ExchangeId = this.activeExchange,
+    options?: {
+      snapshotConsistency?:
+        | 'INDEPENDENT_ENDPOINT_SNAPSHOT'
+        | 'SHARED_ATOMIC_SNAPSHOT';
+    }
+  ) {
+    if (exchange === 'demo_synthetic') {
+      throw new Error(
+        '安全攔截：Live 15m 收盤事件端點嚴禁使用 demo_synthetic 模擬資料'
+      );
+    }
+    return this.radarDb.getLiveCaptureEvents(exchange, options);
+  }
+
+  public getLiveCaptureSummary(
+    exchange: ExchangeId = this.activeExchange,
+    options?: {
+      snapshotConsistency?:
+        | 'INDEPENDENT_ENDPOINT_SNAPSHOT'
+        | 'SHARED_ATOMIC_SNAPSHOT';
+    }
+  ) {
+    if (exchange === 'demo_synthetic') {
+      throw new Error(
+        '安全攔截：Live 候選觀測摘要端點嚴禁使用 demo_synthetic 模擬資料'
+      );
+    }
+    return this.radarDb.getLiveCaptureSummary(exchange, options);
+  }
+
+  public getSharedAtomicLiveCaptureBundle(
+    exchange: ExchangeId = this.activeExchange
+  ) {
+    if (exchange === 'demo_synthetic') {
+      throw new Error(
+        '安全攔截：Live 候選觀測原子快照端點嚴禁使用 demo_synthetic 模擬資料'
+      );
+    }
+    return this.radarDb.getSharedAtomicLiveCaptureBundle(exchange);
   }
 }
 

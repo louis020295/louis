@@ -15,12 +15,15 @@ import { RadarDatabase } from './RadarDatabase.ts';
 
 export class BacktestDatabase {
   private readonly radarDb: RadarDatabase;
-  private readonly rawDb: DatabaseSync;
+
+  private get rawDb(): DatabaseSync {
+    return this.radarDb.getRawDb();
+  }
 
   constructor(radarDb: RadarDatabase) {
     this.radarDb = radarDb;
-    this.rawDb = radarDb.getRawDb();
     this.initBacktestSchema();
+    radarDb.registerSchemaInitHook(() => this.initBacktestSchema());
   }
 
   private initBacktestSchema(): void {
@@ -99,6 +102,8 @@ export class BacktestDatabase {
       `ALTER TABLE backtest_signal_evidences ADD COLUMN funding_rate REAL`,
       `ALTER TABLE backtest_signal_evidences ADD COLUMN funding_data_timestamp INTEGER`,
       `ALTER TABLE backtest_signal_evidences ADD COLUMN oi_funding_point_in_time INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE backtest_runs ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'MANUAL'`,
+      `ALTER TABLE backtest_runs ADD COLUMN auto_batch_id TEXT`,
     ];
     for (const sql of alterColumns) {
       try {
@@ -142,15 +147,17 @@ export class BacktestDatabase {
         signal_count, executed_paper_count, blocked_count, expired_count, insufficient_data_count,
         trade_count, win_rate, average_r, profit_factor, max_drawdown_r,
         expectancy_r, average_holding_time, long_count, short_count,
-        walk_forward_json, report_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        walk_forward_json, report_json, created_at, trigger_source, auto_batch_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(backtest_run_id) DO UPDATE SET
         status = excluded.status,
         metric_status = excluded.metric_status,
         lookahead_free = excluded.lookahead_free,
         data_classification = excluded.data_classification,
         report_json = excluded.report_json,
-        walk_forward_json = excluded.walk_forward_json
+        walk_forward_json = excluded.walk_forward_json,
+        trigger_source = excluded.trigger_source,
+        auto_batch_id = excluded.auto_batch_id
     `);
 
     insertRunStmt.run(
@@ -190,7 +197,9 @@ export class BacktestDatabase {
       saved.shortCount ?? null,
       saved.walkForward ? JSON.stringify(saved.walkForward) : null,
       JSON.stringify(saved),
-      createdAt
+      createdAt,
+      saved.triggerSource ?? 'MANUAL',
+      saved.autoBatchId ?? null
     );
 
     if (
