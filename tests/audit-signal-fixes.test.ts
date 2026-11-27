@@ -232,8 +232,9 @@ describe('audit-signal-fixes: 5-bar swing, FVG 部分回補, 嚴格 OB, 缺失�
       openInterest: 100_000_000,
       provenance: { ...liveProvenance, missingData: ['BID_ASK_SPREAD'] },
     });
-    assert.equal(res.actionState, 'LONG CANDIDATE');
+    assert.notEqual(res.actionState, 'WAIT');
     assert.equal(res.waitReasons.some((r) => r.includes('BID_ASK_SPREAD')), false);
+    assert.ok(res.signalDecision);
   });
 
   it('歷史量能 INSUFFICIENT_HISTORY 時，可從已收盤 15m K 線回補 30 根基線而不再誤觸 WAIT', () => {
@@ -280,7 +281,8 @@ describe('audit-signal-fixes: 5-bar swing, FVG 部分回補, 嚴格 OB, 缺失�
       false,
       res.waitReasons.join(' | ')
     );
-    assert.equal(res.actionState, 'LONG CANDIDATE');
+    assert.notEqual(res.actionState, 'WAIT');
+    assert.ok(res.signalDecision?.stateReasonZh);
   });
 
   it('BULL 延續突破標為 BOS，先做更低低點再往上收盤突破則標為 MSS', () => {

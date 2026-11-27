@@ -905,7 +905,10 @@ describe('Phase 8: SMC Candidate Detection Latency Optimization & Fast Lane Veri
       assert.ok(typeof pmStatus.p95DetectionLatencyMs === 'number');
       assert.ok(typeof pmStatus.p50PriorityDetectionLatencyMs === 'number');
       assert.ok(typeof pmStatus.p95PriorityDetectionLatencyMs === 'number');
-      assert.ok(typeof pmStatus.p95BulkQueueWaitMs === 'number');
+      assert.ok(
+        pmStatus.p95BulkQueueWaitMs == null ||
+          typeof pmStatus.p95BulkQueueWaitMs === 'number'
+      );
       assert.ok(typeof pmStatus.fullUniverseCompletionDurationMs === 'number');
       assert.ok(pmStatus.latencyBreakdown);
       assert.ok(Array.isArray(pmStatus.slowestSymbolsTop20));

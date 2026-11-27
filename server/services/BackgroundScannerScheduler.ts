@@ -419,6 +419,10 @@ export class BackgroundScannerScheduler {
             lowLiquidityHighVolatility: c.lowLiquidityHighVolatility,
             requireFullMultiTimeframe: true,
             provenance: c.provenance,
+            quoteVolume24h: c.quoteVolume24h,
+            spreadPercent: c.spreadPercent,
+            fundingRate: c.fundingRate,
+            priceChangePercent24h: c.priceChangePercent24h,
           });
           smcMap.set(c.symbol, smcRes);
         } catch {

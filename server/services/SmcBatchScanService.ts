@@ -7,6 +7,7 @@ import { TelegramNotificationAdapter } from '../adapters/NotificationAdapter.ts'
 import { RadarDatabase } from '../db/RadarDatabase.ts';
 import {
   MARKET_SCAN_RULE_VERSION,
+  MIN_QUOTE_VOLUME_24H,
   runMarketScan,
 } from '../engine/MarketScanner.ts';
 import {
@@ -3059,7 +3060,7 @@ export class SmcBatchScanService {
 
       const isLowLiquidity =
         preCandidate?.isLowLiquidity ??
-        (ticker ? ticker.quoteVolume24h < 15_000_000 : false);
+        (ticker ? ticker.quoteVolume24h < MIN_QUOTE_VOLUME_24H : false);
       const extremeFunding =
         preCandidate?.extremeFunding ??
         (ticker && ticker.fundingRate !== null
@@ -3087,6 +3088,10 @@ export class SmcBatchScanService {
         lowLiquidityHighVolatility,
         requireFullMultiTimeframe: true,
         provenance: combinedProvenance,
+        quoteVolume24h: ticker?.quoteVolume24h ?? null,
+        spreadPercent: ticker?.spreadPercent ?? null,
+        fundingRate: resolvedFundingRate,
+        priceChangePercent24h: ticker?.priceChangePercent24h ?? null,
       });
 
       let marketRadarCategory =
@@ -3119,14 +3124,12 @@ export class SmcBatchScanService {
         combinedMissingData.length === 0 &&
         smcAnalysis.waitReasons.length === 0
       ) {
-        if (marketRadarCategory === '雷達空頭觀察') {
-          smcAnalysis.actionState = 'WATCH';
-          smcAnalysis.waitReasons.push(
-            '第一層市場雷達方向為空頭觀察，與多頭 SMC 結構方向不一致'
-          );
-        } else {
+        finalTradeSignal = '多頭交易候選';
+        if (
+          marketRadarCategory !== '雷達多頭觀察' &&
+          marketRadarCategory !== '雷達空頭觀察'
+        ) {
           marketRadarCategory = '雷達多頭觀察';
-          finalTradeSignal = '多頭交易候選';
         }
       } else if (
         smcAnalysis.smcEvaluationStatus === 'EVALUATED' &&
@@ -3140,14 +3143,12 @@ export class SmcBatchScanService {
         combinedMissingData.length === 0 &&
         smcAnalysis.waitReasons.length === 0
       ) {
-        if (marketRadarCategory === '雷達多頭觀察') {
-          smcAnalysis.actionState = 'WATCH';
-          smcAnalysis.waitReasons.push(
-            '第一層市場雷達方向為多頭觀察，與空頭 SMC 結構方向不一致'
-          );
-        } else {
+        finalTradeSignal = '空頭交易候選';
+        if (
+          marketRadarCategory !== '雷達空頭觀察' &&
+          marketRadarCategory !== '雷達多頭觀察'
+        ) {
           marketRadarCategory = '雷達空頭觀察';
-          finalTradeSignal = '空頭交易候選';
         }
       } else if (
         smcAnalysis.actionState === 'LONG CANDIDATE' ||
@@ -3159,6 +3160,15 @@ export class SmcBatchScanService {
           smcAnalysis.waitReasons.push(
             '雙層交易候選資格閘門未完全通過，降級為 WATCH'
           );
+        }
+        const downgradeGates = smcAnalysis.missingGates ?? [];
+        if (!downgradeGates.includes('POST_EVAL_DOWNGRADE')) {
+          downgradeGates.push('POST_EVAL_DOWNGRADE');
+        }
+        smcAnalysis.missingGates = downgradeGates;
+        if (smcAnalysis.gateEvaluation) {
+          smcAnalysis.gateEvaluation.missingGates = [...downgradeGates];
+          smcAnalysis.gateEvaluation.lastBlockingGate = 'POST_EVAL_DOWNGRADE';
         }
       }
 

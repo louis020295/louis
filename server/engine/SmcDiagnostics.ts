@@ -1,3 +1,4 @@
+import { ensureBlockedReasonsVisible } from './SignalConfidence.ts';
 import {
   FunnelAggregationScope,
   GateStatisticScope,
@@ -169,10 +170,12 @@ export function deriveSymbolSmcGateEvaluationFromAnalysis(
                 : 'NEUTRAL';
 
   const missingGates: string[] = [];
-  if (
-    effectiveActionState !== 'LONG CANDIDATE' &&
-    effectiveActionState !== 'SHORT CANDIDATE'
-  ) {
+  const isFormal =
+    effectiveActionState === 'LONG CANDIDATE' ||
+    effectiveActionState === 'SHORT CANDIDATE';
+  if (!isFormal && smc.signalDecision) {
+    missingGates.push(...smc.signalDecision.missingGates);
+  } else if (!isFormal) {
     const dirBosPassed = preferBull ? hasBullBos : hasBearBos;
     const dirSweepPassed = preferBull ? hasBullSweep : hasBearSweep;
     const dirDispPassed = preferBull ? hasBullDisplacement : hasBearDisplacement;
@@ -193,14 +196,19 @@ export function deriveSymbolSmcGateEvaluationFromAnalysis(
     if (!dirFvgObPassed) missingGates.push('FVG_OR_ORDER_BLOCK');
     if (!dirMtfPassed) missingGates.push('MTF_ALIGNMENT');
   }
+  const visibleMissingGates = ensureBlockedReasonsVisible(
+    missingGates,
+    effectiveWaitReasons,
+    isFormal
+  );
 
   const nearMissStatus: NearMissStatus =
     effectiveActionState === 'LONG CANDIDATE' ||
     effectiveActionState === 'SHORT CANDIDATE'
       ? 'NOT_NEAR_CANDIDATE'
-      : missingGates.length === 1
+      : visibleMissingGates.length === 1
         ? 'NEAR_MISS_ONE_GATE'
-        : missingGates.length === 2
+        : visibleMissingGates.length === 2
           ? 'NEAR_MISS_TWO_GATES'
           : 'NOT_NEAR_CANDIDATE';
 
@@ -219,9 +227,11 @@ export function deriveSymbolSmcGateEvaluationFromAnalysis(
     liquiditySafetyPassed,
     riskSafetyPassed,
     waitReasons: [...effectiveWaitReasons],
-    missingGates,
+    missingGates: visibleMissingGates,
     lastBlockingGate:
-      missingGates.length > 0 ? missingGates[missingGates.length - 1] : null,
+      visibleMissingGates.length > 0
+        ? visibleMissingGates[visibleMissingGates.length - 1]
+        : null,
     nearMissStatus,
     intendedDirection,
   };
@@ -243,6 +253,23 @@ export const CANONICAL_GATE_LABELS: Record<string, string> = {
   RISK_SAFETY: '資金費率與波動風險安全門檻',
   INTERNAL_DIRECTION_CONFLICT: '同週期多空結構不衝突',
   ALL_GATES: '完整 SMC/ICT 全部門檻',
+  HTF_LTF_AGREEMENT: '觸發週期與高週期方向協議',
+  EVENT_SEQUENCE_OR_LIGHTER_PATH: '事件序列或輕量路徑',
+  LOCATION_DISCOUNT_OR_OTE: '多單位置（折價或 OTE）',
+  LOCATION_PREMIUM_OR_OTE: '空單位置（溢價或 OTE）',
+  TRADABLE_LIQUIDITY: '可交易流動性',
+  DIRECTION_CONFLICT_WITHIN_MARGIN: '多空分數落在衝突邊距內',
+  MOMENTUM_CONTINUATION_CHASE: '24h 極端延續追價',
+  MOMENTUM_REVERSAL_INCOMPLETE: '反向極端但序列未在極端位置完成',
+  FUNDING_CROWDING: '資金費率擁擠',
+  DATA_INTEGRITY: '資料完整性',
+  POST_EVAL_DOWNGRADE: '評估後降級',
+  STATE_REASON: '狀態原因',
+  NO_STRUCTURE: '沒有足夠結構證據',
+  EXTREME_FUNDING_RISK: '極端資金費率',
+  LOW_LIQUIDITY_HIGH_VOLATILITY: '低流動性高波動',
+  BTC_REGIME_FILTER: 'BTC 大盤濾網',
+  RADAR_DIRECTION_CONFLICT: '雷達方向與 SMC 不一致',
 };
 
 export interface EvaluatedGateDiagnosticItemInput {

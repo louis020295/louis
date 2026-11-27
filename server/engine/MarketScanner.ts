@@ -22,6 +22,7 @@ import {
   ScoreBreakdown,
   SmcActionState,
   SmcAnalysisResult,
+  SignalDecision,
   SmcEvaluationStatus,
   SmcGateDiagnosticsSummary,
   SmcNearMissSymbolRecord,
@@ -52,10 +53,18 @@ import {
   deriveSymbolSmcGateEvaluationFromAnalysis,
   EvaluatedGateDiagnosticItemInput,
 } from './SmcRuleEngine.ts';
+import { resolveSignalGatingConfig } from './SignalGatingConfig.ts';
+import {
+  ensureBlockedReasonsVisible,
+  evaluateTradableLiquidity,
+  smcQualityPoints,
+} from './SignalConfidence.ts';
 
 export const MARKET_SCAN_RULE_VERSION = 'v2.1.0-phase2-15m-consistent-vol-multiex';
 
-export const MIN_QUOTE_VOLUME_24H = 15_000_000; // $15M USDT 24h minimum liquidity for standard candidates
+export const MIN_QUOTE_VOLUME_24H = resolveSignalGatingConfig({
+  preset: 'standard',
+}).liquidity.minQuoteVolume24h; // standard absolute floor; relative median and ±1% depth can also pass
 export const MAX_ALLOWED_SPREAD_PERCENT = 0.15; // 0.15% maximum real order-book bid-ask spread percent
 export const LOW_LIQUIDITY_POLICY = 'ONLY_HIGH_RISK_OR_WATCH_OR_WAIT' as const;
 
@@ -88,6 +97,7 @@ export interface MarketScanOptions {
         marketRadarCategory?: MarketRadarCategory;
         finalTradeSignal?: FinalTradeSignal;
         smcAnalysis?: SmcAnalysisResult;
+        signalDecision?: SignalDecision | null;
         gateEvaluation?: SymbolSmcGateEvaluation;
         entryWindowStatus?:
           | 'DETECTED_BEFORE_NEXT_BAR_OPEN'
@@ -197,6 +207,11 @@ export function runMarketScan(
       totalCount > 1 ? Math.round((index / (totalCount - 1)) * 1000) / 10 : 100;
     volumeRankMap.set(ticker.symbol, percentile);
   });
+  const medianQuoteVolume24h =
+    totalCount === 0
+      ? 0
+      : sortedByVolume[Math.floor((totalCount - 1) / 2)].quoteVolume24h;
+  const signalGatingConfig = resolveSignalGatingConfig();
 
   let missingFundingCount = 0;
   let missingSpreadCount = 0;
@@ -343,8 +358,14 @@ export function runMarketScan(
     const isRealSpreadTooWide =
       spreadPercent !== null && spreadPercent > maxSpreadPercent;
 
-    const isLowLiquidity =
-      ticker.quoteVolume24h < MIN_QUOTE_VOLUME_24H || isRealSpreadTooWide;
+    const liquidityVerdict = evaluateTradableLiquidity({
+      quoteVolume24h: ticker.quoteVolume24h,
+      spreadPercent,
+      medianQuoteVolume24h,
+      depthUsdWithin1Pct: null,
+      config: signalGatingConfig,
+    });
+    const isLowLiquidity = !liquidityVerdict.passed || isRealSpreadTooWide;
 
     if (isLowLiquidity) {
       lowLiquidityCount++;
@@ -497,15 +518,20 @@ export function runMarketScan(
             (blockedAfterSmcCandidateReasons[key] ?? 0) + 1;
         } else if (isLowLiquidity) {
           smcActionState = 'WAIT';
-          const reason =
-            '低流動性保護（24h 成交額 < $15M 或盤口價差過寬），不列入交易候選';
+          const reason = `低流動性保護（${liquidityVerdict.reasonZh}），不列入交易候選`;
           if (!smcWaitReasons.includes(reason)) {
             smcWaitReasons.push(reason);
           }
           blockedAfterSmcCandidateCount++;
           blockedAfterSmcCandidateReasons.LOW_LIQUIDITY_GATE =
             (blockedAfterSmcCandidateReasons.LOW_LIQUIDITY_GATE ?? 0) + 1;
-        } else if (!historyGatePassed) {
+        } else if (
+          !historyGatePassed &&
+          cachedSmc?.signalDecision?.actionState !== 'LONG CANDIDATE' &&
+          cachedSmc?.signalDecision?.actionState !== 'SHORT CANDIDATE' &&
+          cachedSmc?.smcAnalysis?.signalDecision?.actionState !== 'LONG CANDIDATE' &&
+          cachedSmc?.smcAnalysis?.signalDecision?.actionState !== 'SHORT CANDIDATE'
+        ) {
           smcActionState = 'WAIT';
           const reason =
             '15m 已確認 K 線歷史成交量基線未就緒或異常 (INSUFFICIENT_HISTORY / BASELINE_UNSTABLE)';
@@ -516,32 +542,6 @@ export function runMarketScan(
           blockedAfterSmcCandidateReasons.HISTORY_VOLUME_BASELINE_GATE =
             (blockedAfterSmcCandidateReasons.HISTORY_VOLUME_BASELINE_GATE ??
               0) + 1;
-        } else if (
-          smcActionState === 'LONG CANDIDATE' &&
-          marketRadarCategory === '雷達空頭觀察'
-        ) {
-          smcActionState = 'WATCH';
-          const reason =
-            '第一層市場雷達方向為空頭觀察，與多頭 SMC 結構方向不一致';
-          if (!smcWaitReasons.includes(reason)) {
-            smcWaitReasons.push(reason);
-          }
-          blockedAfterSmcCandidateCount++;
-          blockedAfterSmcCandidateReasons.RADAR_DIRECTION_CONFLICT =
-            (blockedAfterSmcCandidateReasons.RADAR_DIRECTION_CONFLICT ?? 0) + 1;
-        } else if (
-          smcActionState === 'SHORT CANDIDATE' &&
-          marketRadarCategory === '雷達多頭觀察'
-        ) {
-          smcActionState = 'WATCH';
-          const reason =
-            '第一層市場雷達方向為多頭觀察，與空頭 SMC 結構方向不一致';
-          if (!smcWaitReasons.includes(reason)) {
-            smcWaitReasons.push(reason);
-          }
-          blockedAfterSmcCandidateCount++;
-          blockedAfterSmcCandidateReasons.RADAR_DIRECTION_CONFLICT =
-            (blockedAfterSmcCandidateReasons.RADAR_DIRECTION_CONFLICT ?? 0) + 1;
         } else if (
           ticker.symbol !== 'BTCUSDT' &&
           ((smcActionState === 'LONG CANDIDATE' &&
@@ -561,13 +561,15 @@ export function runMarketScan(
             (blockedAfterSmcCandidateReasons.BTC_REGIME_FILTER ?? 0) + 1;
         } else if (
           smcActionState === 'LONG CANDIDATE' &&
-          marketRadarCategory !== '雷達多頭觀察'
+          marketRadarCategory !== '雷達多頭觀察' &&
+          marketRadarCategory !== '雷達空頭觀察'
         ) {
           marketRadarCategory = '雷達多頭觀察';
           marketRadarLongCount++;
         } else if (
           smcActionState === 'SHORT CANDIDATE' &&
-          marketRadarCategory !== '雷達空頭觀察'
+          marketRadarCategory !== '雷達空頭觀察' &&
+          marketRadarCategory !== '雷達多頭觀察'
         ) {
           marketRadarCategory = '雷達空頭觀察';
           marketRadarShortCount++;
@@ -589,7 +591,10 @@ export function runMarketScan(
         smcActionState === 'SHORT CANDIDATE'
       ) {
         smcWaitReasons = [];
-        smcStatusReason = `已確認完整 ${smcActionState} 結構與多週期共振`;
+        smcStatusReason =
+          cachedSmc?.smcAnalysis?.signalDecision?.stateReasonZh ??
+          cachedSmc?.signalDecision?.stateReasonZh ??
+          `已確認必要閘門（HTF/LTF 協議、序列或輕量路徑、位置、流動性），狀態 ${smcActionState}`;
       } else {
         smcStatusReason =
           smcWaitReasons.length > 0
@@ -751,6 +756,32 @@ export function runMarketScan(
         ? -4
         : 10;
 
+    const attachedDecision =
+      cachedSmc?.signalDecision ?? cachedSmc?.smcAnalysis?.signalDecision ?? null;
+    const decisionConfidence = attachedDecision?.confidence ?? null;
+    let smcQuality = smcQualityPoints(smcActionState, decisionConfidence);
+    let momentumContextNote: string | null = null;
+    const momentumExtreme =
+      absChange >= signalGatingConfig.momentum.extremeAbsChangePct;
+    if (
+      momentumExtreme &&
+      (smcActionState === 'LONG CANDIDATE' || smcActionState === 'SHORT CANDIDATE')
+    ) {
+      const side = smcActionState === 'LONG CANDIDATE' ? 'LONG' : 'SHORT';
+      const continuation =
+        (side === 'LONG' && ticker.priceChangePercent24h > 0) ||
+        (side === 'SHORT' && ticker.priceChangePercent24h < 0);
+      const momentumRow = attachedDecision?.components.find((row) => row.key === 'momentum24h');
+      if (momentumRow && momentumRow.points !== 0) {
+        momentumContextNote = `MOMENTUM_CONTEXT: ${momentumRow.reasonZh}`;
+      } else if (continuation) {
+        smcQuality -= signalGatingConfig.momentum.continuationPenalty;
+        momentumContextNote = `MOMENTUM_CONTEXT: 24h ${ticker.priceChangePercent24h.toFixed(2)}% 與${side === 'LONG' ? '多' : '空'}單同向且達極端，標題分數扣延續追價 ${signalGatingConfig.momentum.continuationPenalty} 分，不因雷達方向直接降級`;
+      } else {
+        momentumContextNote = `MOMENTUM_CONTEXT: 24h ${ticker.priceChangePercent24h.toFixed(2)}% 與正式${side === 'LONG' ? '多' : '空'}頭候選相反。未附帶完整序列與極端位置時只記背景，不否決`;
+      }
+    }
+
     const scoreBreakdown: ScoreBreakdown = {
       volumeAnomaly: volumeAnomalyScore,
       auxiliaryVolumeRank: auxiliaryVolumeRankScore,
@@ -760,6 +791,7 @@ export function runMarketScan(
       fundingRisk: fundingRiskScore,
       liquidityRisk: liquidityRiskScore,
       dataQuality: dataQualityScore,
+      smcQuality,
     };
 
     const rawSum =
@@ -768,7 +800,8 @@ export function runMarketScan(
       scoreBreakdown.relativeBtcStrength +
       scoreBreakdown.fundingRisk +
       scoreBreakdown.liquidityRisk +
-      scoreBreakdown.dataQuality;
+      scoreBreakdown.dataQuality +
+      (scoreBreakdown.smcQuality ?? 0);
 
     // Final Trade Signal & Final Category with strict 1-to-1 invariant (Section 五):
     // LONG CANDIDATE -> 多頭交易候選
@@ -848,15 +881,35 @@ export function runMarketScan(
       scoreCapRule = `MarketScanner.ts Score Cap 48 Rule: Math.min(${rawScoreBeforeCap}, 48) triggered by [${capTriggers.join(', ')}]`;
     }
 
+    const stateCap = signalGatingConfig.scoreCaps;
+    if (!scoreCapApplied && (smcActionState === 'WAIT' || smcActionState === 'WATCH')) {
+      const cap = smcActionState === 'WAIT' ? stateCap.wait : stateCap.watch;
+      if (totalScore > cap) {
+        scoreCapApplied = true;
+        scoreCapRule = `SMC_STATE_SCORE_CAP: ${smcActionState} 標題分數由 ${totalScore} 限制為 ${cap}，避免與訊號狀態矛盾`;
+        totalScore = cap;
+      }
+    } else if (
+      !scoreCapApplied &&
+      (smcActionState === 'LONG CANDIDATE' || smcActionState === 'SHORT CANDIDATE') &&
+      totalScore < stateCap.formalFloor
+    ) {
+      scoreCapRule = `SMC_FORMAL_SCORE_FLOOR: 正式候選標題分數由 ${totalScore} 抬到 ${stateCap.formalFloor}，避免高品質結構被低分掩蓋`;
+      totalScore = stateCap.formalFloor;
+      scoreCapApplied = true;
+    }
+
     // Build complete downgradeReasons trace
     const downgradeReasons: string[] = [];
 
+    if (momentumContextNote) {
+      downgradeReasons.push(momentumContextNote);
+    }
+
     if (!liquidityGatePassed) {
-      if (ticker.quoteVolume24h < MIN_QUOTE_VOLUME_24H) {
+      if (!liquidityVerdict.passed || isRealSpreadTooWide) {
         downgradeReasons.push(
-          `LIQUIDITY_GATE_REJECTED: 24h 成交額 ($${formatCompactUsd(
-            ticker.quoteVolume24h
-          )}) 低於最低流動性門檻 ($${formatCompactUsd(MIN_QUOTE_VOLUME_24H)})`
+          `LIQUIDITY_GATE_REJECTED: ${liquidityVerdict.reasonZh}`
         );
       }
       if (isRealSpreadTooWide) {
@@ -1019,7 +1072,27 @@ export function runMarketScan(
       },
     };
 
-    const missingGates: string[] = symbolGateEvaluation?.missingGates ?? [];
+    const missingGates: string[] = ensureBlockedReasonsVisible(
+      symbolGateEvaluation?.missingGates ?? [],
+      smcWaitReasons,
+      smcActionState === 'LONG CANDIDATE' || smcActionState === 'SHORT CANDIDATE'
+    );
+    if (symbolGateEvaluation) {
+      symbolGateEvaluation.missingGates = missingGates;
+      symbolGateEvaluation.lastBlockingGate =
+        missingGates.length > 0 ? missingGates[missingGates.length - 1] : null;
+      if (
+        smcActionState !== 'LONG CANDIDATE' &&
+        smcActionState !== 'SHORT CANDIDATE'
+      ) {
+        symbolGateEvaluation.nearMissStatus =
+          missingGates.length === 1
+            ? 'NEAR_MISS_ONE_GATE'
+            : missingGates.length === 2
+              ? 'NEAR_MISS_TWO_GATES'
+              : symbolGateEvaluation.nearMissStatus;
+      }
+    }
     const nearMissStatus: NearMissStatus =
       smcEvaluationStatus !== 'EVALUATED' ||
       smcActionState === 'LONG CANDIDATE' ||
@@ -1198,6 +1271,7 @@ export function runMarketScan(
       scoreBreakdown,
       gates,
       downgradeReasons,
+      signalDecision: attachedDecision,
       gateEvaluation: symbolGateEvaluation,
       nearMissStatus,
       paperEligibilityStatus,
@@ -1340,7 +1414,7 @@ export function runMarketScan(
           : spreadDisplayValue,
         weight: scoreBreakdown.liquidityRisk,
         detail: isLowLiquidity
-          ? `低流動性：不列入一般候選（24h 成交額低於 $${formatCompactUsd(MIN_QUOTE_VOLUME_24H)} 或真實 Bid-Ask Spread > ${maxSpreadPercent}%，僅能輸出高風險、準備觀察或 WAIT）`
+          ? `低流動性：不列入一般候選（${liquidityVerdict.reasonZh}；絕對門檻 $${formatCompactUsd(MIN_QUOTE_VOLUME_24H)} 或相對中位數／±1% 深度，Spread > ${maxSpreadPercent}% 同樣攔截）`
           : spreadPercent === null
             ? 'Spread 資料不可用（缺少盤口報價，已記錄 missingData: BID_ASK_SPREAD）'
             : `真實盤口價差 ${spreadPercent.toFixed(4)}% (spread=${spread}) 與 24h 成交額符合主流流動性門檻`,
@@ -1520,6 +1594,7 @@ export function runMarketScan(
       scoreBreakdown,
       gates,
       downgradeReasons,
+      signalDecision: attachedDecision,
       decisionTrace,
       evidences,
       provenance: tickerProvenance,
@@ -1702,7 +1777,7 @@ export function runMarketScan(
       primaryRadarBucket = '第一層：高風險（極端資金費率或低流動性高波動）';
     } else if (c.isLowLiquidity) {
       primaryRadarBucket =
-        '第一層：低流動性保護（24h 成交額 < $15M 或 Spread > 0.15%）';
+        `第一層：低流動性保護（24h 成交額低於絕對門檻 $${formatCompactUsd(MIN_QUOTE_VOLUME_24H)}、相對中位數或價差）`;
     } else if (!c.gates.momentum.passed) {
       primaryRadarBucket = '第一層：24h 價格動能未達 ±3.0% 門檻';
     } else if (!c.gates.relativeBtc.passed) {
@@ -1720,7 +1795,7 @@ export function runMarketScan(
 
     // Overlapping occurrences for radar gate rejections
     if (!c.gates.liquidity.passed) {
-      const k = 'LIQUIDITY_OR_SPREAD_GATE_REJECTED (24h 成交額 < $15M 或 Spread > 0.15%)';
+      const k = `LIQUIDITY_OR_SPREAD_GATE_REJECTED (24h 成交額低於絕對門檻 $${formatCompactUsd(MIN_QUOTE_VOLUME_24H)}、相對中位數或 Spread)`;
       radarReasonOccurrenceCount[k] = (radarReasonOccurrenceCount[k] ?? 0) + 1;
       radarTotalReasonOccurrences++;
     }

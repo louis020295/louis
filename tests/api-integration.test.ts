@@ -220,7 +220,7 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
     }
   });
 
-  it('5. 手動 Demo 模式 (GET /api/scan?mode=demo) 驗證 isDemo=true, fallback=false, 29筆樣本 (AVAXUSDT) INSUFFICIENT_HISTORY 輸出準備觀察，30筆樣本 (SOLUSDT) READY 輸出多頭候選', async () => {
+  it('5. 手動 Demo 模式 (GET /api/scan?mode=demo) 驗證 isDemo=true, fallback=false, AVAX 29筆樣本仍是 INSUFFICIENT_HISTORY，SOL 30筆 READY 輸出多頭候選', async () => {
     const res = await fetch(`${baseUrl}/api/scan?mode=demo`);
     assert.equal(res.status, 200);
     const body = (await res.json()) as MarketScanResponse;
@@ -232,7 +232,8 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
     assert.equal(body.provenance.isDemo, true);
     assert.equal(body.provenance.fallback, false);
 
-    // AVAXUSDT has 29 samples -> INSUFFICIENT_HISTORY -> 準備觀察
+    // The ticker baseline stays short. Structure evaluation may still formalize
+    // when closed klines rebuild a 30-bar baseline inside the SMC engine.
     const avax = body.candidates.find((c) => c.symbol === 'AVAXUSDT')!;
     assert.ok(avax);
     assert.equal(avax.historicalVolume.sampleCount, 29);
@@ -241,7 +242,7 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
     assert.equal(avax.historicalVolume.mad, null);
     assert.equal(avax.historicalVolume.robustZScore, null);
     assert.equal(avax.historicalVolume.rvol, null);
-    assert.equal(avax.category, '準備觀察');
+    assert.equal(avax.category, '多頭候選');
 
     // SOLUSDT has 30 samples -> READY -> 多頭候選
     const sol = body.candidates.find((c) => c.symbol === 'SOLUSDT')!;
@@ -592,11 +593,11 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
     assert.equal(linkTrace.symbol, 'LINKUSDT');
     assert.equal(linkTrace.marketRadarCategory, '雷達多頭觀察');
     assert.equal(linkTrace.smcEvaluationStatus, 'EVALUATED');
-    assert.equal(linkTrace.smcActionState, 'WAIT');
+    assert.equal(linkTrace.smcActionState, 'WATCH');
     assert.equal(linkTrace.finalTradeSignal, 'NONE');
     assert.equal(linkTrace.finalCategory, '準備觀察');
 
-    // Verify ETHUSDT decision-trace: Layer 1 雷達多頭觀察 + Layer 2 WATCH -> finalTradeSignal NONE, finalCategory 準備觀察
+    // ETH is a lighter-path long: radar and SMC now agree, so the trade signal is allowed.
     const ethTraceRes = await fetch(
       `${baseUrl}/api/symbol/ETHUSDT/decision-trace?mode=demo&timeframe=15m`
     );
@@ -605,9 +606,9 @@ describe('API 整合測試 (Phase 2 Full API Integration Tests)', () => {
     assert.equal(ethTrace.symbol, 'ETHUSDT');
     assert.equal(ethTrace.marketRadarCategory, '雷達多頭觀察');
     assert.equal(ethTrace.smcEvaluationStatus, 'EVALUATED');
-    assert.equal(ethTrace.smcActionState, 'WATCH');
-    assert.equal(ethTrace.finalTradeSignal, 'NONE');
-    assert.equal(ethTrace.finalCategory, '準備觀察');
+    assert.equal(ethTrace.smcActionState, 'LONG CANDIDATE');
+    assert.equal(ethTrace.finalTradeSignal, '多頭交易候選');
+    assert.equal(ethTrace.finalCategory, '多頭候選');
 
     // Verify SMC state statistics and non-uniform distribution across Demo 18 symbols
     assert.equal(typeof scanBody.smcWatchCount, 'number');

@@ -36,6 +36,7 @@ import {
 } from './components/PositionSentinelPanel.tsx';
 import { PriceAlertDrawer } from './components/PriceAlertDrawer.tsx';
 import { ProvenanceLine } from './components/ProvenanceLine.tsx';
+import { SignalConfidenceCard } from './components/SignalConfidenceCard.tsx';
 import {
   SettingsFormulasModal,
   SettingsHubTab,
@@ -5584,6 +5585,9 @@ export default function App() {
                         >
                           {symbolDetail.candidate.marketRadarCategory} (Score:{' '}
                           {symbolDetail.candidate.score}
+                          {symbolDetail.smcAnalysis.signalDecision
+                            ? ` · 信心 ${symbolDetail.smcAnalysis.signalDecision.confidence}`
+                            : ''}
                           {symbolDetail.candidate.scoreCapApplied
                             ? ` / 原始 ${symbolDetail.candidate.rawScoreBeforeCap}`
                             : ''}
@@ -5907,7 +5911,7 @@ export default function App() {
                         <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-slate-800/80 bg-slate-950/85 px-3.5 py-2.5 text-xs">
                           <div className="flex flex-wrap items-center gap-2 min-w-0">
                             <span className="font-bold text-amber-300 shrink-0">
-                              5 步闖關 {plainGuide.passedCount}/5
+                              {plainGuide.steps.length} 步闖關 {plainGuide.passedCount}/{plainGuide.steps.length}
                             </span>
                             <div className="flex items-center gap-1 shrink-0">
                               {plainGuide.steps.map((st, i) => (
@@ -6977,7 +6981,7 @@ export default function App() {
                                 </span>
                                 <span className="text-slate-600">·</span>
                                 <span className="text-xs font-semibold text-slate-100">
-                                  已通過 {plainGuide.passedCount} / 5 關
+                                  已通過 {plainGuide.passedCount} / {plainGuide.steps.length} 關
                                 </span>
                               </div>
                             </div>
@@ -7038,6 +7042,13 @@ export default function App() {
                         );
                       })()}
 
+                      <SignalConfidenceCard
+                        decision={
+                          symbolDetail.smcAnalysis.signalDecision ??
+                          symbolDetail.candidate.signalDecision
+                        }
+                      />
+
                       {/* Score Breakdown & Market Scan Evidences (Collapsible) */}
                       <details className="group rounded-xl border border-slate-800 bg-slate-950/90 text-xs overflow-hidden">
                         <summary className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 cursor-pointer select-none">
@@ -7051,7 +7062,8 @@ export default function App() {
                             histVol:{symbolDetail.candidate.scoreBreakdown.volumeAnomaly} ·
                             auxPR:{symbolDetail.candidate.scoreBreakdown.auxiliaryVolumeRank} ·
                             mom:{symbolDetail.candidate.scoreBreakdown.momentum} ·
-                            rs:{symbolDetail.candidate.scoreBreakdown.relativeBtcStrength}
+                            rs:{symbolDetail.candidate.scoreBreakdown.relativeBtcStrength} ·
+                            smc:{symbolDetail.candidate.scoreBreakdown.smcQuality ?? 0}
                           </span>
                         </summary>
                         <div className="divide-y divide-slate-800 border-t border-slate-800 bg-slate-950 text-xs">
@@ -10932,6 +10944,44 @@ function buildPlainLanguageSmcSteps(
 } {
   const c = detail.candidate;
   const smc = detail.smcAnalysis;
+  const decision = smc.signalDecision ?? c.signalDecision;
+  if (decision) {
+    const gateSteps = decision.requiredGates.map((gate, index) => ({
+      stepNumber: index + 1,
+      title: gate.labelZh,
+      passed: gate.passed,
+      statusLabel: gate.passed ? '通過' : '未過',
+      plainDesc: gate.reasonZh,
+    }));
+    const formal =
+      c.finalTradeSignal === '多頭交易候選' || c.finalTradeSignal === '空頭交易候選';
+    gateSteps.push({
+      stepNumber: gateSteps.length + 1,
+      title: `信心分數 ${decision.confidence}/100`,
+      passed: formal,
+      statusLabel: formal ? '正式候選' : decision.actionState,
+      plainDesc: decision.stateReasonZh,
+    });
+    const passedCount = gateSteps.filter((step) => step.passed).length;
+    const tone =
+      c.finalTradeSignal === '多頭交易候選'
+        ? 'emerald'
+        : c.finalTradeSignal === '空頭交易候選'
+          ? 'rose'
+          : decision.actionState === 'WATCH'
+            ? 'sky'
+            : 'amber';
+    return {
+      passedCount,
+      recommendationTitle: decision.stateReasonZh,
+      recommendationBody:
+        decision.conflictBlocked
+          ? `多方 ${decision.longScore}、空方 ${decision.shortScore}，分差低於 ${decision.conflictMargin}，兩邊都保留。`
+          : `加分 ${decision.plusPoints.length} 項、減分 ${decision.minusPoints.length} 項。${decision.lighterPath.used ? '這筆走輕量路徑。' : ''}`,
+      recommendationTone: tone,
+      steps: gateSteps,
+    };
+  }
   const liqPassed = trace ? trace.gates.liquidity.passed && trace.gates.funding.passed : !c.isLowLiquidity && !c.extremeFunding;
   const histPassed = trace ? trace.gates.history.passed : c.historicalVolume.status === 'READY';
   const htf1h = smc.mtfAlignment.byTimeframe['1h'];
@@ -10963,7 +11013,7 @@ function buildPlainLanguageSmcSteps(
       plainDesc: liqPassed
         ? `24h 成交額 $${formatUsdCompact(c.quoteVolume24h)} 充足，資金費率正常，不易被惡意插針。`
         : c.isLowLiquidity
-          ? `24h 成交額僅 $${formatUsdCompact(c.quoteVolume24h)}（低於 $1,500 萬安全門檻），容易滑價。`
+          ? `24h 成交額僅 $${formatUsdCompact(c.quoteVolume24h)}，未達可交易流動性（絕對門檻、相對中位數或盤口深度），容易滑價。`
           : '資金費率過度擁擠（|Funding| ≥ 0.05%），提防主力反向軋空或殺多。',
     },
     {

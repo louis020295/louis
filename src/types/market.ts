@@ -145,6 +145,52 @@ export interface ScoreBreakdown {
   fundingRisk: number;
   liquidityRisk: number;
   dataQuality: number;
+  /** SMC setup quality folded into the headline radar score. */
+  smcQuality?: number;
+}
+
+export interface SignalScoreComponent {
+  key: string;
+  labelZh: string;
+  points: number;
+  maxPoints: number;
+  reasonZh: string;
+}
+
+export interface SignalRequiredGate {
+  key: string;
+  labelZh: string;
+  passed: boolean;
+  reasonZh: string;
+}
+
+/** Step 2 confidence breakdown. Formal state still requires the four gates, not this number alone. */
+export interface SignalDecision {
+  version: 'signal-gating-v1';
+  preset: 'conservative' | 'standard' | 'aggressive';
+  actionState: SmcActionState;
+  confidence: number;
+  side: 'LONG' | 'SHORT' | 'NONE';
+  longScore: number;
+  shortScore: number;
+  margin: number;
+  conflictMargin: number;
+  conflictBlocked: boolean;
+  requiredGates: SignalRequiredGate[];
+  missingGates: string[];
+  waitReasons: string[];
+  components: SignalScoreComponent[];
+  plusPoints: string[];
+  minusPoints: string[];
+  stateReasonZh: string;
+  lighterPath: {
+    id: 'TRIGGER_BOS_MSS_AND_POI';
+    documentedZh: string;
+    enabled: boolean;
+    used: boolean;
+  };
+  formulasZh: string[];
+  liquidityPath?: string;
 }
 
 export interface SymbolDecisionGates {
@@ -262,6 +308,7 @@ export interface SymbolDecisionTrace {
   scoreBreakdown: ScoreBreakdown;
   gates: SymbolDecisionGates;
   downgradeReasons: string[];
+  signalDecision?: SignalDecision | null;
   gateEvaluation?: SymbolSmcGateEvaluation;
   nearMissStatus?: NearMissStatus;
   paperEligibilityStatus?: PaperEligibilityStatus;
@@ -364,6 +411,7 @@ export interface ScannedCandidate {
   scoreBreakdown: ScoreBreakdown;
   gates: SymbolDecisionGates;
   downgradeReasons: string[];
+  signalDecision?: SignalDecision | null;
   decisionTrace: SymbolDecisionTrace;
   gateEvaluation?: SymbolSmcGateEvaluation;
   nearMissStatus?: NearMissStatus;
@@ -862,7 +910,10 @@ export interface SmcEventSequenceState {
   windowBars: number;
   completedStepCount: number;
   steps: SmcEventSequenceStep[];
-  /** Context only. The sequence is not a candidate gate. */
+  /**
+   * Kept for step-1 compatibility. Step 2 reads `isComplete` as required gate (b),
+   * or accepts the documented lighter path when the sequence is incomplete.
+   */
   informational: true;
 }
 
@@ -956,6 +1007,7 @@ export interface SmcAnalysisResult {
   premiumDiscount?: PremiumDiscountRange | null;
   premiumDiscountByTimeframe?: Partial<Record<Timeframe, PremiumDiscountRange>>;
   eventSequence?: SmcEventSequenceState | null;
+  signalDecision?: SignalDecision | null;
 }
 
 export interface SymbolDetailResponse {

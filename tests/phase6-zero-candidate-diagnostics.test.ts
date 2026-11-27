@@ -8,7 +8,7 @@ import {
   DemoExchangeAdapter,
 } from '../server/adapters/ExchangeAdapter.ts';
 import { RadarDatabase } from '../server/db/RadarDatabase.ts';
-import { runMarketScan } from '../server/engine/MarketScanner.ts';
+import { MIN_QUOTE_VOLUME_24H, runMarketScan } from '../server/engine/MarketScanner.ts';
 import {
   evaluateSmcStructure,
   SMC_RULE_VERSION,
@@ -77,7 +77,7 @@ describe('Phase 6: 多空 SMC 候選為 0 的完整診斷與連續 3 週期穩�
         openInterest: oiRes.openInterest,
         historicalVolume: histVol,
         isLowLiquidity:
-          preCandidate?.isLowLiquidity ?? ticker.quoteVolume24h < 15_000_000,
+          preCandidate?.isLowLiquidity ?? ticker.quoteVolume24h < MIN_QUOTE_VOLUME_24H,
         extremeFunding:
           preCandidate?.extremeFunding ??
           (ticker.fundingRate !== null &&

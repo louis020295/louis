@@ -262,9 +262,10 @@ function detectDirectionalSequence(
 }
 
 /**
- * Informational SMC sequence. Not used as a gate.
+ * Ordered SMC sequence used by signal gate (b).
  * Long: sell-side sweep → bullish MSS/CHoCH → displacement → FVG/OB from that displacement.
  * Short is the mirror. Events must occur in that order inside `sequenceWindowBars`.
+ * A complete sequence satisfies the gate. The lighter path is applied later in SignalConfidence.
  */
 export function detectBestEventSequence(
   candles: Kline[] | null | undefined,
