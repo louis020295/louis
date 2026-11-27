@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { formatTaipeiDateTime, formatTaipeiTime } from '../utils/taipeiTime.ts';
 import {
   Activity,
   AlertTriangle,
@@ -318,9 +319,7 @@ export const PositionSentinelPanel: React.FC<PositionSentinelPanelProps> = ({
             <span>
               最近檢查:{' '}
               {status?.lastCycleAt
-                ? new Date(status.lastCycleAt).toLocaleTimeString('zh-TW', {
-                    hour12: false,
-                  })
+                ? formatTaipeiTime(status.lastCycleAt)
                 : '尚未執行'}
             </span>
           </div>
@@ -1155,9 +1154,7 @@ export const PositionSentinelPanel: React.FC<PositionSentinelPanelProps> = ({
                       </span>
                     </div>
                     <span className="text-[11px] text-slate-400">
-                      {new Date(alert.createdAt).toLocaleString('zh-TW', {
-                        hour12: false,
-                      })}
+                      {formatTaipeiDateTime(alert.createdAt)}
                     </span>
                   </div>
                   <div className="text-slate-100 font-medium">

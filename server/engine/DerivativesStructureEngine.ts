@@ -10,6 +10,11 @@ import {
   Timeframe,
 } from '../../src/types/market.ts';
 import { calculateConfirmedAtr14 } from './SmcRuleEngine.ts';
+import {
+  annualizedFundingPercent,
+  DEFAULT_FUNDING_INTERVAL_HOURS,
+  type FundingIntervalSource,
+} from '../market/FundingInterval.ts';
 
 interface ConfirmedSwingPoint {
   type: 'HIGH' | 'LOW';
@@ -111,6 +116,10 @@ export function computeDerivativesStructure(params: {
   fundingSeries: HistoricalFundingRatePoint[];
   currentOiValue?: number | null;
   currentFundingRate?: number | null;
+  fundingIntervalHours?: number | null;
+  fundingIntervalFallback?: boolean;
+  fundingIntervalSource?: FundingIntervalSource;
+  fundingIntervalNoteZh?: string | null;
   evaluatedAt?: string;
 }): DerivativesStructureAnalysis {
   const evaluatedAt = params.evaluatedAt ?? new Date().toISOString();
@@ -335,6 +344,22 @@ export function computeDerivativesStructure(params: {
   let avgFundingRate: number | null = null;
   let deltaBps: number | null = null;
   let annualizedPct: number | null = null;
+  const intervalHours =
+    typeof params.fundingIntervalHours === 'number' &&
+    Number.isFinite(params.fundingIntervalHours) &&
+    params.fundingIntervalHours > 0
+      ? params.fundingIntervalHours
+      : DEFAULT_FUNDING_INTERVAL_HOURS;
+  const fundingIntervalFallback =
+    params.fundingIntervalFallback ??
+    !(
+      typeof params.fundingIntervalHours === 'number' &&
+      Number.isFinite(params.fundingIntervalHours) &&
+      params.fundingIntervalHours > 0
+    );
+  const fundingIntervalSource: FundingIntervalSource =
+    params.fundingIntervalSource ??
+    (fundingIntervalFallback ? 'fallback' : 'exchange');
   let squeezeBias:
     | 'SHORT_SQUEEZE_RISK'
     | 'LONG_SQUEEZE_RISK'
@@ -351,7 +376,10 @@ export function computeDerivativesStructure(params: {
     avgFundingRate =
       recentRates.reduce((a, b) => a + b, 0) / recentRates.length;
     deltaBps = roundTo((resolvedCurrentFunding - avgFundingRate) * 10_000, 2);
-    annualizedPct = roundTo(resolvedCurrentFunding * 3 * 365 * 100, 2);
+    annualizedPct = roundTo(
+      annualizedFundingPercent(resolvedCurrentFunding, intervalHours),
+      2
+    );
 
     if (resolvedCurrentFunding <= -0.0002) {
       squeezeBias = 'SHORT_SQUEEZE_RISK';
@@ -501,6 +529,14 @@ export function computeDerivativesStructure(params: {
       avgRate: avgFundingRate,
       deltaBps,
       annualizedPct,
+      fundingIntervalHours: intervalHours,
+      fundingIntervalSource,
+      fundingIntervalFallback,
+      fundingIntervalNoteZh:
+        params.fundingIntervalNoteZh ??
+        (fundingIntervalFallback
+          ? '無法取得該交易對結算週期，年化暫以 8 小時結算估算（已標記 fallback）'
+          : `每 ${intervalHours} 小時結算`),
       squeezeBias,
       squeezeLabelZh,
       sampleCount: fundingSorted.length,

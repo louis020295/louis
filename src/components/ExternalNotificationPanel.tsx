@@ -1,4 +1,5 @@
 import React from 'react';
+import { formatTaipeiTime } from '../utils/taipeiTime.ts';
 import { Bell, CheckCircle2, Send, ShieldAlert } from 'lucide-react';
 import {
   ExternalNotificationChannel,
@@ -274,9 +275,7 @@ export const ExternalNotificationPanel: React.FC<
                 logs.map((log) => (
                   <tr key={log.id} className="hover:bg-slate-900/40">
                     <td className="py-1.5 px-2.5 text-slate-400 whitespace-nowrap">
-                      {new Date(log.createdAt).toLocaleTimeString('zh-TW', {
-                        hour12: false,
-                      })}
+                      {formatTaipeiTime(log.createdAt)}
                     </td>
                     <td className="py-1.5 px-2.5 text-slate-200 whitespace-nowrap">
                       {log.channel}

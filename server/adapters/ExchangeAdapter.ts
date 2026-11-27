@@ -272,9 +272,16 @@ export interface ExchangeAdapter {
   fetchKlines(
     symbol: string,
     timeframe: Timeframe,
-    limit?: number
+    limit?: number,
+    window?: KlineFetchWindow
   ): Promise<{
     klines: Kline[];
+    provenance: DataProvenance;
+  }>;
+
+  /** Binance `/fapi/v1/fundingInfo`. Other venues may omit this. */
+  fetchFundingIntervals?(): Promise<{
+    bySymbol: Record<string, number>;
     provenance: DataProvenance;
   }>;
 
@@ -338,6 +345,11 @@ export interface AdapterClientConfig {
   retryBaseDelayMs?: number;
   rateLimiter?: SlidingWindowRateLimiter;
   customFetch?: typeof fetch;
+}
+
+export interface KlineFetchWindow {
+  startTime?: number;
+  endTime?: number;
 }
 
 const INTERVAL_MS_MAP: Record<Timeframe | '1m', number> = {
@@ -682,23 +694,73 @@ export class BinanceFuturesAdapter implements ExchangeAdapter {
     return this.fetchKlines(symbol, '1m' as unknown as Timeframe, limit);
   }
 
+  public async fetchFundingIntervals(): Promise<{
+    bySymbol: Record<string, number>;
+    provenance: DataProvenance;
+  }> {
+    const fetchedAt = new Date().toISOString();
+    try {
+      const { data, endpointUsed, usedFallbackEndpoint } = await this.request<
+        Array<{ symbol: string; fundingIntervalHours: number | string }>
+      >('/fapi/v1/fundingInfo');
+      const bySymbol: Record<string, number> = {};
+      for (const row of data || []) {
+        const hours = Number(row.fundingIntervalHours);
+        if (row.symbol && Number.isFinite(hours) && hours > 0) {
+          bySymbol[String(row.symbol).toUpperCase()] = hours;
+        }
+      }
+      return {
+        bySymbol,
+        provenance: {
+          source: `Binance USDⓈ-M Futures REST (${endpointUsed}/fapi/v1/fundingInfo)`,
+          fetchedAt,
+          stale: false,
+          fallback: usedFallbackEndpoint,
+          missingData: Object.keys(bySymbol).length === 0 ? ['fundingInterval'] : [],
+          isDemo: false,
+        },
+      };
+    } catch {
+      return {
+        bySymbol: {},
+        provenance: {
+          source: 'Binance USDⓈ-M Futures REST (/fapi/v1/fundingInfo)',
+          fetchedAt,
+          stale: false,
+          fallback: true,
+          missingData: ['fundingInterval'],
+          isDemo: false,
+        },
+      };
+    }
+  }
+
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
-    limit = 120
+    limit = 120,
+    window?: KlineFetchWindow
   ): Promise<{
     klines: Kline[];
     provenance: DataProvenance;
   }> {
     const fetchedAt = new Date().toISOString();
     const nowMs = Date.now();
+    const params = new URLSearchParams({
+      symbol,
+      interval: timeframe,
+      limit: String(limit),
+    });
+    if (window?.startTime != null && Number.isFinite(window.startTime)) {
+      params.set('startTime', String(Math.floor(window.startTime)));
+    }
+    if (window?.endTime != null && Number.isFinite(window.endTime)) {
+      params.set('endTime', String(Math.floor(window.endTime)));
+    }
 
     const { data, endpointUsed, usedFallbackEndpoint } =
-      await this.request<BinanceKlineTuple[]>(
-        `/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(
-          timeframe
-        )}&limit=${limit}`
-      );
+      await this.request<BinanceKlineTuple[]>(`/fapi/v1/klines?${params.toString()}`);
 
     const klines: Kline[] = (data || []).map((tuple) => {
       const openTime = Number(tuple[0]);
@@ -1264,7 +1326,8 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
-    limit = 120
+    limit = 120,
+    window?: KlineFetchWindow
   ): Promise<{
     klines: Kline[];
     provenance: DataProvenance;
@@ -1273,15 +1336,25 @@ export class BybitFuturesAdapter implements ExchangeAdapter {
     const nowMs = Date.now();
     const bybitInterval = BYBIT_INTERVAL_MAP[timeframe];
     const intervalMs = INTERVAL_MS_MAP[timeframe];
+    const params = new URLSearchParams({
+      category: 'linear',
+      symbol,
+      interval: bybitInterval,
+      limit: String(limit),
+    });
+    if (window?.startTime != null && Number.isFinite(window.startTime)) {
+      params.set('start', String(Math.floor(window.startTime)));
+    }
+    if (window?.endTime != null && Number.isFinite(window.endTime)) {
+      params.set('end', String(Math.floor(window.endTime)));
+    }
 
     const { data, endpointUsed, usedFallbackEndpoint } = await this.request<{
       category: string;
       symbol: string;
       list: BybitKlineTuple[];
     }>(
-      `/v5/market/kline?category=linear&symbol=${encodeURIComponent(
-        symbol
-      )}&interval=${bybitInterval}&limit=${limit}`
+      `/v5/market/kline?${params.toString()}`
     );
 
     if (data.retCode !== 0 || !data.result?.list) {
@@ -1867,7 +1940,8 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
-    limit = 120
+    limit = 120,
+    window?: KlineFetchWindow
   ): Promise<{
     klines: Kline[];
     provenance: DataProvenance;
@@ -1876,14 +1950,21 @@ export class BingXFuturesAdapter implements ExchangeAdapter {
     const nowMs = Date.now();
     const bingxSymbol = toBingXSymbol(symbol);
     const intervalMs = INTERVAL_MS_MAP[timeframe];
+    const params = new URLSearchParams({
+      symbol: bingxSymbol,
+      interval: timeframe,
+      limit: String(limit),
+    });
+    if (window?.startTime != null && Number.isFinite(window.startTime)) {
+      params.set('startTime', String(Math.floor(window.startTime)));
+    }
+    if (window?.endTime != null && Number.isFinite(window.endTime)) {
+      params.set('endTime', String(Math.floor(window.endTime)));
+    }
 
     const { data, endpointUsed, usedFallbackEndpoint } = await this.request<
       BingXKlineRaw[]
-    >(
-      `/openApi/swap/v3/quote/klines?symbol=${encodeURIComponent(
-        bingxSymbol
-      )}&interval=${encodeURIComponent(timeframe)}&limit=${limit}`
-    );
+    >(`/openApi/swap/v3/quote/klines?${params.toString()}`);
 
     if (data.code !== 0 || !Array.isArray(data.data)) {
       throw new ExchangeApiUnavailableError(
@@ -2456,10 +2537,28 @@ export class DemoExchangeAdapter implements ExchangeAdapter {
     return this.fetchKlines(symbol, '1m' as unknown as Timeframe, limit);
   }
 
+  public async fetchFundingIntervals(): Promise<{
+    bySymbol: Record<string, number>;
+    provenance: DataProvenance;
+  }> {
+    return {
+      bySymbol: {},
+      provenance: {
+        source: 'DEMO_SYNTHETIC_DATASET',
+        fetchedAt: new Date().toISOString(),
+        stale: false,
+        fallback: true,
+        missingData: ['fundingInterval'],
+        isDemo: true,
+      },
+    };
+  }
+
   public async fetchKlines(
     symbol: string,
     timeframe: Timeframe,
-    limit = 100
+    limit = 100,
+    window?: KlineFetchWindow
   ): Promise<{
     klines: Kline[];
     provenance: DataProvenance;
@@ -2470,6 +2569,10 @@ export class DemoExchangeAdapter implements ExchangeAdapter {
 
     const intervalMs = INTERVAL_MS_MAP[timeframe];
     const nowAligned = Math.floor(Date.now() / intervalMs) * intervalMs;
+    const endOpen =
+      window?.endTime != null && Number.isFinite(window.endTime)
+        ? Math.floor(window.endTime / intervalMs) * intervalMs
+        : nowAligned;
 
     let mode: 'BULL' | 'BEAR' | 'WATCH_BULL' | 'WATCH_BEAR' | 'RANGE' = 'BULL';
     if (seed.pattern === 'BEAR_SMC') {
@@ -2484,13 +2587,22 @@ export class DemoExchangeAdapter implements ExchangeAdapter {
       mode = 'RANGE';
     }
 
-    const klines = generateDeterministicSmcKlines({
+    let klines = generateDeterministicSmcKlines({
       basePrice: seed.lastPrice,
       count: limit,
       intervalMs,
-      endOpenTime: nowAligned,
+      endOpenTime: endOpen,
       mode,
     });
+    if (window?.endTime != null) {
+      const nowMs = Date.now();
+      klines = klines.map((k) =>
+        k.closeTime <= nowMs ? { ...k, isClosed: true } : k
+      );
+    }
+    if (window?.startTime != null && Number.isFinite(window.startTime)) {
+      klines = klines.filter((k) => k.openTime >= (window.startTime as number));
+    }
 
     return {
       klines,

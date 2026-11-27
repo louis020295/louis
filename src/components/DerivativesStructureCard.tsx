@@ -172,7 +172,11 @@ export const DerivativesStructureCard: React.FC<
             }`}
           >
             {funding.status === 'READY' && funding.currentRate !== null
-              ? `${(funding.currentRate * 100).toFixed(4)}% (年化 ${funding.annualizedPct}%)`
+              ? `${(funding.currentRate * 100).toFixed(4)}% (年化 ${funding.annualizedPct}%${
+                  funding.fundingIntervalHours
+                    ? ` · 每 ${funding.fundingIntervalHours}h`
+                    : ''
+                }${funding.fundingIntervalFallback ? ' · 8h fallback' : ''})`
               : 'Funding 資料缺失'}
           </div>
           <div className="font-sans text-[11px] text-slate-400 leading-snug break-words">

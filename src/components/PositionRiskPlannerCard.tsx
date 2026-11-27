@@ -437,7 +437,7 @@ export const PositionRiskPlannerCard: React.FC<
             className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2 text-[11px] ${
               entryZoneAnalysis.status === 'OVEREXTENDED'
                 ? 'border-amber-500/45 bg-amber-950/35 text-amber-200'
-                : entryZoneAnalysis.status === 'IN_DISCOUNT_ZONE'
+                : entryZoneAnalysis.status === 'NEAR_POI'
                   ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-200'
                   : 'border-sky-500/35 bg-sky-950/25 text-sky-200'
             }`}

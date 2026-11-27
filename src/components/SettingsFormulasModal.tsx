@@ -1,4 +1,5 @@
 import React from 'react';
+import { formatTaipeiTime } from '../utils/taipeiTime.ts';
 import {
   Activity,
   Calculator,
@@ -729,20 +730,17 @@ export const SettingsFormulasModal: React.FC<SettingsFormulasModalProps> = ({
                     </div>
                     <div className="mt-0.5 text-xs font-bold text-slate-200 truncate">
                       {activeSmc?.lastJobCompletedAt ?? activeSmc?.lastCompletedAt
-                        ? new Date(
+                        ? formatTaipeiTime(
                             activeSmc?.lastJobCompletedAt ??
                               activeSmc?.lastCompletedAt ??
                               ''
-                          ).toLocaleTimeString('zh-TW', { hour12: false })
+                          )
                         : '尚無完成紀錄'}
                     </div>
                     <div className="text-[10px] font-sans text-sky-300 truncate">
                       資料新鮮度 · 最後進度:{' '}
                       {activeSmc?.lastProgressAt
-                        ? new Date(activeSmc.lastProgressAt).toLocaleTimeString(
-                            'zh-TW',
-                            { hour12: false }
-                          )
+                        ? formatTaipeiTime(activeSmc.lastProgressAt)
                         : 'N/A'}
                     </div>
                   </div>

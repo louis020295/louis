@@ -13,6 +13,7 @@ import {
   evaluateSmcStructure,
   SMC_RULE_VERSION,
 } from '../engine/SmcRuleEngine.ts';
+import { fetchClosedCandleSeries } from '../market/ClosedCandleSeries.ts';
 import {
   evaluateHistoricalVolumeAnomaly,
   extractPriorConfirmedBaselineWindow,
@@ -2548,7 +2549,18 @@ export class SmcBatchScanService {
       let res: { klines: Kline[]; provenance: DataProvenance };
       let httpLatencyMs = 0;
       try {
-        res = await adapter.fetchKlines(symbol, timeframe, fetchLimit);
+        const series = await fetchClosedCandleSeries({
+          symbol,
+          timeframe,
+          barCount: fetchLimit,
+          exactRequestLimit: fetchLimit,
+          fetchPage: (query) =>
+            adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+        });
+        res = {
+          klines: [...series.klines, ...series.forming],
+          provenance: series.provenance,
+        };
         httpLatencyMs = Math.max(0, Date.now() - httpStartMs);
       } finally {
         this.releaseHttpSlot(exchange);

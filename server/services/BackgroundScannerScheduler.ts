@@ -6,6 +6,7 @@ import { TelegramNotificationAdapter } from '../adapters/NotificationAdapter.ts'
 import { RadarDatabase } from '../db/RadarDatabase.ts';
 import { runMarketScan } from '../engine/MarketScanner.ts';
 import { evaluateSmcStructure } from '../engine/SmcRuleEngine.ts';
+import { fetchClosedCandleSeries } from '../market/ClosedCandleSeries.ts';
 import {
   BackgroundScanRunRecord,
   BackgroundSchedulerSmcCoverage,
@@ -357,10 +358,50 @@ export class BackgroundScannerScheduler {
         try {
           const [oiRes, k5m, k15m, k1h, k4h] = await Promise.all([
             adapter.fetchOpenInterest(c.symbol, c.lastPrice),
-            adapter.fetchKlines(c.symbol, '5m', 60),
-            adapter.fetchKlines(c.symbol, '15m', 60),
-            adapter.fetchKlines(c.symbol, '1h', 60),
-            adapter.fetchKlines(c.symbol, '4h', 60),
+            fetchClosedCandleSeries({
+              symbol: c.symbol,
+              timeframe: '5m',
+              barCount: 60,
+              exactRequestLimit: 60,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
+            fetchClosedCandleSeries({
+              symbol: c.symbol,
+              timeframe: '15m',
+              barCount: 60,
+              exactRequestLimit: 60,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
+            fetchClosedCandleSeries({
+              symbol: c.symbol,
+              timeframe: '1h',
+              barCount: 60,
+              exactRequestLimit: 60,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
+            fetchClosedCandleSeries({
+              symbol: c.symbol,
+              timeframe: '4h',
+              barCount: 60,
+              exactRequestLimit: 60,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
           ]);
           const smcRes = evaluateSmcStructure({
             symbol: c.symbol,

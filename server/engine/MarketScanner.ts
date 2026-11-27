@@ -1546,6 +1546,8 @@ export function runMarketScan(
       intendedDirection,
       earlyIgnition,
       entryZoneSummary: cachedSmc?.smcAnalysis?.entryZoneAnalysis ?? null,
+      premiumDiscount: cachedSmc?.smcAnalysis?.premiumDiscount ?? null,
+      eventSequence: cachedSmc?.smcAnalysis?.eventSequence ?? null,
       tradeHorizon:
         smcEvaluationStatus !== 'PENDING' || earlyIgnition.status !== 'NONE'
           ? classifyTradeHorizon({

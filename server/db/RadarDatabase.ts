@@ -3888,6 +3888,7 @@ export class RadarDatabase {
         exitPrice: latestPrice,
         entryTimeMs,
         exitTimeMs: nowMs,
+        symbol: entry.symbol,
         entryOrderType:
           entry.costConfig?.entryOrderType ??
           (entry.strategyTrack === 'SMC_PULLBACK_LIMIT' ? 'LIMIT' : 'MARKET'),
@@ -4078,6 +4079,7 @@ export class RadarDatabase {
               : 'MARKET'),
           exitIsLimitFill: options?.exitIsLimitFill ?? false,
           fundingRatePer8h: options?.fundingRatePer8h,
+          symbol: existing.symbol,
           costConfig: existing.costConfig,
         });
 

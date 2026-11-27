@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { formatTaipeiDateTime, formatTaipeiTime } from './utils/taipeiTime.ts';
 import {
   AlertTriangle,
   Bell,
@@ -250,9 +251,7 @@ export default function App() {
   const [backtestReports, setBacktestReports] = useState<BacktestResult[]>([]);
   const [backtestLoading, setBacktestLoading] = useState<boolean>(false);
   const [backtestError, setBacktestError] = useState<string | null>(null);
-  const [backtestBarLimit, setBacktestBarLimit] = useState<
-    120 | 240 | 500 | 1000
-  >(240);
+  const [backtestBarLimit, setBacktestBarLimit] = useState<number>(240);
   const [costConfigState, setCostConfigState] = useState<TradingCostConfig>({
     makerFeeBps: 2,
     takerFeeBps: 5,
@@ -2920,14 +2919,14 @@ export default function App() {
           return false;
         }
         return (
-          ez.status === 'IN_DISCOUNT_ZONE' || ez.status === 'NEAR_PULLBACK_ZONE'
+          ez.status === 'NEAR_POI' || ez.status === 'NEAR_PULLBACK_ZONE'
         );
       })
       .sort((a, b) => {
         const ezA = a.entryZoneSummary!;
         const ezB = b.entryZoneSummary!;
-        const tierA = ezA.status === 'IN_DISCOUNT_ZONE' ? 0 : 1;
-        const tierB = ezB.status === 'IN_DISCOUNT_ZONE' ? 0 : 1;
+        const tierA = ezA.status === 'NEAR_POI' ? 0 : 1;
+        const tierB = ezB.status === 'NEAR_POI' ? 0 : 1;
         if (tierA !== tierB) return tierA - tierB;
         const candA =
           a.smcActionState === 'LONG CANDIDATE' ||
@@ -4930,7 +4929,7 @@ export default function App() {
                               className={`mt-0.5 text-[10px] truncate ${
                                 zone?.status === 'OVEREXTENDED'
                                   ? 'text-amber-300'
-                                  : zone?.status === 'IN_DISCOUNT_ZONE'
+                                  : zone?.status === 'NEAR_POI'
                                     ? 'text-emerald-300'
                                     : zone?.status === 'NEAR_PULLBACK_ZONE'
                                       ? 'text-sky-300'
@@ -4939,7 +4938,7 @@ export default function App() {
                             >
                               {zone?.status === 'OVEREXTENDED'
                                 ? `延伸過熱 (${zone.distanceToZoneAtr !== null ? `${zone.distanceToZoneAtr.toFixed(2)}x ATR` : '遠離區間'}) · 建議等回踩 ${zone.anchorLabel}`
-                                : zone?.status === 'IN_DISCOUNT_ZONE'
+                                : zone?.status === 'NEAR_POI'
                                   ? `已入 ${zone.anchorLabel} 理想回踩區`
                                   : zone?.status === 'NEAR_PULLBACK_ZONE'
                                     ? `接近 ${zone.anchorLabel} 回踩區`
@@ -5092,7 +5091,7 @@ export default function App() {
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex flex-wrap items-center gap-2 min-w-0">
                       <span className="text-xs font-semibold text-amber-300">
-                        回踩狙擊雷達 (FVG / OB 折價區即時追蹤)
+                        回踩狙擊雷達 (FVG / OB 興趣區 POI)
                       </span>
                       <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">
                         {pullbackReadyCandidates.length} 檔
@@ -5127,7 +5126,7 @@ export default function App() {
                       {pullbackReadyCandidates.slice(0, 4).map((pc) => {
                         const ez = pc.entryZoneSummary!;
                         const isSel = pc.symbol === selectedSymbol;
-                        const isInZone = ez.status === 'IN_DISCOUNT_ZONE';
+                        const isInZone = ez.status === 'NEAR_POI';
                         const isLong = ez.direction === 'LONG';
                         const distPct =
                           ez.distanceToZonePct !== null
@@ -5610,12 +5609,9 @@ export default function App() {
                           <div className="mt-0.5 flex items-center justify-end gap-2 text-[10px] font-mono text-slate-400">
                             <span>
                               {symbolDetail.smcAnalysis.evaluatedAt
-                                ? new Date(
-                                    symbolDetail.smcAnalysis.evaluatedAt
-                                  ).toLocaleTimeString('zh-TW', { hour12: false })
-                                : new Date(
-                                    symbolDetail.provenance.fetchedAt
-                                  ).toLocaleTimeString('zh-TW', { hour12: false })}
+                                ? formatTaipeiTime(symbolDetail.smcAnalysis.evaluatedAt)
+                                : formatTaipeiTime(symbolDetail.provenance.fetchedAt)}
+                              <span className="text-slate-500"> 台北</span>
                             </span>
                             <button
                               type="button"
@@ -6569,7 +6565,7 @@ export default function App() {
                                 } ${
                                   ez.status === 'OVEREXTENDED'
                                     ? 'border-amber-500/45 bg-amber-950/25 text-amber-100'
-                                    : ez.status === 'IN_DISCOUNT_ZONE'
+                                    : ez.status === 'NEAR_POI'
                                       ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-100'
                                       : ez.status === 'NEAR_PULLBACK_ZONE'
                                         ? 'border-sky-500/35 bg-sky-950/20 text-sky-100'
@@ -6581,6 +6577,34 @@ export default function App() {
                                     <span className="font-bold">
                                       {ez.headlineZh}
                                     </span>
+                                    {symbolDetail.smcAnalysis.premiumDiscount?.labels.map(
+                                      (label) => (
+                                        <span
+                                          key={label}
+                                          className="rounded border border-violet-400/40 bg-violet-500/15 px-1.5 py-0.5 font-mono text-[10px] text-violet-200"
+                                        >
+                                          {label === 'IN_DISCOUNT'
+                                            ? '折價 IN_DISCOUNT'
+                                            : label === 'IN_PREMIUM'
+                                              ? '溢價 IN_PREMIUM'
+                                              : label === 'IN_OTE'
+                                                ? 'OTE IN_OTE'
+                                                : '均衡'}
+                                        </span>
+                                      )
+                                    )}
+                                    {symbolDetail.smcAnalysis.eventSequence && (
+                                      <span className="rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
+                                        序列{' '}
+                                        {symbolDetail.smcAnalysis.eventSequence.isComplete
+                                          ? '完成'
+                                          : `${symbolDetail.smcAnalysis.eventSequence.completedStepCount}/4`}
+                                        {symbolDetail.smcAnalysis.eventSequence.direction !==
+                                        'NONE'
+                                          ? ` · ${symbolDetail.smcAnalysis.eventSequence.direction}`
+                                          : ''}
+                                      </span>
+                                    )}
                                     {distPct !== null && (
                                       <span className="rounded bg-slate-900/90 px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
                                         距現價 {distPct.toFixed(2)}%
@@ -7331,7 +7355,7 @@ export default function App() {
                   <span className="text-slate-400 font-sans font-semibold">
                     歷史回測 K 線數 (Bar Limit):
                   </span>
-                  {([120, 240, 500, 1000] as const).map((bl) => (
+                  {([120, 240, 500, 1000, 2000, 5000] as const).map((bl) => (
                     <button
                       key={bl}
                       type="button"
@@ -8366,15 +8390,16 @@ export default function App() {
                             {tr.pointInTimeEvidence && (
                               <>
                                 <div>
-                                  Point-in-Time K 線時間: openTime=
-                                  {new Date(
+                                  Point-in-Time K 線時間（台北）: openTime=
+                                  {formatTaipeiDateTime(
                                     tr.pointInTimeEvidence.barOpenTime
-                                  ).toISOString()}{' '}
+                                  )}{' '}
                                   · closeTime=
-                                  {new Date(
+                                  {formatTaipeiDateTime(
                                     tr.pointInTimeEvidence.barCloseTime
-                                  ).toISOString()}{' '}
-                                  · decisionAt={tr.pointInTimeEvidence.decisionAt}
+                                  )}{' '}
+                                  · decisionAt=
+                                  {formatTaipeiDateTime(tr.pointInTimeEvidence.decisionAt)}
                                 </div>
                                 <div>
                                   當時可見已確認 K 線數 (confirmedBarsCount)={' '}
@@ -8389,13 +8414,13 @@ export default function App() {
                                   {tr.pointInTimeEvidence.oiValue ?? tr.pointInTimeEvidence.oi ?? 'N/A'} ·
                                   oiDataTimestamp=
                                   {tr.pointInTimeEvidence.oiDataTimestamp
-                                    ? new Date(tr.pointInTimeEvidence.oiDataTimestamp).toISOString()
+                                    ? formatTaipeiDateTime(tr.pointInTimeEvidence.oiDataTimestamp)
                                     : 'N/A'}{' '}
                                   · 歷史 Funding 對齊: fundingRate=
                                   {tr.pointInTimeEvidence.fundingRate ?? tr.pointInTimeEvidence.funding ?? 'N/A'} ·
                                   fundingDataTimestamp=
                                   {tr.pointInTimeEvidence.fundingDataTimestamp
-                                    ? new Date(tr.pointInTimeEvidence.fundingDataTimestamp).toISOString()
+                                    ? formatTaipeiDateTime(tr.pointInTimeEvidence.fundingDataTimestamp)
                                     : 'N/A'}
                                 </div>
                                 <div>
@@ -8512,11 +8537,7 @@ export default function App() {
                                   </td>
                                   <td className="py-2 px-3 text-slate-300">
                                     {rep.createdAt
-                                      ? new Date(
-                                          rep.createdAt
-                                        ).toLocaleTimeString('zh-TW', {
-                                          hour12: false,
-                                        })
+                                      ? formatTaipeiTime(rep.createdAt)
                                       : ''}
                                   </td>
                                   <td className="py-2 px-3 font-semibold text-slate-100">
@@ -9213,12 +9234,7 @@ export default function App() {
                                 <td className="py-2.5 px-3 text-[10px] text-slate-400">
                                   <div>{entry.provenance.source.slice(0, 38)}</div>
                                   <div>
-                                    {new Date(entry.openedAt).toLocaleString(
-                                      'zh-TW',
-                                      {
-                                        hour12: false,
-                                      }
-                                    )}
+                                    {formatTaipeiDateTime(entry.openedAt)}
                                   </div>
                                 </td>
                                 <td className="py-2.5 px-3 text-right">
@@ -10447,16 +10463,16 @@ export default function App() {
                               signalBarCloseTime:{' '}
                               <strong className="text-slate-200">
                                 {sig.signalBarCloseTime !== null
-                                  ? new Date(
-                                      sig.signalBarCloseTime
-                                    ).toISOString()
+                                  ? formatTaipeiDateTime(sig.signalBarCloseTime)
                                   : 'N/A'}
                               </strong>
                             </span>
                             <span>
                               signalDetectedAt:{' '}
                               <strong className="text-slate-200">
-                                {sig.signalDetectedAt ?? sig.evaluatedAt}
+                                {formatTaipeiDateTime(
+                                  sig.signalDetectedAt ?? sig.evaluatedAt
+                                )}
                               </strong>
                             </span>
                             <span>

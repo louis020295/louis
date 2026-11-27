@@ -1,4 +1,5 @@
 import React from 'react';
+import { formatTaipeiTime } from '../utils/taipeiTime.ts';
 import { Clock, Play, RefreshCw, Search, Square } from 'lucide-react';
 import {
   AutoBacktestStatusResponse,
@@ -223,9 +224,7 @@ export const AutoBacktestControlPanel: React.FC<
               </span>
               <span aria-hidden="true">·</span>
               <span>
-                {new Date(latestBatch.startedAt).toLocaleTimeString('zh-TW', {
-                  hour12: false,
-                })}
+                {formatTaipeiTime(latestBatch.startedAt)} 台北
               </span>
               <span aria-hidden="true">·</span>
               <span>{latestBatch.note}</span>
@@ -240,9 +239,7 @@ export const AutoBacktestControlPanel: React.FC<
           {status?.nextRunAt && (
             <span className="text-sky-300">
               下次排程:{' '}
-              {new Date(status.nextRunAt).toLocaleTimeString('zh-TW', {
-                hour12: false,
-              })}
+              {formatTaipeiTime(status.nextRunAt)} 台北
             </span>
           )}
         </div>

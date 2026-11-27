@@ -166,8 +166,8 @@ export function classifyTradeHorizon(
   const abs24h = Math.abs(priceChangePercent24h);
   const isOverextended =
     entryZoneAnalysis?.status === 'OVEREXTENDED' || abs24h >= 18;
-  const inOrNearDiscount =
-    entryZoneAnalysis?.status === 'IN_DISCOUNT_ZONE' ||
+  const inOrNearPoi =
+    entryZoneAnalysis?.status === 'NEAR_POI' ||
     entryZoneAnalysis?.status === 'NEAR_PULLBACK_ZONE';
 
   // Funding & liquidity carry check
@@ -188,7 +188,7 @@ export function classifyTradeHorizon(
     hasSwingRoom &&
     !isOverextended &&
     healthyCarry &&
-    (aligned15m || inOrNearDiscount || bosOrMssDetected)
+    (aligned15m || inOrNearPoi || bosOrMssDetected)
   ) {
     category = 'SWING_EXTENDED';
   } else if (
@@ -239,9 +239,9 @@ export function classifyTradeHorizon(
   const positionValue =
     entryZoneAnalysis?.status === 'OVEREXTENDED' &&
     entryZoneAnalysis.distanceToZoneAtr !== null
-      ? `偏離折價區 ${entryZoneAnalysis.distanceToZoneAtr.toFixed(1)}x ATR`
-      : inOrNearDiscount
-        ? `${entryZoneAnalysis?.status === 'IN_DISCOUNT_ZONE' ? '已入' : '緊貼'} ${entryZoneAnalysis?.anchorType ?? 'FVG/OB'} 區`
+      ? `偏離 POI ${entryZoneAnalysis.distanceToZoneAtr.toFixed(1)}x ATR`
+      : inOrNearPoi
+        ? `${entryZoneAnalysis?.status === 'NEAR_POI' ? '已入' : '緊貼'} ${entryZoneAnalysis?.anchorType ?? 'FVG/OB'} 區`
         : `24h ${formatSignedPct(priceChangePercent24h)}${rvol !== null ? ` · ${rvol}x 量` : ''}`;
 
   const positionCriterion: TradeHorizonCriterion = {
@@ -251,8 +251,8 @@ export function classifyTradeHorizon(
     valueText: positionValue,
     impactZh: isOverextended
       ? '短線已大幅拉開或追高過熱，慎防回吐宜快進快出'
-      : inOrNearDiscount
-        ? '位於折價/回踩防守區，止損緊湊適合安心抱單'
+      : inOrNearPoi
+        ? '位於 POI 回踩防守區，止損緊湊適合安心抱單'
         : '漲跌幅溫和未過熱，可依結構持有',
   };
 
@@ -286,7 +286,7 @@ export function classifyTradeHorizon(
       summaryZh:
         '1h 與 4h 高週期同向撐腰、目標空間大且尚未過熱、資金費率健康，具備跨時段抱波段條件。',
       executionPlaybookZh:
-        '優先在 FVG / OB 折價區掛單或以 4h 結構設止損；達 TP1 後移動止損至保本，保留部分倉位跟隨 1h/4h 趨勢延伸。',
+        '優先在 FVG / OB 興趣區（POI）掛單或以 4h 結構設止損；達 TP1 後移動止損至保本，保留部分倉位跟隨 1h/4h 趨勢延伸。',
       criteria,
     };
   }
