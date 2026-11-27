@@ -415,6 +415,7 @@ export class PositionSentinelService {
       move1mAtrMultiple: null,
       liveBarRvol5m: null,
       micro5mState: 'UNKNOWN',
+      preliminaryMicro5m: { status: 'NONE', confirmed: false, labelZh: '無未確認盤中預警' },
       structure15mState: 'UNKNOWN',
       htf1hBias: 'UNKNOWN',
       oiDeltaPct: null,
@@ -828,9 +829,16 @@ export class PositionSentinelService {
           : latest5m.close > latest5m.open;
     }
 
-    // 3. 5m Micro-Structure CHoCH & FVG
+    // 3. 5m Micro-Structure CHoCH & FVG — confirmed closed candles only.
+    // Forming (unclosed) 5m bars are recorded separately as preliminaryMicro5m
+    // and must never flip micro5mState or confirmed healthState.
     let micro5mState: PositionSentinelSnapshot['micro5mState'] = 'UNKNOWN';
     let micro5mTriggerRef: number | null = null;
+    let preliminaryMicro5m: NonNullable<PositionSentinelSnapshot['preliminaryMicro5m']> = {
+      status: 'NONE',
+      confirmed: false,
+      labelZh: '無未確認盤中預警',
+    };
     if (confirmed5m.length >= 12) {
       const { swingHighs, swingLows } = findConfirmedSwingPoints(confirmed5m);
       const lastConf5m = confirmed5m[confirmed5m.length - 1];
@@ -840,13 +848,23 @@ export class PositionSentinelService {
           micro5mTriggerRef = lastSwingLow.price;
           if (lastConf5m.close < lastSwingLow.price) {
             micro5mState = 'ADVERSE_CHOCH';
-          } else if (
-            currentPrice < lastSwingLow.price ||
-            (latest5m && !latest5m.isClosed && latest5m.low < lastSwingLow.price)
-          ) {
+          } else if (lastConf5m.low < lastSwingLow.price) {
+            // Confirmed wick tested the pool but the close held above it.
             micro5mState = 'TESTING_SWING';
           } else {
             micro5mState = 'ALIGNED';
+          }
+          if (
+            latest5m &&
+            !latest5m.isClosed &&
+            latest5m.low < lastSwingLow.price &&
+            micro5mState !== 'ADVERSE_CHOCH'
+          ) {
+            preliminaryMicro5m = {
+              status: 'UNCONFIRMED_SWING_TEST',
+              confirmed: false,
+              labelZh: `未確認盤中預警：未收盤 5m 下影線刺穿擺動低點 ${lastSwingLow.price}（須等收盤才能計入結構）`,
+            };
           }
         } else {
           micro5mState = 'ALIGNED';
@@ -857,18 +875,41 @@ export class PositionSentinelService {
           micro5mTriggerRef = lastSwingHigh.price;
           if (lastConf5m.close > lastSwingHigh.price) {
             micro5mState = 'ADVERSE_CHOCH';
-          } else if (
-            currentPrice > lastSwingHigh.price ||
-            (latest5m && !latest5m.isClosed && latest5m.high > lastSwingHigh.price)
-          ) {
+          } else if (lastConf5m.high > lastSwingHigh.price) {
             micro5mState = 'TESTING_SWING';
           } else {
             micro5mState = 'ALIGNED';
+          }
+          if (
+            latest5m &&
+            !latest5m.isClosed &&
+            latest5m.high > lastSwingHigh.price &&
+            micro5mState !== 'ADVERSE_CHOCH'
+          ) {
+            preliminaryMicro5m = {
+              status: 'UNCONFIRMED_SWING_TEST',
+              confirmed: false,
+              labelZh: `未確認盤中預警：未收盤 5m 上影線刺穿擺動高點 ${lastSwingHigh.price}（須等收盤才能計入結構）`,
+            };
           }
         } else {
           micro5mState = 'ALIGNED';
         }
       }
+    }
+    if (
+      preliminaryMicro5m.status === 'NONE' &&
+      latest5m &&
+      !latest5m.isClosed &&
+      liveBarRvol5m !== null &&
+      liveBarRvol5m >= cfg.rvolSpikeThreshold &&
+      isAdverseLive5mBar
+    ) {
+      preliminaryMicro5m = {
+        status: 'UNCONFIRMED_ADVERSE_RVOL',
+        confirmed: false,
+        labelZh: `未確認盤中預警：未收盤 5m 逆向 K 線量能 ${liveBarRvol5m}x（不計入已確認健康狀態）`,
+      };
     }
 
     const adverseFvgRange = detectUnmitigatedOpposingFvg5m(confirmed5m, pos.side);
@@ -1081,15 +1122,21 @@ export class PositionSentinelService {
         confirmedClose: true,
       });
     } else if (micro5mState === 'TESTING_SWING') {
-      const detail = `5m 盤中正在測試/插針跌破擺動防線 ${micro5mTriggerRef ?? '--'} (尚未收盤)`;
+      const detail = `5m 已收盤 K 線影線測試擺動防線 ${micro5mTriggerRef ?? '--'}，收盤仍守在結構內`;
       activeWarnings.push(detail);
+    }
+
+    if (preliminaryMicro5m.status === 'UNCONFIRMED_SWING_TEST') {
+      activeWarnings.push(preliminaryMicro5m.labelZh);
       candidateEvents.push({
         eventType: 'MICRO_CHOCH_5M_UNCONFIRMED',
         severity: 'WARNING',
-        titleZh: '5m 盤中測試微結構支撐/壓力',
-        detailZh: detail,
+        titleZh: '5m 未確認盤中預警（未收盤，不計入已確認結構）',
+        detailZh: preliminaryMicro5m.labelZh,
         confirmedClose: false,
       });
+    } else if (preliminaryMicro5m.status === 'UNCONFIRMED_ADVERSE_RVOL') {
+      activeWarnings.push(preliminaryMicro5m.labelZh);
     }
 
     if (adverseFvgDetected && adverseFvgRange) {
@@ -1156,7 +1203,8 @@ export class PositionSentinelService {
       structure15mState === 'REVERSED' ||
       (micro5mState === 'TESTING_SWING' &&
         liveBarRvol5m !== null &&
-        liveBarRvol5m >= cfg.rvolSpikeThreshold)
+        liveBarRvol5m >= cfg.rvolSpikeThreshold &&
+        !(latest5m && !latest5m.isClosed))
     ) {
       healthState = 'EARLY_REVERSAL';
     } else if (
@@ -1164,11 +1212,9 @@ export class PositionSentinelService {
       distanceToInvalidationPercent <= cfg.stopProximityPct ||
       adverseFvgDetected ||
       oiWarningZh !== null ||
-      htfOpposing ||
-      (liveBarRvol5m !== null &&
-        liveBarRvol5m >= cfg.rvolSpikeThreshold &&
-        isAdverseLive5mBar)
+      htfOpposing
     ) {
+      // Forming-bar RVOL / unclosed wick are preliminary only and do not change confirmed health.
       healthState = 'MOMENTUM_FADING';
     }
 
@@ -1213,6 +1259,7 @@ export class PositionSentinelService {
       move1mAtrMultiple,
       liveBarRvol5m,
       micro5mState,
+      preliminaryMicro5m,
       structure15mState,
       htf1hBias,
       oiDeltaPct: data.oiDeltaPct,

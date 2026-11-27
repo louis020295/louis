@@ -732,6 +732,16 @@ export interface SmcDisplacementEvidence {
   description: string;
 }
 
+export interface SmcFvgZone {
+  direction: 'BULL' | 'BEAR';
+  top: number;
+  bottom: number;
+  candleTime: number;
+  /** 0 = untouched, 1 = fully filled through the far side of the gap. */
+  fillRatio: number;
+  mitigated: boolean;
+}
+
 export interface SmcFvgEvidence {
   detected: boolean;
   direction: 'BULL' | 'BEAR' | 'NONE';
@@ -740,6 +750,10 @@ export interface SmcFvgEvidence {
   mitigated: boolean;
   candleTime: number | null;
   description: string;
+  /** 0–1 fill of the primary (top-level) gap. Omitted by older persisted results. */
+  fillRatio?: number;
+  /** All recent unfilled or partially filled FVGs; primary gap remains in the top-level fields. */
+  zones?: SmcFvgZone[];
 }
 
 export interface SmcOrderBlockEvidence {
@@ -749,6 +763,9 @@ export interface SmcOrderBlockEvidence {
   low: number | null;
   candleTime: number | null;
   description: string;
+  /** True when a later confirmed close has traded through the invalidation side of the block. */
+  mitigated?: boolean;
+  bodyToAtrRatio?: number | null;
 }
 
 export interface SmcMtfAlignment {
@@ -1497,6 +1514,22 @@ export interface BackgroundScanRunRecord {
   durationMs: number;
 }
 
+export interface BackgroundSchedulerSmcCoverage {
+  /** Parsed SCHEDULER_SMC_TOP_N: "ALL" or a positive cap. */
+  topN: number | 'ALL';
+  selectedSymbolCount: number;
+  evaluatedInLatestMap: number;
+  batchWorkerState: string | null;
+  /**
+   * Estimated USDT-M REST weight for one full selected cycle
+   * (4 kline timeframes + 1 openInterest per symbol). Snapshot calls are extra.
+   */
+  estimatedRequestsPerCycle: number;
+  /** Floor minutes at maxRequestsPerMinute = 1200 (excludes queue/backoff). */
+  estimatedMinCycleMinutes: number;
+  rateLimitNoteZh: string;
+}
+
 export interface BackgroundSchedulerStatus {
   safety: typeof TRADING_SAFETY_FLAGS;
   running: boolean;
@@ -1505,6 +1538,8 @@ export interface BackgroundSchedulerStatus {
   lastRunAt: string | null;
   totalRuns: number;
   recentRuns: BackgroundScanRunRecord[];
+  /** Optional: SMC coverage and HTTP-cost readout (added 2026-11-27; clients may ignore). */
+  smcCoverage?: BackgroundSchedulerSmcCoverage;
 }
 
 // ============================================================================
@@ -6548,6 +6583,15 @@ export interface PositionSentinelSnapshot extends PositionSentinelTrackedPositio
   move1mAtrMultiple: number | null;
   liveBarRvol5m: number | null;
   micro5mState: 'ALIGNED' | 'TESTING_SWING' | 'ADVERSE_CHOCH' | 'UNKNOWN';
+  /**
+   * Intrabar / forming-5m early warning. Never used for confirmed structure
+   * or healthState. Optional so older clients can ignore it.
+   */
+  preliminaryMicro5m?: {
+    status: 'NONE' | 'UNCONFIRMED_SWING_TEST' | 'UNCONFIRMED_ADVERSE_RVOL';
+    confirmed: false;
+    labelZh: string;
+  } | null;
   structure15mState: 'ALIGNED' | 'WEAKENING' | 'REVERSED' | 'UNKNOWN';
   htf1hBias: 'BULL' | 'BEAR' | 'NEUTRAL' | 'UNKNOWN';
   oiDeltaPct: number | null;

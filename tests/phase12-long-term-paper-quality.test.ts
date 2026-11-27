@@ -17,8 +17,7 @@ import { PaperShadowMonitor } from '../server/services/PaperShadowMonitor.ts';
 import { SignalOutcomeTracker } from '../server/services/SignalOutcomeTracker.ts';
 import { SmcBatchScanService } from '../server/services/SmcBatchScanService.ts';
 import { ExchangeId, Kline, SmcScanResultRecord } from '../src/types/market.ts';
-
-const TEST_BASE_URL = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
+import { startLocalTestServer } from './helpers/localTestServer.ts';
 
 function createTempDb() {
   const tmpDir = fs.mkdtempSync(
@@ -786,6 +785,9 @@ test('Phase 12 (11 & 12): 服務重啟後 Paper 訊號與監控週期不消失�
 });
 
 test('Phase 12 (13 & 14 + 全新 8 個 API 整合驗證): /api/paper-quality/* 端點回應完整、Demo 遭拒、外部 Telegram/TradingView 請求數維持 0、所有下單 API 維持 404', async () => {
+  const httpServer = await startLocalTestServer();
+  const TEST_BASE_URL = httpServer.baseUrl;
+  try {
   await fetch(`${TEST_BASE_URL}/api/smc-scan/pause?exchange=binance_usdm`, {
     method: 'POST',
   });
@@ -926,5 +928,8 @@ test('Phase 12 (13 & 14 + 全新 8 個 API 整合驗證): /api/paper-quality/* �
       body: JSON.stringify({ symbol: 'BTCUSDT', side: 'BUY', quantity: 1 }),
     });
     assert.equal(res.status, 404, `Order endpoint ${p} must return 404`);
+  }
+  } finally {
+    await httpServer.close();
   }
 });

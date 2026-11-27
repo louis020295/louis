@@ -237,6 +237,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     db,
     telegramDryRunAdapter: telegramAdapter,
     intervalMs: 300_000,
+    smcBatchScanner,
   });
 
   const paperMonitorDb = new PaperMonitorDatabase(db);

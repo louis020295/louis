@@ -328,7 +328,8 @@ describe('Phase 24: Position Sentinel 持倉趨勢即時守護哨兵測試', () 
       '獲利達 +1R 且結構上移時必須提供高於原止損的建議防守位'
     );
 
-    // Case B: Unclosed 5m bar sweeps swing low intraday gently (MICRO_CHOCH_5M_UNCONFIRMED -> MOMENTUM_FADING)
+    // Case B: Unclosed 5m wick is a preliminary warning only — confirmed micro state
+    // and healthState stay intact until a closed candle confirms the test.
     const fading = buildHealthyKlines();
     fading.k5m[26].low = 103.5;
     fading.k5m[27].low = 103.4;
@@ -345,8 +346,10 @@ describe('Phase 24: Position Sentinel 持倉趨勢即時守護哨兵測試', () 
     adapter.klinesByTf['1m'] = fading.k1m;
     st = await sentinel.runEvaluationCycle(Date.now() + 1000);
     snap = st.positions.find((p) => p.id === pos.id)!;
-    assert.equal(snap.micro5mState, 'TESTING_SWING');
-    assert.equal(snap.healthState, 'MOMENTUM_FADING');
+    assert.equal(snap.micro5mState, 'ALIGNED');
+    assert.equal(snap.healthState, 'TREND_INTACT');
+    assert.equal(snap.preliminaryMicro5m?.status, 'UNCONFIRMED_SWING_TEST');
+    assert.equal(snap.preliminaryMicro5m?.confirmed, false);
     const unconfAlert = st.recentAlerts.find(
       (a) => a.positionId === pos.id && a.eventType === 'MICRO_CHOCH_5M_UNCONFIRMED'
     );

@@ -184,7 +184,8 @@ describe('1. 歷史成交量最低樣本數 MIN_HISTORY_SAMPLES = 30、MAD 基�
     assert.notEqual(sol29.category, '空頭候選');
     assert.equal(sol29.category, '準備觀察');
 
-    // SMC Rule Engine with 29 historical volume samples MUST output actionState: "WAIT"
+    // If confirmed 15m klines already contain a prior-30 window, the engine backfills
+    // the baseline from those closed bars instead of staying stuck on the short series.
     const bullKlines = generateDeterministicSmcKlines({
       basePrice: 200,
       count: 70,
@@ -193,7 +194,7 @@ describe('1. 歷史成交量最低樣本數 MIN_HISTORY_SAMPLES = 30、MAD 基�
       mode: 'BULL',
     });
 
-    const smcWith29VolSamples = evaluateSmcStructure({
+    const smcWithKlineBackfill = evaluateSmcStructure({
       symbol: 'SOLUSDT',
       primaryTimeframe: '15m',
       klinesByTimeframe: {
@@ -207,10 +208,34 @@ describe('1. 歷史成交量最低樣本數 MIN_HISTORY_SAMPLES = 30、MAD 基�
       provenance: testFixtureProvenance,
     });
 
-    assert.equal(smcWith29VolSamples.actionState, 'WAIT');
-    assert.ok(
-      smcWith29VolSamples.waitReasons.some((r) =>
+    assert.equal(
+      smcWithKlineBackfill.waitReasons.some((r) =>
         r.includes('INSUFFICIENT_HISTORY')
+      ),
+      false,
+      smcWithKlineBackfill.waitReasons.join(' | ')
+    );
+
+    // When klines themselves also lack 31 confirmed bars, the WAIT gate must still fire.
+    const shortKlines = bullKlines.filter((k) => k.isClosed).slice(0, 20);
+    const smcWithShortKlines = evaluateSmcStructure({
+      symbol: 'SOLUSDT',
+      primaryTimeframe: '15m',
+      klinesByTimeframe: {
+        '5m': shortKlines,
+        '15m': shortKlines,
+        '1h': shortKlines,
+        '4h': shortKlines,
+      },
+      openInterest: 1500000,
+      historicalVolume: sol29.historicalVolume,
+      provenance: testFixtureProvenance,
+    });
+
+    assert.equal(smcWithShortKlines.actionState, 'WAIT');
+    assert.ok(
+      smcWithShortKlines.waitReasons.some((r) =>
+        r.includes('INSUFFICIENT_HISTORY') || r.includes('已確認收盤 K 線數量不足')
       )
     );
   });
@@ -2103,9 +2128,9 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
     assert.equal(fullBullRes.mtfAlignment.aligned, true);
     assert.equal(fullBullRes.actionState, 'LONG CANDIDATE');
 
-    // Case A: Remove Liquidity Sweep (remove wick sweeps on recent 14 bars so neither SSL nor BSL sweep occurs)
+    // Case A: Remove Liquidity Sweep (strip wicks across the sweep lookback so no confirmed swing pool is pierced)
     const noSweepKlines = fullBullKlines.map((k, idx) =>
-      idx >= fullBullKlines.length - 14
+      idx >= fullBullKlines.length - 24
         ? {
             ...k,
             high: Math.max(k.open, k.close),
