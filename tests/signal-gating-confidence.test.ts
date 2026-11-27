@@ -170,12 +170,11 @@ describe('signal gating required gates', () => {
         },
       })
     );
-    assert.equal(decision.actionState, 'LONG CANDIDATE');
-    assert.equal(
-      decision.components.find((row) => row.key === 'location')?.points,
-      0
+    assert.notEqual(decision.actionState, 'LONG CANDIDATE');
+    assert.ok(decision.missingGates.includes('LOCATION_DISCOUNT_OR_OTE'));
+    assert.ok(
+      decision.requiredGates.some((gate) => gate.reasonZh.includes('location unavailable'))
     );
-    assert.ok(decision.minusPoints.some((row) => row.includes('不臆造')));
   });
 
   it('rejects a long outside discount and OTE', () => {
@@ -227,7 +226,13 @@ describe('signal confidence composition', () => {
   it('clamps the side score to 0-100 and matches the rounded component sum', () => {
     const decision = resolveSignalDecision(baseInput());
     const raw = decision.components.reduce((sum, row) => sum + row.points, 0);
-    assert.equal(decision.confidence, Math.max(0, Math.min(100, Math.round(raw))));
+    const dropped = decision.components
+      .filter((row) => row.unavailable)
+      .reduce((sum, row) => sum + Math.max(0, row.maxPoints), 0);
+    const expected = Math.max(0, Math.min(100, Math.round((raw / Math.max(1, 100 - dropped)) * 100)));
+    assert.equal(decision.confidence, expected);
+    assert.ok(decision.components.some((row) => row.key === 'oi' && row.unavailable));
+    assert.ok(decision.components.some((row) => row.key === 'obi' && row.unavailable));
     assert.ok(decision.components.every((row) => row.reasonZh.length > 0));
   });
 
@@ -283,6 +288,10 @@ describe('long short conflict margin', () => {
         premiumDiscount: range('EQUILIBRIUM'),
         longFlags: { ...fullFlags, sweep: true, displacement: true },
         shortFlags: { ...fullFlags, sweep: true, displacement: true },
+        displacementBodyToAtrLong: 2.2,
+        displacementBodyToAtrShort: 2.2,
+        fvgAtrMultipleLong: 0.8,
+        fvgAtrMultipleShort: 0.8,
         fundingRate: 0.0001,
         priceChangePercent24h: 0.4,
       })
@@ -351,5 +360,86 @@ describe('derivatives score adjustments', () => {
     assert.ok(decision.missingGates.includes('FUNDING_CROWDING'));
     assert.ok(decision.minusPoints.some((row) => row.includes('擁擠') || row.includes('資金費率')));
     assert.ok(decision.stateReasonZh.length > 0);
+  });
+});
+
+describe('live-scan gating corrections', () => {
+  it('refuses a formal when confidence is under the preset minimum', () => {
+    const decision = resolveSignalDecision(
+      baseInput({
+        eventSequence: sequence('LONG', false),
+        longFlags: { ...fullFlags, sweep: false, displacement: false },
+        fundingRate: null,
+      })
+    );
+    assert.ok(decision.confidence < SIGNAL_GATING_PRESETS.standard.formalMinConfidence);
+    assert.notEqual(decision.actionState, 'LONG CANDIDATE');
+    assert.ok(decision.missingGates.includes('CONFIDENCE_BELOW_FORMAL'));
+  });
+
+  it('takes the lower-scoring side when that side is the one that passes the gates', () => {
+    const decision = resolveSignalDecision(
+      baseInput({
+        mtfAlignment: mtf('BEAR'),
+        eventSequence: sequence('SHORT', true),
+        premiumDiscount: range('PREMIUM'),
+        longFlags: { ...fullFlags, sweep: true },
+        shortFlags: fullFlags,
+        priceChangePercent24h: 1,
+      })
+    );
+    assert.equal(decision.actionState, 'SHORT CANDIDATE');
+    assert.ok(decision.longScore <= decision.shortScore || decision.missingGates.length === 0);
+  });
+
+  it('keeps WATCH only for one missing gate and enough confidence', () => {
+    const oneGate = resolveSignalDecision(
+      baseInput({ quoteVolume24h: 800_000, medianQuoteVolume24h: 10_000_000 })
+    );
+    assert.equal(oneGate.actionState, 'WATCH');
+    assert.ok(oneGate.confidence >= SIGNAL_GATING_PRESETS.standard.watchMinConfidence);
+
+    const empty = resolveSignalDecision(
+      baseInput({
+        mtfAlignment: mtf('CONFLICT'),
+        eventSequence: sequence('LONG', false),
+        premiumDiscount: range('EQUILIBRIUM'),
+        longFlags: noneFlags,
+        shortFlags: noneFlags,
+        quoteVolume24h: 800_000,
+      })
+    );
+    assert.equal(empty.actionState, 'WAIT');
+  });
+
+  it('scores the sweep that belongs to the sequence, not the latest opposite sweep', () => {
+    const decision = resolveSignalDecision(
+      baseInput({
+        longFlags: { ...fullFlags, sweep: false },
+        eventSequence: sequence('LONG', true),
+      })
+    );
+    const sweep = decision.components.find((row) => row.key === 'sweep');
+    assert.ok(sweep && sweep.points > 0);
+  });
+
+  it('does not let the lighter path qualify the opposite of the sequence', () => {
+    const decision = resolveSignalDecision(
+      baseInput({
+        eventSequence: { ...sequence('LONG', false), direction: 'LONG' },
+        longFlags: noneFlags,
+        shortFlags: fullFlags,
+        mtfAlignment: mtf('BEAR'),
+        premiumDiscount: range('PREMIUM'),
+      })
+    );
+    assert.equal(decision.lighterPath.used, false);
+    assert.notEqual(decision.actionState, 'SHORT CANDIDATE');
+  });
+
+  it('separates confidence when displacement magnitude differs', () => {
+    const small = resolveSignalDecision(baseInput({ displacementBodyToAtrLong: 1.1 }));
+    const large = resolveSignalDecision(baseInput({ displacementBodyToAtrLong: 3.4 }));
+    assert.ok(large.confidence > small.confidence);
   });
 });

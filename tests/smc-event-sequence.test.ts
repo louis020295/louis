@@ -46,6 +46,9 @@ function orderedLong(): Kline[] {
   bars[20] = candle(20, 100, 134, 99, 132);
   bars[21] = candle(21, 136, 170, 135, 168);
   bars[22] = candle(22, 150, 158, 140, 155);
+  for (let i = 23; i < bars.length; i++) {
+    bars[i] = candle(i, 160, 168, 150, 162);
+  }
   return bars;
 }
 
@@ -103,5 +106,18 @@ describe('SMC event sequence', () => {
     assert.equal(mss?.complete, true);
     assert.equal(disp?.complete, false);
     assert.ok((mss?.barIndex ?? 0) - (sweep?.barIndex ?? 0) <= 8);
+  });
+
+  it('invalidates a long sequence after a later candle breaks the sweep low', () => {
+    const bars = orderedLong();
+    const live = detectBestEventSequence(bars, config);
+    assert.equal(live.isComplete, true);
+    assert.equal(live.invalidated, false);
+    const sweepLevel = live.sweepLevel ?? 0;
+    bars.push(candle(bars.length, sweepLevel, sweepLevel + 1, sweepLevel - 0.5, sweepLevel - 0.2));
+    const broken = detectBestEventSequence(bars, config);
+    assert.equal(broken.invalidated, true);
+    assert.equal(broken.isComplete, false);
+    assert.ok((broken.invalidationReasonZh ?? '').includes('掃單'));
   });
 });

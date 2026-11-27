@@ -155,6 +155,8 @@ export interface SignalScoreComponent {
   points: number;
   maxPoints: number;
   reasonZh: string;
+  /** True when the input was missing. The confidence denominator drops this max. */
+  unavailable?: boolean;
 }
 
 export interface SignalRequiredGate {
@@ -915,6 +917,11 @@ export interface SmcEventSequenceState {
    * or accepts the documented lighter path when the sequence is incomplete.
    */
   informational: true;
+  /** Pool price the sweep traded through. Later bars that break it invalidate the sequence. */
+  sweepLevel?: number | null;
+  /** A later closed candle ran the sweep extreme, or filled the displacement FVG / OB. */
+  invalidated?: boolean;
+  invalidationReasonZh?: string | null;
 }
 
 export interface EntryZoneAnalysis {

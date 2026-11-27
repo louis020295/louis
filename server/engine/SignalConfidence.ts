@@ -122,6 +122,19 @@ export interface ResolveSignalInput {
   /** Closed candles used only when cvdDivergence was not supplied. */
   klinesForCvd?: Kline[] | null;
   openInterestPresent?: boolean;
+  /** Body/ATR of the displacement that belongs to this side. Continuous, not a boolean. */
+  displacementBodyToAtrLong?: number | null;
+  displacementBodyToAtrShort?: number | null;
+  fvgAtrMultipleLong?: number | null;
+  fvgAtrMultipleShort?: number | null;
+  distanceToPoiAtrLong?: number | null;
+  distanceToPoiAtrShort?: number | null;
+  /**
+   * Omit to skip the entry-zone gate (synthetic gate tests).
+   * SmcRuleEngine always supplies both sides.
+   */
+  entryZoneLong?: { valid: boolean; reasonZh: string } | null;
+  entryZoneShort?: { valid: boolean; reasonZh: string } | null;
 }
 
 interface SideScore {
@@ -146,7 +159,8 @@ function component(
   labelZh: string,
   points: number,
   maxPoints: number,
-  reasonZh: string
+  reasonZh: string,
+  unavailable = false
 ): SignalScoreComponent {
   return {
     key,
@@ -154,7 +168,17 @@ function component(
     points: Math.round(points),
     maxPoints,
     reasonZh,
+    unavailable,
   };
+}
+
+function confidenceFromComponents(rows: SignalScoreComponent[]): number {
+  const raw = rows.reduce((sum, row) => sum + row.points, 0);
+  const dropped = rows
+    .filter((row) => row.unavailable)
+    .reduce((sum, row) => sum + Math.max(0, row.maxPoints), 0);
+  const denom = Math.max(1, 100 - dropped);
+  return clampScore((raw / denom) * 100);
 }
 
 export function evaluateTradableLiquidity(input: LiquidityInput): LiquidityVerdict {
@@ -299,11 +323,10 @@ export function locationAllows(
 ): { passed: boolean; inOte: boolean; quality: 'OTE' | 'ZONE' | 'UNAVAILABLE' | 'WRONG'; reasonZh: string } {
   if (!range || range.zone === 'UNAVAILABLE' || range.pricePositionPct == null) {
     return {
-      passed: true,
+      passed: false,
       inOte: false,
       quality: 'UNAVAILABLE',
-      reasonZh:
-        '未計分：已確認擺動高低下無法框住現價，不臆造折價／溢價，因此位置閘門不否決也不加分',
+      reasonZh: 'location unavailable：折價／溢價區間無法測量（價格已離開所有已確認擺動），位置閘門不通過',
     };
   }
   const inOte = Boolean(range.inOte || range.labels?.includes('IN_OTE'));
@@ -355,8 +378,15 @@ function sequenceForSide(
   flags: SideStructureFlags,
   config: SignalGatingConfig
 ): { passed: boolean; mode: 'COMPLETE' | 'LIGHTER' | 'PARTIAL' | 'NONE'; reasonZh: string } {
+  if (sequence?.invalidated && sequence.direction === side) {
+    return {
+      passed: false,
+      mode: 'NONE',
+      reasonZh: sequence.invalidationReasonZh ?? '事件序列已失效',
+    };
+  }
   const complete =
-    Boolean(sequence?.isComplete) && sequence?.direction === side;
+    Boolean(sequence?.isComplete) && sequence?.direction === side && !sequence?.invalidated;
   if (complete) {
     return {
       passed: true,
@@ -364,8 +394,15 @@ function sequenceForSide(
       reasonZh: '事件序列已完成：掃流動性 → MSS/CHoCH → 位移 → FVG/OB',
     };
   }
+  const sequenceOwnsOtherSide =
+    sequence?.direction === 'LONG' || sequence?.direction === 'SHORT'
+      ? sequence.direction !== side
+      : false;
   const lighter =
-    config.lighterPathEnabled && flags.bosOrMss && flags.fvgOrOb;
+    config.lighterPathEnabled &&
+    flags.bosOrMss &&
+    flags.fvgOrOb &&
+    !sequenceOwnsOtherSide;
   if (lighter) {
     return {
       passed: true,
@@ -384,6 +421,13 @@ function sequenceForSide(
   const missing: string[] = [];
   if (!flags.bosOrMss) missing.push('BOS/MSS');
   if (!flags.fvgOrOb) missing.push('FVG 或 OB');
+  if (sequenceOwnsOtherSide) {
+    return {
+      passed: false,
+      mode: 'NONE',
+      reasonZh: `事件序列方向是 ${sequence?.direction}，輕量路徑不能拿來做反向`,
+    };
+  }
   if (!config.lighterPathEnabled) {
     return {
       passed: false,
@@ -472,7 +516,14 @@ function obiPoints(
 ): SignalScoreComponent {
   const primary = obi100 ?? obi50 ?? obi200 ?? null;
   if (primary == null || !Number.isFinite(primary)) {
-    return component('obi', '盤口失衡 OBI', 0, maxPoints, '未計分：±0.5%／1%／2% 盤口不可用');
+    return component(
+      'obi',
+      '盤口失衡 OBI',
+      0,
+      maxPoints,
+      'unavailable：±0.5%／1%／2% 盤口深度未提供，此項不進分母',
+      true
+    );
   }
   const abs = Math.abs(primary);
   let magnitude = 0;
@@ -520,8 +571,9 @@ function oiComponent(
       0,
       max,
       openInterestPresent
-        ? '未計分：只有單點未平倉，沒有 OI 變化序列'
-        : '未計分：未平倉量缺失，OI 確認項不加分'
+        ? 'unavailable：只有單點未平倉，沒有 OI 變化，此項不進分母'
+        : 'unavailable：未平倉量缺失，此項不進分母',
+      true
     );
   }
   const priceMin = config.derivatives.oiConfirmAbsPricePct;
@@ -645,6 +697,43 @@ function fundingComponent(
   };
 }
 
+function geometryComponent(
+  side: 'LONG' | 'SHORT',
+  input: ResolveSignalInput,
+  displacementDetected: boolean
+): SignalScoreComponent {
+  const ratio = side === 'LONG' ? input.displacementBodyToAtrLong : input.displacementBodyToAtrShort;
+  const fvg = side === 'LONG' ? input.fvgAtrMultipleLong : input.fvgAtrMultipleShort;
+  const dist = side === 'LONG' ? input.distanceToPoiAtrLong : input.distanceToPoiAtrShort;
+  let points = 0;
+  const parts: string[] = [];
+  if (ratio != null && Number.isFinite(ratio) && ratio > 0) {
+    const earned = Math.max(1, Math.min(5, Math.round(ratio * 1.6)));
+    points += earned;
+    parts.push(`位移實體 ${ratio.toFixed(2)}×ATR +${earned}`);
+  } else if (displacementDetected) {
+    points += 2;
+    parts.push('有同向位移但沒有幅度，先給 +2');
+  }
+  if (fvg != null && Number.isFinite(fvg) && fvg > 0) {
+    const earned = Math.max(1, Math.min(4, Math.round(fvg * 3)));
+    points += earned;
+    parts.push(`FVG ${fvg.toFixed(2)}×ATR +${earned}`);
+  }
+  if (dist != null && Number.isFinite(dist)) {
+    const earned = dist <= 0.2 ? 4 : dist <= 0.8 ? 2 : dist <= 1.6 ? 0 : -3;
+    points += earned;
+    parts.push(`距 POI ${dist.toFixed(2)} ATR ${earned >= 0 ? '+' : ''}${earned}`);
+  }
+  return component(
+    'setupGeometry',
+    '結構連續量',
+    points,
+    13,
+    parts.length > 0 ? parts.join('；') : '沒有可區分的位移幅度、FVG 大小或 POI 距離'
+  );
+}
+
 function atLocationExtreme(
   side: 'LONG' | 'SHORT',
   range: PremiumDiscountRange | null | undefined,
@@ -700,9 +789,29 @@ function scoreSide(
       reasonZh: liquidityReason,
     },
   ];
+  const entryZone = side === 'LONG' ? input.entryZoneLong : input.entryZoneShort;
+  if (entryZone) {
+    requiredPassed.push({
+      key: 'ENTRY_ZONE',
+      labelZh: '有效進場區間與止損止盈',
+      passed: entryZone.valid,
+      reasonZh: entryZone.reasonZh,
+    });
+  }
   for (const gate of requiredPassed) {
     if (!gate.passed) requiredFailed.push(gate.key);
   }
+
+  const sequenceDirection = input.eventSequence?.direction;
+  const sequenceSweep =
+    sequenceDirection === side &&
+    !input.eventSequence?.invalidated &&
+    Boolean(
+      input.eventSequence?.steps.some((step) => step.key === 'LIQUIDITY_SWEEP' && step.complete)
+    );
+  const ownSweep =
+    sequenceSweep ||
+    ((sequenceDirection == null || sequenceDirection === 'NONE') && flags.sweep);
 
   const htfPoints = htf.passed ? weights.htfAgreement : -8;
   const sequencePoints =
@@ -718,9 +827,7 @@ function scoreSide(
       ? weights.locationOte
       : location.quality === 'ZONE'
         ? weights.locationZone
-        : location.quality === 'WRONG'
-          ? weights.locationWrong
-          : 0;
+        : weights.locationWrong;
   const liquidityPoints = liquidityPassed ? weights.liquidityPass : weights.liquidityFail;
 
   const change = input.priceChangePercent24h;
@@ -766,19 +873,17 @@ function scoreSide(
     ),
     component('location', '折價溢價位置', locationPoints, weights.locationOte, location.reasonZh),
     component('liquidity', '可交易流動性', liquidityPoints, weights.liquidityPass, liquidityReason),
-    component(
-      'displacement',
-      '位移 K',
-      flags.displacement ? weights.displacement : 0,
-      weights.displacement,
-      flags.displacement ? '觸發週期有同向位移 K' : '未計入：沒有同向位移 K'
-    ),
+    geometryComponent(side, input, flags.displacement),
     component(
       'sweep',
       '流動性掃單',
-      flags.sweep ? weights.sweep : 0,
+      ownSweep ? weights.sweep : 0,
       weights.sweep,
-      flags.sweep ? '觸發週期有同向掃單' : '未計入：沒有同向掃單'
+      sequenceSweep
+        ? '計入事件序列裡的那次掃單，而不是最新一根反向掃單'
+        : ownSweep
+          ? '沒有定向事件序列，先計入這側自己的掃單'
+          : '未計入：這側的事件序列沒有有效掃單'
     ),
     oiComponent(
       side,
@@ -793,7 +898,7 @@ function scoreSide(
     component('momentum24h', '24h 動能背景', momentumPoints, config.momentum.reversalBonus, momentumReason),
   ];
 
-  const confidence = clampScore(components.reduce((sum, row) => sum + row.points, 0));
+  const confidence = confidenceFromComponents(components);
   let softVeto: SideScore['softVeto'] = null;
   if (funding.crowdedAgainst && Math.abs(input.fundingRate ?? 0) >= config.derivatives.fundingCrowdAbs) {
     softVeto = {
@@ -827,7 +932,11 @@ function scoreSide(
 function pointsToText(row: SignalScoreComponent, positive: boolean): string | null {
   if (positive && row.points > 0) return `${row.labelZh} +${row.points}：${row.reasonZh}`;
   if (!positive && row.points < 0) return `${row.labelZh} ${row.points}：${row.reasonZh}`;
-  if (!positive && row.points === 0 && row.reasonZh.startsWith('未計分')) {
+  if (
+    !positive &&
+    row.points === 0 &&
+    (row.unavailable || row.reasonZh.startsWith('未計分') || row.reasonZh.startsWith('unavailable'))
+  ) {
     return `${row.labelZh} 0：${row.reasonZh}`;
   }
   return null;
@@ -853,17 +962,31 @@ export function resolveSignalDecision(input: ResolveSignalInput): SignalDecision
         });
   const longScore = scoreSide('LONG', input, config, liquidity);
   const shortScore = scoreSide('SHORT', input, config, liquidity);
-  const winner = longScore.confidence >= shortScore.confidence ? longScore : shortScore;
+  const formalReady = (side: SideScore) =>
+    side.requiredFailed.length === 0 &&
+    !side.softVeto &&
+    side.confidence >= config.formalMinConfidence;
+  const longReady = formalReady(longScore);
+  const shortReady = formalReady(shortScore);
+  const winner =
+    longReady && !shortReady
+      ? longScore
+      : shortReady && !longReady
+        ? shortScore
+        : longScore.confidence >= shortScore.confidence
+          ? longScore
+          : shortScore;
   const loser = winner.side === 'LONG' ? shortScore : longScore;
   const margin = Math.abs(longScore.confidence - shortScore.confidence);
-  const conflictBlocked =
+  const bothMeaningful =
     longScore.confidence >= config.conflict.minMeaningfulScore &&
-    shortScore.confidence >= config.conflict.minMeaningfulScore &&
-    margin < config.conflict.minScoreMargin;
+    shortScore.confidence >= config.conflict.minMeaningfulScore;
+  const conflictBlocked =
+    bothMeaningful && margin < config.conflict.minScoreMargin && longReady === shortReady;
 
   const dataBlockers = (input.dataBlockers ?? []).filter((row) => row.trim().length > 0);
   const formulasZh = [
-    '信心 = clamp(0, 100, round(各分項點數和))；多空各算一次，取較高的一側顯示。',
+    '信心 = clamp(0, 100, round(有效分項 / (100 − 不可用項上限) × 100))。OI／OBI 缺資料標 unavailable，不假裝 0 分。',
     '必要閘門只有四項：HTF/LTF 協議、完整序列或輕量路徑、多單折價/OTE 或空單溢價/OTE、可交易流動性。',
     LIGHTER_PATH_DOC_ZH,
     'OI 確認：價格同向 ≥ 0.25% 且 OI ≥ +0.5% 加分；OI ≤ −0.5% 則減分。',
@@ -890,32 +1013,44 @@ export function resolveSignalDecision(input: ResolveSignalInput): SignalDecision
     actionState = 'WAIT';
     missingGates.push('DATA_INTEGRITY');
     waitReasons.push(...dataBlockers);
+  } else if ((longReady || shortReady) && !conflictBlocked) {
+    actionState = winner.side === 'LONG' ? 'LONG CANDIDATE' : 'SHORT CANDIDATE';
   } else if (conflictBlocked) {
     actionState = 'WAIT';
     missingGates.push('DIRECTION_CONFLICT_WITHIN_MARGIN');
     waitReasons.push(
       `多空分數落在衝突邊距內（多 ${longScore.confidence} / 空 ${shortScore.confidence}，差 ${margin} < ${config.conflict.minScoreMargin}），兩邊都列出、暫不選邊`
     );
-  } else if (winner.requiredFailed.length === 0 && winner.softVeto) {
-    actionState = 'WATCH';
-    missingGates.push(winner.softVeto.code);
-    waitReasons.push(winner.softVeto.reasonZh);
-  } else if (winner.requiredFailed.length === 0 && winner.confidence > 0) {
-    actionState = winner.side === 'LONG' ? 'LONG CANDIDATE' : 'SHORT CANDIDATE';
-  } else if (winner.structureEvidence || loser.structureEvidence) {
-    actionState = 'WATCH';
+  } else {
+    const belowFormal =
+      winner.requiredFailed.length === 0 &&
+      !winner.softVeto &&
+      winner.confidence < config.formalMinConfidence;
+    if (winner.softVeto) {
+      missingGates.push(winner.softVeto.code);
+      waitReasons.push(winner.softVeto.reasonZh);
+    }
+    if (belowFormal) {
+      missingGates.push('CONFIDENCE_BELOW_FORMAL');
+      waitReasons.push(
+        `信心 ${winner.confidence} 低於正式候選門檻 ${config.formalMinConfidence}`
+      );
+    }
+    if (winner.requiredFailed.length === 0 && !winner.softVeto && !belowFormal && !winner.structureEvidence) {
+      missingGates.push('NO_STRUCTURE');
+      waitReasons.push('目前沒有足夠的 SMC 結構證據');
+    }
     missingGates.push(...winner.requiredFailed);
     waitReasons.push(
       ...winner.requiredPassed.filter((gate) => !gate.passed).map((gate) => gate.reasonZh)
     );
-  } else {
-    actionState = 'WAIT';
-    missingGates.push(...(winner.requiredFailed.length > 0 ? winner.requiredFailed : ['NO_STRUCTURE']));
-    waitReasons.push(
-      winner.requiredFailed.length > 0
-        ? winner.requiredPassed.filter((gate) => !gate.passed).map((gate) => gate.reasonZh).join('；')
-        : '目前沒有足夠的 SMC 結構證據'
-    );
+    const blockerCount = new Set(missingGates).size;
+    const watch =
+      winner.confidence >= config.watchMinConfidence &&
+      blockerCount > 0 &&
+      blockerCount <= config.watchMaxMissingGates &&
+      (winner.structureEvidence || belowFormal || Boolean(winner.softVeto));
+    actionState = watch ? 'WATCH' : 'WAIT';
   }
 
   if (actionState !== 'LONG CANDIDATE' && actionState !== 'SHORT CANDIDATE') {

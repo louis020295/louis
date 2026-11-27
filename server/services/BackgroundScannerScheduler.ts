@@ -361,8 +361,8 @@ export class BackgroundScannerScheduler {
             fetchClosedCandleSeries({
               symbol: c.symbol,
               timeframe: '5m',
-              barCount: 60,
-              exactRequestLimit: 60,
+              barCount: 99,
+              exactRequestLimit: 99,
               fetchPage: (query) =>
                 adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
             }).then((series) => ({
@@ -372,8 +372,8 @@ export class BackgroundScannerScheduler {
             fetchClosedCandleSeries({
               symbol: c.symbol,
               timeframe: '15m',
-              barCount: 60,
-              exactRequestLimit: 60,
+              barCount: 99,
+              exactRequestLimit: 99,
               fetchPage: (query) =>
                 adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
             }).then((series) => ({
@@ -383,8 +383,8 @@ export class BackgroundScannerScheduler {
             fetchClosedCandleSeries({
               symbol: c.symbol,
               timeframe: '1h',
-              barCount: 60,
-              exactRequestLimit: 60,
+              barCount: 99,
+              exactRequestLimit: 99,
               fetchPage: (query) =>
                 adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
             }).then((series) => ({
@@ -394,8 +394,8 @@ export class BackgroundScannerScheduler {
             fetchClosedCandleSeries({
               symbol: c.symbol,
               timeframe: '4h',
-              barCount: 60,
-              exactRequestLimit: 60,
+              barCount: 99,
+              exactRequestLimit: 99,
               fetchPage: (query) =>
                 adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
             }).then((series) => ({

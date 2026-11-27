@@ -38,7 +38,8 @@ import {
 import { enforceProvenanceIntegrity } from '../utils/provenanceQuarantine.ts';
 import { classifyTradeHorizon } from './TradeHorizonClassifier.ts';
 import { selectClosedCandles } from '../market/ClosedCandleSeries.ts';
-import { computePremiumDiscount } from './PremiumDiscount.ts';
+import { computePremiumDiscount, DEFAULT_DEALING_RANGE_LOOKBACK } from './PremiumDiscount.ts';
+import type { DealingRangeImpulse } from './PremiumDiscount.ts';
 import { detectBestEventSequence } from './SmcEventSequence.ts';
 import {
   resolveDisplacementThresholds,
@@ -683,6 +684,61 @@ function detectEarlyInflection(
     invalidationPrice: null,
     invalidationLabel: null,
     descriptionZh: null,
+  };
+}
+
+function describeEntryZone(zone: EntryZoneAnalysis | null): { valid: boolean; reasonZh: string } {
+  if (
+    !zone ||
+    zone.stopLossPrice == null ||
+    zone.targetPrice == null ||
+    !Number.isFinite(zone.stopLossPrice) ||
+    !Number.isFinite(zone.targetPrice)
+  ) {
+    return { valid: false, reasonZh: '沒有算出止損與止盈，不能當正式候選' };
+  }
+  if (zone.status !== 'NEAR_POI' && zone.status !== 'NEAR_PULLBACK_ZONE') {
+    return {
+      valid: false,
+      reasonZh: `進場區間 ${zone.status}，正式候選需要靠近 POI，而且止損止盈都要算得出來`,
+    };
+  }
+  return {
+    valid: true,
+    reasonZh: `${zone.headlineZh}；止損 ${zone.stopLossPrice}、止盈 ${zone.targetPrice}`,
+  };
+}
+
+function fvgAtrMultiple(
+  direction: 'BULL' | 'BEAR',
+  fvg: SmcFvgEvidence,
+  atr14: number | null
+): number | null {
+  if (!fvg.detected || fvg.mitigated || fvg.direction !== direction) return null;
+  if (fvg.top == null || fvg.bottom == null || atr14 == null || !(atr14 > 0)) return null;
+  return (fvg.top - fvg.bottom) / atr14;
+}
+
+function impulseFromSequence(
+  sequence: SmcAnalysisResult['eventSequence'],
+  candles: Kline[]
+): DealingRangeImpulse | null {
+  if (!sequence || sequence.direction === 'NONE' || sequence.sweepLevel == null) return null;
+  const sweepIndex = sequence.steps.find((step) => step.key === 'LIQUIDITY_SWEEP')?.barIndex;
+  if (sweepIndex == null) return null;
+  const tail = candles.slice(sweepIndex);
+  if (tail.length === 0) return null;
+  if (sequence.direction === 'LONG') {
+    return {
+      low: sequence.sweepLevel,
+      high: Math.max(sequence.sweepLevel, ...tail.map((candle) => candle.high)),
+      direction: 'LONG',
+    };
+  }
+  return {
+    high: sequence.sweepLevel,
+    low: Math.min(sequence.sweepLevel, ...tail.map((candle) => candle.low)),
+    direction: 'SHORT',
   };
 }
 
@@ -1704,15 +1760,13 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     structureConfig.swingConfirmationBars
   );
 
-  const entryZoneDirection: 'LONG' | 'SHORT' | 'NEUTRAL' =
-    intendedDirection !== 'NEUTRAL'
-      ? intendedDirection
-      : earlyInflection.direction;
-
-  const entryZoneAnalysis =
+  const priceForRange = lastConfirmed && lastConfirmed.close > 0 ? lastConfirmed.close : 0;
+  const eventSequence = detectBestEventSequence(confirmedKlines, structureConfig);
+  const impulse = impulseFromSequence(eventSequence, confirmedKlines);
+  const zoneFor = (direction: 'LONG' | 'SHORT') =>
     lastConfirmed && lastConfirmed.close > 0
       ? computeEntryZoneAnalysis({
-          direction: entryZoneDirection,
+          direction,
           currentPrice: lastConfirmed.close,
           atr14,
           fvg,
@@ -1720,8 +1774,9 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
           liquiditySweep,
         })
       : null;
+  const longEntryZone = zoneFor('LONG');
+  const shortEntryZone = zoneFor('SHORT');
 
-  const priceForRange = lastConfirmed && lastConfirmed.close > 0 ? lastConfirmed.close : 0;
   const premiumDiscountByTimeframe: SmcAnalysisResult['premiumDiscountByTimeframe'] = {};
   for (const tf of ['5m', '15m', '1h', '4h'] as Timeframe[]) {
     const series = selectClosedCandles(klinesByTimeframe[tf] ?? []);
@@ -1732,6 +1787,8 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       price: tf === primaryTimeframe && priceForRange > 0 ? priceForRange : tfPrice,
       swingConfirmationBars: structureConfig.swingConfirmationBars,
       timeframe: tf,
+      lookbackBars: DEFAULT_DEALING_RANGE_LOOKBACK,
+      impulse: tf === primaryTimeframe ? impulse : null,
     });
   }
   const premiumDiscount =
@@ -1741,8 +1798,9 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       price: priceForRange,
       swingConfirmationBars: structureConfig.swingConfirmationBars,
       timeframe: primaryTimeframe,
+      lookbackBars: DEFAULT_DEALING_RANGE_LOOKBACK,
+      impulse,
     });
-  const eventSequence = detectBestEventSequence(confirmedKlines, structureConfig);
 
   let resolvedNearMiss = nearMissStatus;
   let resolvedDirection = intendedDirection;
@@ -1784,6 +1842,14 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       obi200bpsPct: input.obi200bpsPct,
       klinesForCvd: confirmedKlines,
       openInterestPresent: openInterest !== null && Number.isFinite(openInterest),
+      displacementBodyToAtrLong: hasBullDisplacement ? displacement.bodyToAtrRatio : null,
+      displacementBodyToAtrShort: hasBearDisplacement ? displacement.bodyToAtrRatio : null,
+      fvgAtrMultipleLong: fvgAtrMultiple('BULL', fvg, atr14),
+      fvgAtrMultipleShort: fvgAtrMultiple('BEAR', fvg, atr14),
+      distanceToPoiAtrLong: longEntryZone?.distanceToZoneAtr ?? null,
+      distanceToPoiAtrShort: shortEntryZone?.distanceToZoneAtr ?? null,
+      entryZoneLong: describeEntryZone(longEntryZone),
+      entryZoneShort: describeEntryZone(shortEntryZone),
     });
     actionState = signalDecision.actionState;
     waitReasons.length = 0;
@@ -1807,6 +1873,13 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     gateEvaluation.nearMissStatus = resolvedNearMiss;
     gateEvaluation.intendedDirection = resolvedDirection;
   }
+
+  const entryZoneAnalysis =
+    resolvedDirection === 'LONG'
+      ? longEntryZone
+      : resolvedDirection === 'SHORT'
+        ? shortEntryZone
+        : longEntryZone ?? shortEntryZone;
 
   const tradeHorizon = classifyTradeHorizon({
     smcActionState: actionState,

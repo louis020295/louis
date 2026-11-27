@@ -27,6 +27,16 @@ export interface SignalGatingConfig {
   lighterPathEnabled: boolean;
   /** Aggressive only: 3 of 4 sequence steps also satisfies gate (b). */
   partialSequenceSatisfiesGate: boolean;
+  /**
+   * Formal minimum. Standard is 60: the four required gates alone are about
+   * 46–54 points (HTF 16 + lighter/full sequence 12–20 + location 10 + liquidity 8).
+   * 60 demands those gates plus a real displacement, sweep, or derivatives confirm,
+   * so a bare chase like ZEC at 36 cannot print LONG/SHORT CANDIDATE.
+   */
+  formalMinConfidence: number;
+  /** WATCH requires at most one failed required gate and at least this confidence. */
+  watchMinConfidence: number;
+  watchMaxMissingGates: number;
   htf: {
     /** Single-timeframe backtests may self-agree when the trigger bias matches. */
     allowSingleTimeframeSelfAgreement: boolean;
@@ -130,6 +140,9 @@ export const SIGNAL_GATING_PRESETS: Record<SmcStructurePresetName, SignalGatingC
     preset: 'standard',
     lighterPathEnabled: true,
     partialSequenceSatisfiesGate: false,
+    formalMinConfidence: 60,
+    watchMinConfidence: 40,
+    watchMaxMissingGates: 1,
     htf: { allowSingleTimeframeSelfAgreement: true },
     liquidity: {
       minQuoteVolume24h: 3_000_000,
@@ -161,6 +174,9 @@ export const SIGNAL_GATING_PRESETS: Record<SmcStructurePresetName, SignalGatingC
     preset: 'conservative',
     lighterPathEnabled: false,
     partialSequenceSatisfiesGate: false,
+    formalMinConfidence: 72,
+    watchMinConfidence: 50,
+    watchMaxMissingGates: 1,
     htf: { allowSingleTimeframeSelfAgreement: false },
     liquidity: {
       minQuoteVolume24h: 8_000_000,
@@ -197,6 +213,9 @@ export const SIGNAL_GATING_PRESETS: Record<SmcStructurePresetName, SignalGatingC
     preset: 'aggressive',
     lighterPathEnabled: true,
     partialSequenceSatisfiesGate: true,
+    formalMinConfidence: 48,
+    watchMinConfidence: 32,
+    watchMaxMissingGates: 1,
     htf: { allowSingleTimeframeSelfAgreement: true },
     liquidity: {
       minQuoteVolume24h: 1_500_000,

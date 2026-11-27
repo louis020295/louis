@@ -2143,12 +2143,9 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
     );
     assert.equal(fullBullRes.mtfAlignment.aligned, true);
     assert.equal(fullBullRes.eventSequence?.isComplete, true);
-    assert.equal(fullBullRes.premiumDiscount?.zone, 'UNAVAILABLE');
-    assert.equal(fullBullRes.actionState, 'LONG CANDIDATE');
-    assert.equal(
-      fullBullRes.signalDecision?.components.find((row) => row.key === 'location')?.points,
-      0
-    );
+    assert.equal(fullBullRes.premiumDiscount?.zone, 'PREMIUM');
+    assert.notEqual(fullBullRes.actionState, 'LONG CANDIDATE');
+    assert.ok(fullBullRes.missingGates?.includes('LOCATION_DISCOUNT_OR_OTE'));
 
     // Case A: Remove Liquidity Sweep (strip wicks across the sweep lookback so no confirmed swing pool is pierced)
     const noSweepKlines = fullBullKlines.map((k, idx) =>
@@ -2240,7 +2237,11 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
       provenance: verifiedBinanceLiveProvenance,
     });
     assert.equal(mtfConflictRes.mtfAlignment.dominantDirection, 'CONFLICT');
-    assert.equal(mtfConflictRes.actionState, 'WATCH');
+    assert.ok(
+      mtfConflictRes.actionState === 'WATCH' || mtfConflictRes.actionState === 'WAIT'
+    );
+    assert.notEqual(mtfConflictRes.actionState, 'LONG CANDIDATE');
+    assert.notEqual(mtfConflictRes.actionState, 'SHORT CANDIDATE');
     assert.ok(mtfConflictRes.missingGates?.includes('HTF_LTF_AGREEMENT'));
     assert.ok(mtfConflictRes.waitReasons.length > 0);
   });
@@ -2628,7 +2629,7 @@ describe('12. 第一層市場雷達與第二層 SMC/ICT 分類分離與 finalTra
     )!;
     assert.equal(bullConflict.smcActionState, 'SHORT CANDIDATE');
     assert.equal(bullConflict.finalTradeSignal, '空頭交易候選');
-    assert.equal(bullConflict.marketRadarCategory, '雷達多頭觀察');
+    assert.equal(bullConflict.marketRadarCategory, '雷達空頭觀察');
     assert.ok(
       bullConflict.downgradeReasons.some((r) => r.includes('MOMENTUM_CONTEXT')),
       bullConflict.downgradeReasons.join(' | ')

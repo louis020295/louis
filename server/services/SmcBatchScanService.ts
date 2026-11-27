@@ -514,6 +514,17 @@ export class SmcBatchScanService {
     return null;
   }
 
+  private medianQuoteVolume24h(exchange: ExchangeId): number | null {
+    const tickers = this.latestTickerMapByExchange.get(exchange);
+    if (!tickers || tickers.size === 0) return null;
+    const volumes = [...tickers.values()]
+      .map((ticker) => ticker.quoteVolume24h)
+      .filter((volume) => Number.isFinite(volume) && volume > 0)
+      .sort((a, b) => a - b);
+    if (volumes.length === 0) return null;
+    return volumes[Math.floor((volumes.length - 1) / 2)];
+  }
+
   public updateLatestMarketSnapshot(
     exchange: ExchangeId,
     tickers: MarketTicker[]
@@ -2541,7 +2552,8 @@ export class SmcBatchScanService {
           ? cached.klines.filter((k) => k.isClosed)
           : [];
       const canUseIncrementalFetch = priorConfirmedKlines.length >= 45;
-      const fetchLimit = canUseIncrementalFetch ? 20 : 60;
+      const targetBars = 99;
+      const fetchLimit = canUseIncrementalFetch ? 20 : targetBars;
 
       const slotWaitMs = await this.acquireHttpSlot(exchange);
       const httpStartMs = Date.now();
@@ -3090,6 +3102,7 @@ export class SmcBatchScanService {
         provenance: combinedProvenance,
         quoteVolume24h: ticker?.quoteVolume24h ?? null,
         spreadPercent: ticker?.spreadPercent ?? null,
+        medianQuoteVolume24h: this.medianQuoteVolume24h(exchange),
         fundingRate: resolvedFundingRate,
         priceChangePercent24h: ticker?.priceChangePercent24h ?? null,
       });
@@ -3125,12 +3138,7 @@ export class SmcBatchScanService {
         smcAnalysis.waitReasons.length === 0
       ) {
         finalTradeSignal = '多頭交易候選';
-        if (
-          marketRadarCategory !== '雷達多頭觀察' &&
-          marketRadarCategory !== '雷達空頭觀察'
-        ) {
-          marketRadarCategory = '雷達多頭觀察';
-        }
+        marketRadarCategory = '雷達多頭觀察';
       } else if (
         smcAnalysis.smcEvaluationStatus === 'EVALUATED' &&
         smcAnalysis.actionState === 'SHORT CANDIDATE' &&
@@ -3144,12 +3152,7 @@ export class SmcBatchScanService {
         smcAnalysis.waitReasons.length === 0
       ) {
         finalTradeSignal = '空頭交易候選';
-        if (
-          marketRadarCategory !== '雷達空頭觀察' &&
-          marketRadarCategory !== '雷達多頭觀察'
-        ) {
-          marketRadarCategory = '雷達空頭觀察';
-        }
+        marketRadarCategory = '雷達空頭觀察';
       } else if (
         smcAnalysis.actionState === 'LONG CANDIDATE' ||
         smcAnalysis.actionState === 'SHORT CANDIDATE'

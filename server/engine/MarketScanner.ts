@@ -525,13 +525,7 @@ export function runMarketScan(
           blockedAfterSmcCandidateCount++;
           blockedAfterSmcCandidateReasons.LOW_LIQUIDITY_GATE =
             (blockedAfterSmcCandidateReasons.LOW_LIQUIDITY_GATE ?? 0) + 1;
-        } else if (
-          !historyGatePassed &&
-          cachedSmc?.signalDecision?.actionState !== 'LONG CANDIDATE' &&
-          cachedSmc?.signalDecision?.actionState !== 'SHORT CANDIDATE' &&
-          cachedSmc?.smcAnalysis?.signalDecision?.actionState !== 'LONG CANDIDATE' &&
-          cachedSmc?.smcAnalysis?.signalDecision?.actionState !== 'SHORT CANDIDATE'
-        ) {
+        } else if (!historyGatePassed) {
           smcActionState = 'WAIT';
           const reason =
             '15m 已確認 K 線歷史成交量基線未就緒或異常 (INSUFFICIENT_HISTORY / BASELINE_UNSTABLE)';
@@ -559,18 +553,16 @@ export function runMarketScan(
           blockedAfterSmcCandidateCount++;
           blockedAfterSmcCandidateReasons.BTC_REGIME_FILTER =
             (blockedAfterSmcCandidateReasons.BTC_REGIME_FILTER ?? 0) + 1;
-        } else if (
-          smcActionState === 'LONG CANDIDATE' &&
-          marketRadarCategory !== '雷達多頭觀察' &&
-          marketRadarCategory !== '雷達空頭觀察'
-        ) {
+        } else if (smcActionState === 'LONG CANDIDATE' && marketRadarCategory !== '雷達多頭觀察') {
+          if (marketRadarCategory === '雷達空頭觀察') {
+            marketRadarShortCount = Math.max(0, marketRadarShortCount - 1);
+          }
           marketRadarCategory = '雷達多頭觀察';
           marketRadarLongCount++;
-        } else if (
-          smcActionState === 'SHORT CANDIDATE' &&
-          marketRadarCategory !== '雷達空頭觀察' &&
-          marketRadarCategory !== '雷達多頭觀察'
-        ) {
+        } else if (smcActionState === 'SHORT CANDIDATE' && marketRadarCategory !== '雷達空頭觀察') {
+          if (marketRadarCategory === '雷達多頭觀察') {
+            marketRadarLongCount = Math.max(0, marketRadarLongCount - 1);
+          }
           marketRadarCategory = '雷達空頭觀察';
           marketRadarShortCount++;
         }
@@ -897,6 +889,16 @@ export function runMarketScan(
       scoreCapRule = `SMC_FORMAL_SCORE_FLOOR: 正式候選標題分數由 ${totalScore} 抬到 ${stateCap.formalFloor}，避免高品質結構被低分掩蓋`;
       totalScore = stateCap.formalFloor;
       scoreCapApplied = true;
+    }
+
+    if (attachedDecision && smcEvaluationStatus === 'EVALUATED') {
+      const confidenceHeadline = Math.max(0, Math.min(100, Math.round(attachedDecision.confidence)));
+      totalScore = confidenceHeadline;
+      if (smcActionState === 'WAIT') totalScore = Math.min(totalScore, stateCap.wait);
+      if (smcActionState === 'WATCH') totalScore = Math.min(totalScore, stateCap.watch);
+      if (smcActionState === 'HIGH RISK') totalScore = Math.min(totalScore, 48);
+      scoreCapApplied = true;
+      scoreCapRule = `SMC_CONFIDENCE_HEADLINE: 標題分數改為 SMC 信心 ${confidenceHeadline}`;
     }
 
     // Build complete downgradeReasons trace

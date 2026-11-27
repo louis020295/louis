@@ -1338,9 +1338,7 @@ export class PaperShadowMonitor {
             !k15mRes.provenance.fallback
           ) {
             finalTradeSignal = '多頭交易候選';
-            if (radarCat !== '雷達多頭觀察' && radarCat !== '雷達空頭觀察') {
-              radarCat = '雷達多頭觀察';
-            }
+            radarCat = '雷達多頭觀察';
           } else if (
             smcAnalysis.smcEvaluationStatus === 'EVALUATED' &&
             smcAnalysis.actionState === 'SHORT CANDIDATE' &&
@@ -1354,9 +1352,7 @@ export class PaperShadowMonitor {
             !k15mRes.provenance.fallback
           ) {
             finalTradeSignal = '空頭交易候選';
-            if (radarCat !== '雷達空頭觀察' && radarCat !== '雷達多頭觀察') {
-              radarCat = '雷達空頭觀察';
-            }
+            radarCat = '雷達空頭觀察';
           } else if (
             smcAnalysis.actionState === 'LONG CANDIDATE' ||
             smcAnalysis.actionState === 'SHORT CANDIDATE'
