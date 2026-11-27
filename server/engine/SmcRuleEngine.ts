@@ -38,7 +38,8 @@ import {
 import { enforceProvenanceIntegrity } from '../utils/provenanceQuarantine.ts';
 import { classifyTradeHorizon } from './TradeHorizonClassifier.ts';
 import { selectClosedCandles } from '../market/ClosedCandleSeries.ts';
-import { computePremiumDiscount } from './PremiumDiscount.ts';
+import { computePremiumDiscount, DEFAULT_DEALING_RANGE_LOOKBACK } from './PremiumDiscount.ts';
+import type { DealingRangeImpulse } from './PremiumDiscount.ts';
 import { detectBestEventSequence } from './SmcEventSequence.ts';
 import {
   resolveDisplacementThresholds,
@@ -46,6 +47,8 @@ import {
   type SmcStructureConfig,
   type SmcStructurePresetName,
 } from './SmcStructureConfig.ts';
+import { resolveSignalDecision } from './SignalConfidence.ts';
+import type { CvdDivergenceType, SignalDecision } from '../../src/types/market.ts';
 
 export const SMC_RULE_VERSION = 'v1.0.0-smc-ict-deterministic';
 
@@ -90,6 +93,18 @@ export interface EvaluateSmcInput {
   structurePreset?: SmcStructurePresetName | string;
   structureOverrides?: Partial<Omit<SmcStructureConfig, 'preset'>>;
   provenance: DataProvenance;
+  quoteVolume24h?: number | null;
+  spreadPercent?: number | null;
+  medianQuoteVolume24h?: number | null;
+  depthUsdWithin1Pct?: number | null;
+  fundingRate?: number | null;
+  priceChangePercent24h?: number | null;
+  oiChangePct?: number | null;
+  oiPriceChangePct?: number | null;
+  cvdDivergence?: CvdDivergenceType | null;
+  obi50bpsPct?: number | null;
+  obi100bpsPct?: number | null;
+  obi200bpsPct?: number | null;
 }
 
 export function calculateConfirmedAtr14(confirmedKlines: Kline[]): number | null {
@@ -672,6 +687,61 @@ function detectEarlyInflection(
   };
 }
 
+function describeEntryZone(zone: EntryZoneAnalysis | null): { valid: boolean; reasonZh: string } {
+  if (
+    !zone ||
+    zone.stopLossPrice == null ||
+    zone.targetPrice == null ||
+    !Number.isFinite(zone.stopLossPrice) ||
+    !Number.isFinite(zone.targetPrice)
+  ) {
+    return { valid: false, reasonZh: '沒有算出止損與止盈，不能當正式候選' };
+  }
+  if (zone.status !== 'NEAR_POI' && zone.status !== 'NEAR_PULLBACK_ZONE') {
+    return {
+      valid: false,
+      reasonZh: `進場區間 ${zone.status}，正式候選需要靠近 POI，而且止損止盈都要算得出來`,
+    };
+  }
+  return {
+    valid: true,
+    reasonZh: `${zone.headlineZh}；止損 ${zone.stopLossPrice}、止盈 ${zone.targetPrice}`,
+  };
+}
+
+function fvgAtrMultiple(
+  direction: 'BULL' | 'BEAR',
+  fvg: SmcFvgEvidence,
+  atr14: number | null
+): number | null {
+  if (!fvg.detected || fvg.mitigated || fvg.direction !== direction) return null;
+  if (fvg.top == null || fvg.bottom == null || atr14 == null || !(atr14 > 0)) return null;
+  return (fvg.top - fvg.bottom) / atr14;
+}
+
+function impulseFromSequence(
+  sequence: SmcAnalysisResult['eventSequence'],
+  candles: Kline[]
+): DealingRangeImpulse | null {
+  if (!sequence || sequence.direction === 'NONE' || sequence.sweepLevel == null) return null;
+  const sweepIndex = sequence.steps.find((step) => step.key === 'LIQUIDITY_SWEEP')?.barIndex;
+  if (sweepIndex == null) return null;
+  const tail = candles.slice(sweepIndex);
+  if (tail.length === 0) return null;
+  if (sequence.direction === 'LONG') {
+    return {
+      low: sequence.sweepLevel,
+      high: Math.max(sequence.sweepLevel, ...tail.map((candle) => candle.high)),
+      direction: 'LONG',
+    };
+  }
+  return {
+    high: sequence.sweepLevel,
+    low: Math.min(sequence.sweepLevel, ...tail.map((candle) => candle.low)),
+    direction: 'SHORT',
+  };
+}
+
 export function computeEntryZoneAnalysis(params: {
   direction: 'LONG' | 'SHORT' | 'NEUTRAL';
   currentPrice: number;
@@ -1038,9 +1108,6 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
   }
   if (blockingMissingData.length > 0) {
     waitReasons.push(`基礎欄位缺失：${blockingMissingData.join(', ')}`);
-  }
-  if (openInterest === null || !Number.isFinite(openInterest)) {
-    waitReasons.push('Open Interest (OI 未平倉量) 資料缺失，觸發 WAIT 安全閘門');
   }
   if (confirmedKlines.length < MIN_HISTORY_SAMPLES) {
     waitReasons.push(
@@ -1478,23 +1545,6 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       !resolvedBearByStructure
     : hasInternalConflict;
 
-  if (blockingInternalConflict) {
-    waitReasons.push(
-      `同週期內部多空條件互相衝突 (多頭訊號 ${bullSignalCount} 項 vs 空頭訊號 ${bearSignalCount} 項)`
-    );
-  }
-
-  if (mtfAlignment.dominantDirection === 'CONFLICT') {
-    waitReasons.push(mtfAlignment.description);
-  }
-
-  if (
-    (bullSignalCount >= 2 && mtfAlignment.dominantDirection === 'BEAR') ||
-    (bearSignalCount >= 2 && mtfAlignment.dominantDirection === 'BULL')
-  ) {
-    waitReasons.push('主週期 SMC 結構與高週期趨勢方向相反，條件衝突觸發 WAIT');
-  }
-
   const evidences: EvidenceItem[] = [
     {
       code: 'SMC_BOS_MSS',
@@ -1585,90 +1635,10 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
         !historicalVolume.baselineUnstable &&
         historicalVolume.sampleCount >= MIN_HISTORY_SAMPLES));
 
-  // Final deterministic state resolution:
-  // LONG CANDIDATE / SHORT CANDIDATE requires ALL necessary conditions simultaneously:
-  // 1. BOS or MSS
-  // 2. Liquidity Sweep
-  // 3. Displacement
-  // 4. Unmitigated FVG or Order Block
-  // 5. Multi-Timeframe Alignment
-  // 6. Valid ATR & Risk conditions
-  // 7. >= 30 Confirmed closed K-lines (isClosed === true)
-  // 8. All required data present (OI, provenance, historical volume READY)
-  // 9. Zero WAIT Gate blocking reasons
+  // Action state is resolved after premium/discount and the event sequence.
+  // Required gates: HTF/LTF agreement, sequence or lighter path, location, tradable liquidity.
   let actionState: SmcActionState = 'WAIT';
-
-  const bullSweepGate = requireSweep ? hasBullSweep : true;
-  const bearSweepGate = requireSweep ? hasBearSweep : true;
-
-  if (waitReasons.length > 0) {
-    actionState = 'WAIT';
-  } else if (extremeFunding || lowLiquidityHighVolatility) {
-    actionState = 'HIGH RISK';
-    if (extremeFunding) {
-      waitReasons.push(
-        '高風險攔截：資金費率極端 (Funding 高風險，禁止列入一般候選)'
-      );
-    }
-    if (lowLiquidityHighVolatility) {
-      waitReasons.push(
-        '高風險攔截：低流動性高波動異常 (禁止列入一般候選)'
-      );
-    }
-  } else if (isLowLiquidity) {
-    actionState = bullSignalCount >= 1 || bearSignalCount >= 1 ? 'WATCH' : 'WAIT';
-    if (actionState === 'WAIT') {
-      waitReasons.push('低流動性：不列入一般候選，且結構條件不足以列入觀察');
-    } else {
-      waitReasons.push('低流動性：不列入一般候選（僅允許列入 WATCH 觀察，不可升級為 CANDIDATE）');
-    }
-  } else if (
-    hasAllRequiredData &&
-    hasValidAtrAndRisk &&
-    hasBullBos &&
-    bullSweepGate &&
-    hasBullDisplacement &&
-    hasBullFvgOrOb &&
-    hasBullMtf
-  ) {
-    actionState = 'LONG CANDIDATE';
-  } else if (
-    hasAllRequiredData &&
-    hasValidAtrAndRisk &&
-    hasBearBos &&
-    bearSweepGate &&
-    hasBearDisplacement &&
-    hasBearFvgOrOb &&
-    hasBearMtf
-  ) {
-    actionState = 'SHORT CANDIDATE';
-  } else if (bullSignalCount >= 1 || bearSignalCount >= 1) {
-    actionState = 'WATCH';
-    if (bullSignalCount >= bearSignalCount) {
-      const missingBull: string[] = [];
-      if (!hasBullBos) missingBull.push('BOS/MSS 多頭結構突破');
-      if (requireSweep && !hasBullSweep) missingBull.push('Sell-Side Liquidity Sweep');
-      if (!hasBullDisplacement) missingBull.push('多頭 Displacement 位移 K 線');
-      if (!hasBullFvgOrOb) missingBull.push('多頭未回補 FVG 或 Order Block');
-      if (!hasBullMtf) missingBull.push('多週期多頭一致性 (MTF Alignment)');
-      waitReasons.push(
-        `已偵測部分多頭結構證據，但尚未完成全部 SMC 必要確認條件（缺少：${missingBull.join('、')}），維持 WATCH`
-      );
-    } else {
-      const missingBear: string[] = [];
-      if (!hasBearBos) missingBear.push('BOS/MSS 空頭結構突破');
-      if (requireSweep && !hasBearSweep) missingBear.push('Buy-Side Liquidity Sweep');
-      if (!hasBearDisplacement) missingBear.push('空頭 Displacement 位移 K 線');
-      if (!hasBearFvgOrOb) missingBear.push('空頭未回補 FVG 或 Order Block');
-      if (!hasBearMtf) missingBear.push('多週期空頭一致性 (MTF Alignment)');
-      waitReasons.push(
-        `已偵測部分空頭結構證據，但尚未完成全部 SMC 必要確認條件（缺少：${missingBear.join('、')}），維持 WATCH`
-      );
-    }
-  } else {
-    actionState = 'WAIT';
-    waitReasons.push('目前尚無足夠 SMC/ICT 結構證據形成觀察候選（已收盤 K 線 isClosed=true 不代表 SMC 訊號確認）');
-  }
+  let signalDecision: SignalDecision | null = null;
 
   const hasAnyKlinesLoaded = tfList.some(
     (tf) => (klinesByTimeframe[tf]?.length ?? 0) > 0
@@ -1720,26 +1690,18 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
 
   const preferBull = bullSignalCount >= bearSignalCount;
   const intendedDirection: 'LONG' | 'SHORT' | 'NEUTRAL' =
-    actionState === 'LONG CANDIDATE'
+    bullSignalCount > bearSignalCount
       ? 'LONG'
-      : actionState === 'SHORT CANDIDATE'
+      : bearSignalCount > bullSignalCount
         ? 'SHORT'
-        : bullSignalCount > bearSignalCount
+        : mtfAlignment.dominantDirection === 'BULL'
           ? 'LONG'
-          : bearSignalCount > bullSignalCount
+          : mtfAlignment.dominantDirection === 'BEAR'
             ? 'SHORT'
-            : mtfAlignment.dominantDirection === 'BULL'
-              ? 'LONG'
-              : mtfAlignment.dominantDirection === 'BEAR'
-                ? 'SHORT'
-                : 'NEUTRAL';
+            : 'NEUTRAL';
 
   const missingGates: string[] = [];
-  if (
-    smcEvaluationStatus === 'EVALUATED' &&
-    actionState !== 'LONG CANDIDATE' &&
-    actionState !== 'SHORT CANDIDATE'
-  ) {
+  if (smcEvaluationStatus === 'EVALUATED') {
     const dirBosPassed = preferBull ? hasBullBos : hasBearBos;
     const dirSweepPassed = preferBull ? hasBullSweep : hasBearSweep;
     const dirDispPassed = preferBull ? hasBullDisplacement : hasBearDisplacement;
@@ -1762,9 +1724,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
   }
 
   const nearMissStatus: NearMissStatus =
-    smcEvaluationStatus !== 'EVALUATED' ||
-    actionState === 'LONG CANDIDATE' ||
-    actionState === 'SHORT CANDIDATE'
+    smcEvaluationStatus !== 'EVALUATED'
       ? 'NOT_NEAR_CANDIDATE'
       : missingGates.length === 1
         ? 'NEAR_MISS_ONE_GATE'
@@ -1800,15 +1760,13 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     structureConfig.swingConfirmationBars
   );
 
-  const entryZoneDirection: 'LONG' | 'SHORT' | 'NEUTRAL' =
-    intendedDirection !== 'NEUTRAL'
-      ? intendedDirection
-      : earlyInflection.direction;
-
-  const entryZoneAnalysis =
+  const priceForRange = lastConfirmed && lastConfirmed.close > 0 ? lastConfirmed.close : 0;
+  const eventSequence = detectBestEventSequence(confirmedKlines, structureConfig);
+  const impulse = impulseFromSequence(eventSequence, confirmedKlines);
+  const zoneFor = (direction: 'LONG' | 'SHORT') =>
     lastConfirmed && lastConfirmed.close > 0
       ? computeEntryZoneAnalysis({
-          direction: entryZoneDirection,
+          direction,
           currentPrice: lastConfirmed.close,
           atr14,
           fvg,
@@ -1816,8 +1774,9 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
           liquiditySweep,
         })
       : null;
+  const longEntryZone = zoneFor('LONG');
+  const shortEntryZone = zoneFor('SHORT');
 
-  const priceForRange = lastConfirmed && lastConfirmed.close > 0 ? lastConfirmed.close : 0;
   const premiumDiscountByTimeframe: SmcAnalysisResult['premiumDiscountByTimeframe'] = {};
   for (const tf of ['5m', '15m', '1h', '4h'] as Timeframe[]) {
     const series = selectClosedCandles(klinesByTimeframe[tf] ?? []);
@@ -1828,6 +1787,8 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       price: tf === primaryTimeframe && priceForRange > 0 ? priceForRange : tfPrice,
       swingConfirmationBars: structureConfig.swingConfirmationBars,
       timeframe: tf,
+      lookbackBars: DEFAULT_DEALING_RANGE_LOOKBACK,
+      impulse: tf === primaryTimeframe ? impulse : null,
     });
   }
   const premiumDiscount =
@@ -1837,17 +1798,97 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
       price: priceForRange,
       swingConfirmationBars: structureConfig.swingConfirmationBars,
       timeframe: primaryTimeframe,
+      lookbackBars: DEFAULT_DEALING_RANGE_LOOKBACK,
+      impulse,
     });
-  const eventSequence = detectBestEventSequence(confirmedKlines, structureConfig);
+
+  let resolvedNearMiss = nearMissStatus;
+  let resolvedDirection = intendedDirection;
+  if (smcEvaluationStatus === 'EVALUATED') {
+    const dataBlockers = [...waitReasons];
+    signalDecision = resolveSignalDecision({
+      preset: structureConfig.preset,
+      primaryTimeframe,
+      mtfAlignment,
+      eventSequence,
+      premiumDiscount,
+      longFlags: {
+        bosOrMss: hasBullBos,
+        sweep: hasBullSweep,
+        displacement: hasBullDisplacement,
+        fvgOrOb: hasBullFvgOrOb,
+      },
+      shortFlags: {
+        bosOrMss: hasBearBos,
+        sweep: hasBearSweep,
+        displacement: hasBearDisplacement,
+        fvgOrOb: hasBearFvgOrOb,
+      },
+      isLowLiquidity,
+      extremeFunding,
+      lowLiquidityHighVolatility,
+      dataBlockers,
+      quoteVolume24h: input.quoteVolume24h,
+      spreadPercent: input.spreadPercent,
+      medianQuoteVolume24h: input.medianQuoteVolume24h,
+      depthUsdWithin1Pct: input.depthUsdWithin1Pct,
+      fundingRate: input.fundingRate,
+      priceChangePercent24h: input.priceChangePercent24h,
+      oiChangePct: input.oiChangePct,
+      oiPriceChangePct: input.oiPriceChangePct,
+      cvdDivergence: input.cvdDivergence,
+      obi50bpsPct: input.obi50bpsPct,
+      obi100bpsPct: input.obi100bpsPct,
+      obi200bpsPct: input.obi200bpsPct,
+      klinesForCvd: confirmedKlines,
+      openInterestPresent: openInterest !== null && Number.isFinite(openInterest),
+      displacementBodyToAtrLong: hasBullDisplacement ? displacement.bodyToAtrRatio : null,
+      displacementBodyToAtrShort: hasBearDisplacement ? displacement.bodyToAtrRatio : null,
+      fvgAtrMultipleLong: fvgAtrMultiple('BULL', fvg, atr14),
+      fvgAtrMultipleShort: fvgAtrMultiple('BEAR', fvg, atr14),
+      distanceToPoiAtrLong: longEntryZone?.distanceToZoneAtr ?? null,
+      distanceToPoiAtrShort: shortEntryZone?.distanceToZoneAtr ?? null,
+      entryZoneLong: describeEntryZone(longEntryZone),
+      entryZoneShort: describeEntryZone(shortEntryZone),
+    });
+    actionState = signalDecision.actionState;
+    waitReasons.length = 0;
+    waitReasons.push(...signalDecision.waitReasons);
+    missingGates.length = 0;
+    missingGates.push(...signalDecision.missingGates);
+    resolvedDirection =
+      signalDecision.side === 'NONE' ? 'NEUTRAL' : signalDecision.side;
+    resolvedNearMiss =
+      actionState === 'LONG CANDIDATE' || actionState === 'SHORT CANDIDATE'
+        ? 'NOT_NEAR_CANDIDATE'
+        : missingGates.length === 1
+          ? 'NEAR_MISS_ONE_GATE'
+          : missingGates.length === 2
+            ? 'NEAR_MISS_TWO_GATES'
+            : 'NOT_NEAR_CANDIDATE';
+    gateEvaluation.missingGates = [...missingGates];
+    gateEvaluation.waitReasons = [...waitReasons];
+    gateEvaluation.lastBlockingGate =
+      missingGates.length > 0 ? missingGates[missingGates.length - 1] : null;
+    gateEvaluation.nearMissStatus = resolvedNearMiss;
+    gateEvaluation.intendedDirection = resolvedDirection;
+  }
+
+  const entryZoneAnalysis =
+    resolvedDirection === 'LONG'
+      ? longEntryZone
+      : resolvedDirection === 'SHORT'
+        ? shortEntryZone
+        : longEntryZone ?? shortEntryZone;
 
   const tradeHorizon = classifyTradeHorizon({
     smcActionState: actionState,
-    intendedDirection,
+    intendedDirection: resolvedDirection,
     mtfAlignment,
     atrPercent,
-    priceChangePercent24h: 0,
-    quoteVolume24h: 50_000_000,
-    fundingRate: null,
+    priceChangePercent24h: input.priceChangePercent24h ?? 0,
+    quoteVolume24h: input.quoteVolume24h ?? 50_000_000,
+    fundingRate: input.fundingRate ?? null,
     entryZoneAnalysis,
     earlyIgnition: null,
     bosOrMssDetected: bosOrMss.detected,
@@ -1876,9 +1917,9 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     evidences,
     provenance,
     gateEvaluation,
-    nearMissStatus,
+    nearMissStatus: resolvedNearMiss,
     missingGates,
-    intendedDirection,
+    intendedDirection: resolvedDirection,
     earlyInflection,
     entryZoneAnalysis,
     tradeHorizon,
@@ -1886,6 +1927,7 @@ export function evaluateSmcStructure(input: EvaluateSmcInput): SmcAnalysisResult
     premiumDiscount,
     premiumDiscountByTimeframe,
     eventSequence,
+    signalDecision,
   };
 }
 

@@ -41,6 +41,7 @@ import {
 import {
   DEFAULT_SCANNER_CONFIG,
   MARKET_SCAN_RULE_VERSION,
+  MIN_QUOTE_VOLUME_24H,
   runMarketScan,
 } from './server/engine/MarketScanner.ts';
 import {
@@ -625,7 +626,7 @@ export async function createApp(options: CreateAppOptions = {}) {
             openInterest: oiRes.openInterest,
             historicalVolume: histVol,
             isLowLiquidity:
-              preCandidate?.isLowLiquidity ?? t.quoteVolume24h < 15_000_000,
+              preCandidate?.isLowLiquidity ?? t.quoteVolume24h < MIN_QUOTE_VOLUME_24H,
             extremeFunding:
               preCandidate?.extremeFunding ??
               (t.fundingRate !== null && Math.abs(t.fundingRate) >= 0.0005),

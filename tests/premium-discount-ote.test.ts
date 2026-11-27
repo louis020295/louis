@@ -103,4 +103,59 @@ describe('premium / discount / OTE', () => {
     assert.equal(outside.rangeHigh, null);
     assert.deepEqual(outside.labels, []);
   });
+
+  it('uses the dominant impulse instead of the last tiny 15m leg', () => {
+    const bars: Kline[] = [];
+    for (let i = 0; i < 28; i++) bars.push(candle(i, 1.05, 1.08, 1.02, 1.05));
+    bars[6] = candle(6, 0.98, 1.01, 0.936, 0.99);
+    bars[14] = candle(14, 1.12, 1.199, 1.1, 1.16);
+    bars[22] = candle(22, 1.12, 1.14, 1.0667, 1.09);
+    const zone = computePremiumDiscount({
+      candles: bars,
+      price: 1.0829,
+      swingConfirmationBars: 2,
+    });
+    assert.equal(zone.zone, 'PREMIUM');
+    assert.ok((zone.rangeLow ?? 0) < 1);
+    assert.ok((zone.rangeHigh ?? 0) > 1.15);
+    assert.ok((zone.pricePositionPct ?? 0) > 50);
+  });
+
+  it('reads a short on the down-leg as discount, not a tiny bounce premium', () => {
+    const bars: Kline[] = [];
+    for (let i = 0; i < 28; i++) bars.push(candle(i, 3.02, 3.05, 2.99, 3.02));
+    bars[8] = candle(8, 3.08, 3.132, 3.05, 3.09);
+    bars[16] = candle(16, 3.0, 3.02, 2.947, 2.97);
+    const zone = computePremiumDiscount({
+      candles: bars,
+      price: 2.985,
+      swingConfirmationBars: 2,
+    });
+    assert.equal(zone.zone, 'DISCOUNT');
+    assert.ok((zone.pricePositionPct ?? 100) < 50);
+  });
+
+  it('finds an older swing pair when the lookback is long enough', () => {
+    const bars: Kline[] = [];
+    for (let i = 0; i < 40; i++) bars.push(candle(i, 700, 710, 690, 700));
+    bars[4] = candle(4, 690, 700, 676.64, 688);
+    bars[12] = candle(12, 740, 761.49, 730, 750);
+    const price = 676.64 + (761.49 - 676.64) * 0.69;
+    const shortWindow = computePremiumDiscount({
+      candles: bars,
+      price,
+      swingConfirmationBars: 2,
+      lookbackBars: 12,
+    });
+    const longWindow = computePremiumDiscount({
+      candles: bars,
+      price,
+      swingConfirmationBars: 2,
+      lookbackBars: 40,
+    });
+    assert.equal(shortWindow.zone, 'UNAVAILABLE');
+    assert.equal(longWindow.zone, 'PREMIUM');
+    assert.ok(Math.abs((longWindow.rangeLow ?? 0) - 676.64) < 1e-6);
+    assert.ok(Math.abs((longWindow.rangeHigh ?? 0) - 761.49) < 1e-6);
+  });
 });

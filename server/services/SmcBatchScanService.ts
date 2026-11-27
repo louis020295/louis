@@ -7,6 +7,7 @@ import { TelegramNotificationAdapter } from '../adapters/NotificationAdapter.ts'
 import { RadarDatabase } from '../db/RadarDatabase.ts';
 import {
   MARKET_SCAN_RULE_VERSION,
+  MIN_QUOTE_VOLUME_24H,
   runMarketScan,
 } from '../engine/MarketScanner.ts';
 import {
@@ -511,6 +512,17 @@ export class SmcBatchScanService {
       return Number.isFinite(bucketIdx) ? bucketIdx * 900_000 : null;
     }
     return null;
+  }
+
+  private medianQuoteVolume24h(exchange: ExchangeId): number | null {
+    const tickers = this.latestTickerMapByExchange.get(exchange);
+    if (!tickers || tickers.size === 0) return null;
+    const volumes = [...tickers.values()]
+      .map((ticker) => ticker.quoteVolume24h)
+      .filter((volume) => Number.isFinite(volume) && volume > 0)
+      .sort((a, b) => a - b);
+    if (volumes.length === 0) return null;
+    return volumes[Math.floor((volumes.length - 1) / 2)];
   }
 
   public updateLatestMarketSnapshot(
@@ -2540,7 +2552,8 @@ export class SmcBatchScanService {
           ? cached.klines.filter((k) => k.isClosed)
           : [];
       const canUseIncrementalFetch = priorConfirmedKlines.length >= 45;
-      const fetchLimit = canUseIncrementalFetch ? 20 : 60;
+      const targetBars = 99;
+      const fetchLimit = canUseIncrementalFetch ? 20 : targetBars;
 
       const slotWaitMs = await this.acquireHttpSlot(exchange);
       const httpStartMs = Date.now();
@@ -3059,7 +3072,7 @@ export class SmcBatchScanService {
 
       const isLowLiquidity =
         preCandidate?.isLowLiquidity ??
-        (ticker ? ticker.quoteVolume24h < 15_000_000 : false);
+        (ticker ? ticker.quoteVolume24h < MIN_QUOTE_VOLUME_24H : false);
       const extremeFunding =
         preCandidate?.extremeFunding ??
         (ticker && ticker.fundingRate !== null
@@ -3087,6 +3100,11 @@ export class SmcBatchScanService {
         lowLiquidityHighVolatility,
         requireFullMultiTimeframe: true,
         provenance: combinedProvenance,
+        quoteVolume24h: ticker?.quoteVolume24h ?? null,
+        spreadPercent: ticker?.spreadPercent ?? null,
+        medianQuoteVolume24h: this.medianQuoteVolume24h(exchange),
+        fundingRate: resolvedFundingRate,
+        priceChangePercent24h: ticker?.priceChangePercent24h ?? null,
       });
 
       let marketRadarCategory =
@@ -3119,15 +3137,8 @@ export class SmcBatchScanService {
         combinedMissingData.length === 0 &&
         smcAnalysis.waitReasons.length === 0
       ) {
-        if (marketRadarCategory === '雷達空頭觀察') {
-          smcAnalysis.actionState = 'WATCH';
-          smcAnalysis.waitReasons.push(
-            '第一層市場雷達方向為空頭觀察，與多頭 SMC 結構方向不一致'
-          );
-        } else {
-          marketRadarCategory = '雷達多頭觀察';
-          finalTradeSignal = '多頭交易候選';
-        }
+        finalTradeSignal = '多頭交易候選';
+        marketRadarCategory = '雷達多頭觀察';
       } else if (
         smcAnalysis.smcEvaluationStatus === 'EVALUATED' &&
         smcAnalysis.actionState === 'SHORT CANDIDATE' &&
@@ -3140,15 +3151,8 @@ export class SmcBatchScanService {
         combinedMissingData.length === 0 &&
         smcAnalysis.waitReasons.length === 0
       ) {
-        if (marketRadarCategory === '雷達多頭觀察') {
-          smcAnalysis.actionState = 'WATCH';
-          smcAnalysis.waitReasons.push(
-            '第一層市場雷達方向為多頭觀察，與空頭 SMC 結構方向不一致'
-          );
-        } else {
-          marketRadarCategory = '雷達空頭觀察';
-          finalTradeSignal = '空頭交易候選';
-        }
+        finalTradeSignal = '空頭交易候選';
+        marketRadarCategory = '雷達空頭觀察';
       } else if (
         smcAnalysis.actionState === 'LONG CANDIDATE' ||
         smcAnalysis.actionState === 'SHORT CANDIDATE'
@@ -3159,6 +3163,15 @@ export class SmcBatchScanService {
           smcAnalysis.waitReasons.push(
             '雙層交易候選資格閘門未完全通過，降級為 WATCH'
           );
+        }
+        const downgradeGates = smcAnalysis.missingGates ?? [];
+        if (!downgradeGates.includes('POST_EVAL_DOWNGRADE')) {
+          downgradeGates.push('POST_EVAL_DOWNGRADE');
+        }
+        smcAnalysis.missingGates = downgradeGates;
+        if (smcAnalysis.gateEvaluation) {
+          smcAnalysis.gateEvaluation.missingGates = [...downgradeGates];
+          smcAnalysis.gateEvaluation.lastBlockingGate = 'POST_EVAL_DOWNGRADE';
         }
       }
 

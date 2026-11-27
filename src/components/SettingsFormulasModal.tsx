@@ -1051,21 +1051,22 @@ export const SettingsFormulasModal: React.FC<SettingsFormulasModalProps> = ({
                       Decision Trace 6 道硬閘門
                     </div>
                     <div>1. history gate：15m 歷史樣本 ≥ 30 根且基線穩定</div>
-                    <div>2. liquidity gate：24h Vol ≥ $1,500萬 且盤口 Spread ≤ 0.3%</div>
-                    <div>3. momentum gate：|change24h| ≥ 3.0%</div>
-                    <div>4. relativeBtc gate：相對 BTC 同向超額報酬 ≥ 1.2%</div>
-                    <div>5. funding gate：|FundingRate| &lt; 0.05%（非缺失）</div>
-                    <div>6. smc gate：STRICT_PRODUCTION 全套 15m/MTF SMC 結構確認</div>
+                    <div>2. liquidity gate：24h 成交額 ≥ $300萬，或高於灰塵門檻且 ≥ 全市場中位數 × 0.35，或 ±1% 深度足夠；Spread ≤ 0.15%</div>
+                    <div>3. momentum：|change24h| ≥ 3% 只影響雷達分類與信心，極端順向追價減分，不再直接否決</div>
+                    <div>4. relativeBtc：相對 BTC 超額報酬進入雷達分數，不是 SMC 硬閘門</div>
+                    <div>5. funding：|Funding| ≥ 0.05% 對同向擁擠減分或軟否決；旗標 extremeFunding 仍為 HIGH RISK</div>
+                    <div>6. smc：只剩四道必要閘門（HTF/LTF、序列或輕量路徑、折價/OTE 或溢價/OTE、流動性）</div>
                   </div>
                   <div className="border border-slate-800/80 bg-slate-900/50 p-3 space-y-1">
                     <div className="font-sans font-semibold text-slate-100">
                       第二層 SMC 狀態機與進場風控規則
                     </div>
                     <div>• PENDING：尚未載入多週期 K 線評估（不等於 WAIT）</div>
-                    <div>• WAIT：已評估但尚未形成完整 BOS/MSS + FVG/OB（finalTradeSignal=NONE）</div>
-                    <div>• WATCH：已有部分結構或 Near-Miss（差 1~2 項 Gate，不建立 Paper）</div>
-                    <div>• HIGH RISK：極端費率、低流動性或 OI/資料異常攔截</div>
-                    <div>• LONG / SHORT CANDIDATE：同時通過 MTF (1h/4h) + Liquidity Sweep + BOS/MSS + Displacement + FVG/OB + OI/Funding</div>
+                    <div>• WAIT：必要閘門未過且沒有足夠結構，或多空分差低於設定邊距（同時列出兩邊分數）</div>
+                    <div>• WATCH：有結構但四道必要閘門未齊，或追價／費率擁擠軟否決（原因必出現在 missing gates）</div>
+                    <div>• HIGH RISK：extremeFunding 或低流動性高波動</div>
+                    <div>• LONG / SHORT CANDIDATE：HTF/LTF 同向 +（完整序列或輕量路徑 TRIGGER_BOS_MSS_AND_POI）+ 多單折價/OTE、空單溢價/OTE + 可交易流動性</div>
+                    <div>• 信心 0–100：OI 同向增倉加分、OI 下降減分；CVD 背離；OBI=(買−賣)/(買+賣) 於 ±0.5/1/2%；費率擁擠。雷達總分含 smcQuality，WAIT/WATCH 有上限、正式候選有下限</div>
                     <div>• 紙上進場嚴禁回溯：僅用下一根 (i+1) 開盤價進場，逾時記為 ENTRY_WINDOW_MISSED；同根觸及 SL/TP 保守判止損</div>
                   </div>
                 </div>

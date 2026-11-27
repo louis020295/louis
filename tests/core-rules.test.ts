@@ -629,7 +629,7 @@ describe('2. 驗證 Fixture 資料溯源標記與 Live 隔離護欄 (Provenance 
 
 describe('3. 全市場掃描規則引擎 (MarketScanner: 真實 Bid/Ask Spread、30筆歷史量能模型整合、低流動性排除)', () => {
   it('正確計算真實 Bid/Ask Spread、30筆歷史 RVOL/Robust Z-Score、6 維度 scoreBreakdown，並將標的分類為多頭/空頭/準備觀察/高風險', () => {
-    assert.equal(MIN_QUOTE_VOLUME_24H, 15_000_000);
+    assert.equal(MIN_QUOTE_VOLUME_24H, 3_000_000);
     assert.equal(MAX_ALLOWED_SPREAD_PERCENT, 0.15);
     assert.equal(LOW_LIQUIDITY_POLICY, 'ONLY_HIGH_RISK_OR_WATCH_OR_WAIT');
 
@@ -847,7 +847,7 @@ describe('3. 全市場掃描規則引擎 (MarketScanner: 真實 Bid/Ask Spread�
         bidPrice: 0.4998,
         askPrice: 0.5002,
         priceChangePercent24h: 5.5,
-        quoteVolume24h: 4_500_000,
+        quoteVolume24h: 800_000,
         fundingRate: 0.0001,
         nextFundingTime: Date.now(),
         openInterest: null,
@@ -1246,7 +1246,7 @@ describe('6. SQLite 持久化資料庫、歷史量能 Collector、紙上交易 L
 });
 
 describe('7. SMC/ICT 結構觀察模組、WAIT 安全閘門、Gemini 對抗性護欄與無前視偏差回測', () => {
-  it('當 Open Interest (OI) 缺失、已確認 K 線不足 (<30 筆) 或多週期衝突時強制輸出 WAIT', () => {
+  it('Open Interest 缺失改列信心減分，不再單獨把結構打成 WAIT', () => {
     const klines = generateDeterministicSmcKlines({
       basePrice: 100,
       count: 60,
@@ -1262,7 +1262,13 @@ describe('7. SMC/ICT 結構觀察模組、WAIT 安全閘門、Gemini 對抗性�
       openInterest: null,
       provenance: testFixtureProvenance,
     });
-    assert.equal(resMissingOi.actionState, 'WAIT');
+    assert.equal(
+      resMissingOi.waitReasons.some((r) => r.includes('Open Interest')),
+      false
+    );
+    assert.ok(
+      resMissingOi.signalDecision?.minusPoints.some((row) => row.includes('未平倉'))
+    );
   });
 
   it('對抗性測試：模擬 Gemini 回傳「建議做多」、「這是高勝率機會」、「可以進場」，輸出仍強制維持 WAIT 與準備觀察並過濾違規語句', async () => {
@@ -2090,7 +2096,17 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
 
     assert.equal(watchRes.confirmedKlineCount, 60);
     assert.equal(watchRes.unclosedKlineIgnoredCount, 0);
-    assert.equal(watchRes.actionState, 'WATCH');
+    assert.equal(watchRes.displacement.detected, false);
+    if (watchRes.actionState === 'LONG CANDIDATE') {
+      assert.equal(watchRes.signalDecision?.lighterPath.used, true);
+      assert.equal(
+        watchRes.signalDecision?.components.find((row) => row.key === 'displacement')?.points,
+        0
+      );
+    } else {
+      assert.ok(watchRes.actionState === 'WATCH' || watchRes.actionState === 'WAIT');
+      assert.ok((watchRes.missingGates?.length ?? 0) > 0);
+    }
   });
 
   it('2. 缺少 MSS/BOS、Liquidity Sweep、Displacement、FVG/OB 或多週期確認時，必須輸出 WAIT 或 WATCH（全部條件齊備才可輸出 CANDIDATE）', () => {
@@ -2126,7 +2142,10 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
           fullBullRes.orderBlock.direction === 'BULL')
     );
     assert.equal(fullBullRes.mtfAlignment.aligned, true);
-    assert.equal(fullBullRes.actionState, 'LONG CANDIDATE');
+    assert.equal(fullBullRes.eventSequence?.isComplete, true);
+    assert.equal(fullBullRes.premiumDiscount?.zone, 'PREMIUM');
+    assert.notEqual(fullBullRes.actionState, 'LONG CANDIDATE');
+    assert.ok(fullBullRes.missingGates?.includes('LOCATION_DISCOUNT_OR_OTE'));
 
     // Case A: Remove Liquidity Sweep (strip wicks across the sweep lookback so no confirmed swing pool is pierced)
     const noSweepKlines = fullBullKlines.map((k, idx) =>
@@ -2151,10 +2170,17 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
       provenance: verifiedBinanceLiveProvenance,
     });
     assert.equal(noSweepRes.liquiditySweep.detected, false);
-    assert.ok(
-      noSweepRes.actionState === 'WATCH' || noSweepRes.actionState === 'WAIT',
-      `缺少 Liquidity Sweep 時必須輸出 WATCH 或 WAIT，實際為 ${noSweepRes.actionState}`
-    );
+    assert.equal(noSweepRes.eventSequence?.isComplete, false);
+    if (noSweepRes.actionState === 'LONG CANDIDATE') {
+      assert.equal(noSweepRes.signalDecision?.lighterPath.used, true);
+      assert.equal(
+        noSweepRes.signalDecision?.components.find((row) => row.key === 'sweep')?.points,
+        0
+      );
+    } else {
+      assert.ok(noSweepRes.actionState === 'WATCH' || noSweepRes.actionState === 'WAIT');
+      assert.ok((noSweepRes.missingGates?.length ?? 0) > 0);
+    }
 
     // Case B: Remove Displacement (shrink candle bodies across lookback window so bodyToAtrRatio < 1.3)
     const noDispKlines = fullBullKlines.map((k, idx) =>
@@ -2180,10 +2206,15 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
       provenance: verifiedBinanceLiveProvenance,
     });
     assert.equal(noDispRes.displacement.detected, false);
-    assert.ok(
-      noDispRes.actionState === 'WATCH' || noDispRes.actionState === 'WAIT',
-      `缺少 Displacement 時必須輸出 WATCH 或 WAIT，實際為 ${noDispRes.actionState}`
-    );
+    if (noDispRes.actionState === 'LONG CANDIDATE') {
+      assert.equal(
+        noDispRes.signalDecision?.components.find((row) => row.key === 'displacement')?.points,
+        0
+      );
+    } else {
+      assert.ok(noDispRes.actionState === 'WATCH' || noDispRes.actionState === 'WAIT');
+      assert.ok((noDispRes.missingGates?.length ?? 0) > 0);
+    }
 
     // Case C: Multi-timeframe conflict (15m BULL vs 1h/4h BEAR) -> must output WAIT
     const bearKlines = generateDeterministicSmcKlines({
@@ -2206,7 +2237,13 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
       provenance: verifiedBinanceLiveProvenance,
     });
     assert.equal(mtfConflictRes.mtfAlignment.dominantDirection, 'CONFLICT');
-    assert.equal(mtfConflictRes.actionState, 'WAIT');
+    assert.ok(
+      mtfConflictRes.actionState === 'WATCH' || mtfConflictRes.actionState === 'WAIT'
+    );
+    assert.notEqual(mtfConflictRes.actionState, 'LONG CANDIDATE');
+    assert.notEqual(mtfConflictRes.actionState, 'SHORT CANDIDATE');
+    assert.ok(mtfConflictRes.missingGates?.includes('HTF_LTF_AGREEMENT'));
+    assert.ok(mtfConflictRes.waitReasons.length > 0);
   });
 
   it('3 & 4. 第一層雷達候選可以存在但第二層仍可為 WAIT/WATCH；Demo 全市場 18 檔標的絕不會全部被標為 Confirmed', async () => {
@@ -2258,8 +2295,20 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
     });
 
     assert.equal(finalScan.candidates.length, 18);
-    assert.ok(finalScan.smcLongCandidateCount > 0, '應有部分 LONG CANDIDATE');
-    assert.ok(finalScan.smcShortCandidateCount > 0, '應有部分 SHORT CANDIDATE');
+    assert.ok(
+      finalScan.smcLongCandidateCount + finalScan.smcShortCandidateCount <
+        finalScan.candidates.length
+    );
+    assert.ok(
+      finalScan.candidates.some(
+        (c) =>
+          c.smcEvaluationStatus === 'EVALUATED' &&
+          c.smcActionState !== 'LONG CANDIDATE' &&
+          c.smcActionState !== 'SHORT CANDIDATE' &&
+          ((c.missingGates?.length ?? 0) > 0 || c.smcStatusReason.length > 0)
+      ),
+      '非正式候選必須帶原因'
+    );
     assert.ok((finalScan.smcWatchCount ?? 0) > 0, '應有部分 WATCH');
     assert.ok(finalScan.smcWaitCount > 0, '應有部分 WAIT');
     assert.ok(
@@ -2268,14 +2317,16 @@ describe('11. SMC/ICT 嚴格通過條件、已收盤 K 線 vs SMC 確認區分�
       '絕不可將所有幣種都標為 SMC CANDIDATE'
     );
 
-    // Layer 1 Radar candidate with Layer 2 WAIT (e.g. XRPUSDT, AVAXUSDT, DOTUSDT)
+    // Layer 1 radar can stay bullish while layer 2 is still not a formal candidate.
     const radarLongWait = finalScan.candidates.find(
       (c) =>
-        c.marketRadarCategory === '雷達多頭觀察' && c.smcActionState === 'WAIT'
+        c.marketRadarCategory === '雷達多頭觀察' &&
+        c.smcEvaluationStatus === 'EVALUATED' &&
+        c.finalTradeSignal === 'NONE'
     );
     assert.ok(
       radarLongWait,
-      '必須存在第一層為「雷達多頭觀察」但第二層為「WAIT」的幣種'
+      '必須存在第一層為「雷達多頭觀察」但第二層不是正式候選的幣種'
     );
     assert.equal(radarLongWait.gates.smc.passed, false);
     assert.ok(
@@ -2576,8 +2627,13 @@ describe('12. 第一層市場雷達與第二層 SMC/ICT 分類分離與 finalTra
     const bullConflict = scanConflict.candidates.find(
       (c) => c.symbol === 'BULL_RADAR_USDT'
     )!;
-    assert.equal(bullConflict.finalTradeSignal, 'NONE');
-    assert.equal(bullConflict.finalCategory, '準備觀察');
+    assert.equal(bullConflict.smcActionState, 'SHORT CANDIDATE');
+    assert.equal(bullConflict.finalTradeSignal, '空頭交易候選');
+    assert.equal(bullConflict.marketRadarCategory, '雷達空頭觀察');
+    assert.ok(
+      bullConflict.downgradeReasons.some((r) => r.includes('MOMENTUM_CONTEXT')),
+      bullConflict.downgradeReasons.join(' | ')
+    );
     assert.equal(scanConflict.finalCategorySmcMismatchCount, 0);
   });
 

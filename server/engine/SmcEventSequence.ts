@@ -44,7 +44,11 @@ function rank(state: SmcEventSequenceState): number {
 
 interface Attempt {
   sweepIndex: number;
+  sweepLevel: number;
   steps: SmcEventSequenceStep[];
+  fvg: { low: number; high: number } | null;
+  ob: { low: number; high: number } | null;
+  displacementIndex: number | null;
 }
 
 function isDisplacement(
@@ -70,33 +74,58 @@ function fvgOrObFromDisplacement(params: {
   direction: 'LONG' | 'SHORT';
   atr: number;
   config: SmcStructureConfig;
-}): { found: boolean; detail: string } {
+}): {
+  found: boolean;
+  detail: string;
+  fvg: { low: number; high: number } | null;
+  ob: { low: number; high: number } | null;
+} {
   const { confirmed, displacementIndex: k, direction, atr, config } = params;
   const minGap = Math.max(0, config.minFvgAtrMultiple) * Math.max(0, atr);
   if (direction === 'LONG') {
     if (k - 1 >= 0 && k + 1 < confirmed.length) {
       const gap = confirmed[k + 1].low - confirmed[k - 1].high;
       if (gap > 0 && gap + 1e-12 >= minGap) {
-        return { found: true, detail: '位移 K 為中間燭，右側已留下多頭 FVG' };
+        return {
+          found: true,
+          detail: '位移 K 為中間燭，右側已留下多頭 FVG',
+          fvg: { low: confirmed[k - 1].high, high: confirmed[k + 1].low },
+          ob: null,
+        };
       }
     }
     if (k - 2 >= 0) {
       const gap = confirmed[k].low - confirmed[k - 2].high;
       if (gap > 0 && gap + 1e-12 >= minGap) {
-        return { found: true, detail: '位移 K 為右側燭，留下多頭 FVG' };
+        return {
+          found: true,
+          detail: '位移 K 為右側燭，留下多頭 FVG',
+          fvg: { low: confirmed[k - 2].high, high: confirmed[k].low },
+          ob: null,
+        };
       }
     }
   } else {
     if (k - 1 >= 0 && k + 1 < confirmed.length) {
       const gap = confirmed[k - 1].low - confirmed[k + 1].high;
       if (gap > 0 && gap + 1e-12 >= minGap) {
-        return { found: true, detail: '位移 K 為中間燭，右側已留下空頭 FVG' };
+        return {
+          found: true,
+          detail: '位移 K 為中間燭，右側已留下空頭 FVG',
+          fvg: { low: confirmed[k + 1].high, high: confirmed[k - 1].low },
+          ob: null,
+        };
       }
     }
     if (k - 2 >= 0) {
       const gap = confirmed[k - 2].low - confirmed[k].high;
       if (gap > 0 && gap + 1e-12 >= minGap) {
-        return { found: true, detail: '位移 K 為右側燭，留下空頭 FVG' };
+        return {
+          found: true,
+          detail: '位移 K 為右側燭，留下空頭 FVG',
+          fvg: { low: confirmed[k].high, high: confirmed[k - 2].low },
+          ob: null,
+        };
       }
     }
   }
@@ -109,10 +138,15 @@ function fvgOrObFromDisplacement(params: {
     minBodyToAtr: config.obMinBodyToAtr,
     minBodyToRange: config.obMinBodyToRange,
   });
-  if (ob.found) {
-    return { found: true, detail: '該位移離開前方反向 Order Block' };
+  if (ob.found && ob.evidence.low != null && ob.evidence.high != null) {
+    return {
+      found: true,
+      detail: '該位移離開前方反向 Order Block',
+      fvg: null,
+      ob: { low: ob.evidence.low, high: ob.evidence.high },
+    };
   }
-  return { found: false, detail: '位移尚未留下 FVG 或有效 Order Block' };
+  return { found: false, detail: '位移尚未留下 FVG 或有效 Order Block', fvg: null, ob: null };
 }
 
 function detectDirectionalSequence(
@@ -130,6 +164,9 @@ function detectDirectionalSequence(
       completedStepCount,
       steps,
       informational: true,
+      sweepLevel: null,
+      invalidated: false,
+      invalidationReasonZh: null,
     };
   };
 
@@ -191,7 +228,12 @@ function detectDirectionalSequence(
         }
       }
 
-      let poi = { found: false, detail: '尚未出現' };
+      let poi: {
+        found: boolean;
+        detail: string;
+        fvg: { low: number; high: number } | null;
+        ob: { low: number; high: number } | null;
+      } = { found: false, detail: '尚未出現', fvg: null, ob: null };
       if (dispIndex !== null && dispIndex - sweepIndex <= windowBars) {
         poi = fvgOrObFromDisplacement({
           confirmed,
@@ -242,7 +284,14 @@ function detectDirectionalSequence(
         completed > prev ||
         (completed === prev && sweepIndex > best.sweepIndex)
       ) {
-        best = { sweepIndex, steps };
+        best = {
+          sweepIndex,
+          sweepLevel: pool.price,
+          steps,
+          fvg: poi.fvg,
+          ob: poi.ob,
+          displacementIndex: dispIndex,
+        };
       }
     }
   }
@@ -258,13 +307,57 @@ function detectDirectionalSequence(
       emptyStep('FVG_OR_OB', '尚未出現'),
     ]);
   }
-  return unfinished(best.steps);
+
+  let invalidationReasonZh: string | null = null;
+  const afterSweep = best.sweepIndex + 1;
+  for (let i = afterSweep; i < confirmed.length; i++) {
+    const candle = confirmed[i];
+    if (direction === 'LONG' && candle.low < best.sweepLevel) {
+      invalidationReasonZh = `後續 K 線低點跌破掃單低點 ${best.sweepLevel}`;
+      break;
+    }
+    if (direction === 'SHORT' && candle.high > best.sweepLevel) {
+      invalidationReasonZh = `後續 K 線高點升破掃單高點 ${best.sweepLevel}`;
+      break;
+    }
+  }
+  const poiStart = (best.displacementIndex ?? best.sweepIndex) + 1;
+  if (!invalidationReasonZh && best.fvg) {
+    for (let i = poiStart; i < confirmed.length; i++) {
+      const candle = confirmed[i];
+      const filled =
+        direction === 'LONG' ? candle.low <= best.fvg.low : candle.high >= best.fvg.high;
+      if (filled) {
+        invalidationReasonZh = `位移 FVG [${best.fvg.low}–${best.fvg.high}] 已被後續 K 線完全回補`;
+        break;
+      }
+    }
+  }
+  if (!invalidationReasonZh && best.ob) {
+    for (let i = poiStart; i < confirmed.length; i++) {
+      const candle = confirmed[i];
+      const mitigated =
+        direction === 'LONG' ? candle.close < best.ob.low : candle.close > best.ob.high;
+      if (mitigated) {
+        invalidationReasonZh = `Order Block [${best.ob.low}–${best.ob.high}] 已被收盤貫穿`;
+        break;
+      }
+    }
+  }
+
+  const state = unfinished(best.steps);
+  state.sweepLevel = best.sweepLevel;
+  state.invalidated = invalidationReasonZh !== null;
+  state.invalidationReasonZh = invalidationReasonZh;
+  if (state.invalidated) state.isComplete = false;
+  return state;
 }
 
 /**
- * Informational SMC sequence. Not used as a gate.
+ * Ordered SMC sequence used by signal gate (b).
  * Long: sell-side sweep → bullish MSS/CHoCH → displacement → FVG/OB from that displacement.
  * Short is the mirror. Events must occur in that order inside `sequenceWindowBars`.
+ * A complete sequence satisfies the gate. The lighter path is applied later in SignalConfidence.
  */
 export function detectBestEventSequence(
   candles: Kline[] | null | undefined,
