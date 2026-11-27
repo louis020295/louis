@@ -1,5 +1,6 @@
 import React from 'react';
 import { DataProvenance, SmcEvaluationStatus } from '../types/market.ts';
+import { formatTaipeiTime } from '../utils/taipeiTime.ts';
 
 interface ProvenanceLineProps {
   provenance: DataProvenance;
@@ -14,13 +15,7 @@ export const ProvenanceLine: React.FC<ProvenanceLineProps> = ({
 }) => {
   const formattedTime = (() => {
     try {
-      const d = new Date(provenance.fetchedAt);
-      return d.toLocaleTimeString('zh-TW', {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      });
+      return `${formatTaipeiTime(provenance.fetchedAt)} 台北`;
     } catch {
       return provenance.fetchedAt;
     }

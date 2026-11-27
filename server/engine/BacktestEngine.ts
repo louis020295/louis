@@ -46,6 +46,7 @@ import {
   enforceProvenanceIntegrity,
   isVerifiedLivePublicApiSource,
 } from '../utils/provenanceQuarantine.ts';
+import { selectClosedCandles } from '../market/ClosedCandleSeries.ts';
 
 export interface RunBacktestInput {
   backtestRunId?: string;
@@ -74,6 +75,9 @@ export interface RunBacktestInput {
    */
   openInterest?: number | null;
   fundingRate?: number | null;
+  /** Per-settlement interval. Omit to keep the 8h fallback inside the cost model. */
+  fundingIntervalHours?: number | null;
+  fundingIntervalFallback?: boolean;
   provenance: DataProvenance;
   ruleVersion?: string;
   smcRuleProfile?: SmcRuleProfile;
@@ -97,6 +101,8 @@ export interface RunWalkForwardInput {
   historicalFundingRates?: HistoricalFundingRatePoint[];
   openInterest?: number | null;
   fundingRate?: number | null;
+  fundingIntervalHours?: number | null;
+  fundingIntervalFallback?: boolean;
   provenance: DataProvenance;
   ruleVersion?: string;
   smcRuleProfile?: SmcRuleProfile;
@@ -281,15 +287,15 @@ export class BacktestEngine {
     // Verify chronological ordering (no time-series shuffling allowed)
     const chronoCheck = verifyChronologicalKlines(klines);
 
-    // 1. Strictly filter only confirmed closed candles (isClosed === true)
-    const confirmedKlines = klines.filter((k) => k.isClosed === true);
+    // 1. Closed candles only — same predicate as the live scanner fetch layer.
+    const confirmedKlines = selectClosedCandles(klines);
     const unclosedIgnored = klines.length - confirmedKlines.length;
-    const confirmedHtf1h = (higherTimeframeKlines?.['1h'] ?? [])
-      .filter((k) => k.isClosed === true)
-      .sort((a, b) => a.openTime - b.openTime);
-    const confirmedHtf4h = (higherTimeframeKlines?.['4h'] ?? [])
-      .filter((k) => k.isClosed === true)
-      .sort((a, b) => a.openTime - b.openTime);
+    const confirmedHtf1h = selectClosedCandles(higherTimeframeKlines?.['1h'] ?? []).sort(
+      (a, b) => a.openTime - b.openTime
+    );
+    const confirmedHtf4h = selectClosedCandles(higherTimeframeKlines?.['4h'] ?? []).sort(
+      (a, b) => a.openTime - b.openTime
+    );
     const mtfHistoricalAligned =
       timeframe === '1h' || timeframe === '4h'
         ? true
@@ -548,6 +554,9 @@ export class BacktestEngine {
         entryOrderType: resolvedCostConfig.entryOrderType ?? 'MARKET',
         exitIsLimitFill,
         fundingRatePer8h: pointInTimeFundingRate,
+        fundingIntervalHours: input.fundingIntervalHours,
+        fundingIntervalFallback: input.fundingIntervalFallback,
+        symbol,
         costConfig: resolvedCostConfig,
       });
       const netRMultiple = Number((finalR - costs.totalCostR).toFixed(2));
@@ -1064,6 +1073,9 @@ export class BacktestEngine {
         entryOrderType: resolvedCostConfig.entryOrderType ?? 'MARKET',
         exitIsLimitFill,
         fundingRatePer8h: pointInTimeFunding,
+        fundingIntervalHours: input.fundingIntervalHours,
+        fundingIntervalFallback: input.fundingIntervalFallback,
+        symbol,
         costConfig: resolvedCostConfig,
       });
       const netRMultiple = Number((rMultiple - tradeCosts.totalCostR).toFixed(2));
@@ -1117,6 +1129,8 @@ export class BacktestEngine {
         totalCostR: tradeCosts.totalCostR,
         netRMultiple,
         fundingRateUsed: tradeCosts.fundingRateUsed,
+        fundingIntervalHoursUsed: tradeCosts.fundingIntervalHoursUsed,
+        fundingIntervalFallback: tradeCosts.fundingIntervalFallback,
         outcome,
         evidencesSummary:
           `${scanTag} ${passedLabels || 'SMC 結構共振'} · ${volTag}`.trim(),
@@ -1594,6 +1608,8 @@ export class BacktestEngine {
       provenance: rawProvenance,
       ruleVersion: customRuleVersion,
       smcRuleProfile: rawRuleProfile,
+      fundingIntervalHours,
+      fundingIntervalFallback,
     } = input;
 
     const resolvedRuleProfile = normalizeSmcRuleProfile(rawRuleProfile);
@@ -1613,7 +1629,7 @@ export class BacktestEngine {
       );
     }
 
-    const confirmedKlines = klines.filter((k) => k.isClosed === true);
+    const confirmedKlines = selectClosedCandles(klines);
     const evaluableCount = confirmedKlines.length - MIN_HISTORY_SAMPLES;
 
     const buildWindowResult = (
@@ -1706,6 +1722,8 @@ export class BacktestEngine {
         costConfig: resolvedCostConfig,
         historicalOpenInterest: visibleOi,
         historicalFundingRates: visibleFunding,
+        fundingIntervalHours,
+        fundingIntervalFallback,
         provenance,
         ruleVersion: frozenRuleVersion,
         smcRuleProfile: resolvedRuleProfile,
@@ -1812,6 +1830,8 @@ export class BacktestEngine {
       costConfig: resolvedCostConfig,
       historicalOpenInterest,
       historicalFundingRates,
+      fundingIntervalHours,
+      fundingIntervalFallback,
       provenance,
       ruleVersion: frozenRuleVersion,
       smcRuleProfile: resolvedRuleProfile,

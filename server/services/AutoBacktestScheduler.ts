@@ -241,7 +241,10 @@ export class AutoBacktestScheduler {
             timeframe: cfg.timeframe,
             mode,
             exchange,
-            barLimit: Math.min(1000, Math.max(120, options?.barLimit ?? 240)),
+            barLimit: Math.min(
+              10_000,
+              Math.max(120, options?.barLimit ?? 240)
+            ),
             includeWalkForward: true,
             writeToPaperLedger: false,
             triggerSource: 'AUTO_SCHEDULED',

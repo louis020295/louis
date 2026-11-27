@@ -11,6 +11,14 @@ import {
 } from '../engine/SmcRuleEngine.ts';
 import { normalizeTradingCostConfig } from '../engine/TradingCostModel.ts';
 import {
+  clampBacktestBarCount,
+  fetchClosedCandleSeries,
+} from '../market/ClosedCandleSeries.ts';
+import {
+  ensureExchangeFundingMap,
+  resolveFundingInterval,
+} from '../market/FundingInterval.ts';
+import {
   BacktestDataClassification,
   BacktestResult,
   BacktestTriggerSource,
@@ -34,6 +42,43 @@ import {
   TRADING_SAFETY_FLAGS,
   WalkForwardBacktestResult,
 } from '../../src/types/market.ts';
+
+async function fetchBacktestCandles(
+  adapter: ExchangeAdapter,
+  symbol: string,
+  timeframe: Timeframe,
+  barCount: number
+) {
+  return fetchClosedCandleSeries({
+    symbol,
+    timeframe,
+    barCount,
+    fetchPage: (query) =>
+      adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+    rateLimit: {
+      enforce: process.env.NODE_ENV === 'production',
+      maxWeightPerWindow: Number(process.env.KLINE_WEIGHT_PER_MINUTE ?? 1200),
+      windowMs: 60_000,
+    },
+  });
+}
+
+async function resolveBacktestFundingInterval(
+  adapter: ExchangeAdapter,
+  symbol: string,
+  series: HistoricalFundingRatePoint[]
+) {
+  if (adapter.fetchFundingIntervals) {
+    await ensureExchangeFundingMap(async () => {
+      const info = await adapter.fetchFundingIntervals!();
+      return info.bySymbol;
+    });
+  }
+  return resolveFundingInterval({
+    symbol,
+    seriesTimestamps: series.map((point) => point.timestamp),
+  });
+}
 
 export const DEFAULT_PORTFOLIO_RISK_CONFIG: PortfolioRiskConfig = {
   maxOpenPositions: 3,
@@ -172,7 +217,7 @@ export class BacktestService {
       params.timeframe && validTimeframes.includes(params.timeframe)
         ? params.timeframe
         : '15m';
-    const barLimit = Math.min(1000, Math.max(45, params.barLimit ?? 120));
+    const barLimit = clampBacktestBarCount(params.barLimit, 120, 45);
     const resolvedCostConfig = normalizeTradingCostConfig(params.costConfig);
     const resolvedRuleProfile = normalizeSmcRuleProfile(params.smcRuleProfile);
 
@@ -196,7 +241,8 @@ export class BacktestService {
         historicalFundingRates = params.customHistoricalFundingRates ?? [];
       }
     } else {
-      const klinesResult = await adapter.fetchKlines(
+      const klinesResult = await fetchBacktestCandles(
+        adapter,
         cleanSymbol,
         timeframe,
         barLimit
@@ -208,23 +254,23 @@ export class BacktestService {
 
       const shouldFetchMtf =
         !higherTimeframeKlines && (timeframe === '5m' || timeframe === '15m');
-      const mtf1hLimit = Math.min(
-        500,
-        Math.max(120, Math.ceil(barLimit / (timeframe === '5m' ? 12 : 4)) + 80)
+      const mtf1hLimit = clampBacktestBarCount(
+        Math.max(120, Math.ceil(barLimit / (timeframe === '5m' ? 12 : 4)) + 80),
+        120,
+        80
       );
-      const mtf4hLimit = Math.min(
-        300,
-        Math.max(80, Math.ceil(barLimit / (timeframe === '5m' ? 48 : 16)) + 60)
+      const mtf4hLimit = clampBacktestBarCount(
+        Math.max(80, Math.ceil(barLimit / (timeframe === '5m' ? 48 : 16)) + 60),
+        80,
+        40
       );
 
       const mtfPromise = shouldFetchMtf
         ? Promise.all([
-            adapter
-              .fetchKlines(cleanSymbol, '1h', mtf1hLimit)
+            fetchBacktestCandles(adapter, cleanSymbol, '1h', mtf1hLimit)
               .then((r) => r.klines)
               .catch(() => [] as Kline[]),
-            adapter
-              .fetchKlines(cleanSymbol, '4h', mtf4hLimit)
+            fetchBacktestCandles(adapter, cleanSymbol, '4h', mtf4hLimit)
               .then((r) => r.klines)
               .catch(() => [] as Kline[]),
           ])
@@ -335,6 +381,12 @@ export class BacktestService {
     let rawResult: BacktestResult;
     let walkForwardResult: WalkForwardBacktestResult | undefined;
 
+    const fundingInterval = await resolveBacktestFundingInterval(
+      adapter,
+      cleanSymbol,
+      historicalFundingRates
+    );
+
     if (params.includeWalkForward !== false) {
       const wf = this.engine.runWalkForwardBacktest({
         symbol: cleanSymbol,
@@ -345,6 +397,8 @@ export class BacktestService {
         costConfig: resolvedCostConfig,
         historicalOpenInterest,
         historicalFundingRates,
+        fundingIntervalHours: fundingInterval.fundingIntervalHours,
+        fundingIntervalFallback: fundingInterval.fallback,
         provenance: combinedProvenance,
         ruleVersion: params.ruleVersion,
         smcRuleProfile: resolvedRuleProfile,
@@ -361,6 +415,8 @@ export class BacktestService {
         costConfig: resolvedCostConfig,
         historicalOpenInterest,
         historicalFundingRates,
+        fundingIntervalHours: fundingInterval.fundingIntervalHours,
+        fundingIntervalFallback: fundingInterval.fallback,
         provenance: combinedProvenance,
         ruleVersion: params.ruleVersion,
         smcRuleProfile: resolvedRuleProfile,
@@ -413,7 +469,7 @@ export class BacktestService {
       params.timeframe && validTimeframes.includes(params.timeframe)
         ? params.timeframe
         : '15m';
-    const barLimit = Math.min(1000, Math.max(45, params.barLimit ?? 240));
+    const barLimit = clampBacktestBarCount(params.barLimit, 240, 45);
     const resolvedRuleProfile = normalizeSmcRuleProfile(params.smcRuleProfile);
     const costConfig = normalizeTradingCostConfig(params.costConfig);
     const riskConfig = normalizePortfolioRiskConfig(params.riskConfig);
@@ -816,7 +872,7 @@ export class BacktestService {
       params.timeframe && validTimeframes.includes(params.timeframe)
         ? params.timeframe
         : '15m';
-    const barLimit = Math.min(1000, Math.max(45, params.barLimit ?? 480));
+    const barLimit = clampBacktestBarCount(params.barLimit, 480, 45);
     const costConfig = normalizeTradingCostConfig(params.costConfig);
     const riskConfig = normalizePortfolioRiskConfig(params.riskConfig);
     const { adapter, resolvedMode, exchangeId } = this.resolveAdapter(
@@ -854,18 +910,21 @@ export class BacktestService {
         }
       }
     } else {
-      const mtf1hLimit = Math.min(
-        500,
-        Math.max(120, Math.ceil(barLimit / (timeframe === '5m' ? 12 : 4)) + 80)
+      const mtf1hLimit = clampBacktestBarCount(
+        Math.max(120, Math.ceil(barLimit / (timeframe === '5m' ? 12 : 4)) + 80),
+        120,
+        80
       );
-      const mtf4hLimit = Math.min(
-        300,
-        Math.max(80, Math.ceil(barLimit / (timeframe === '5m' ? 48 : 16)) + 60)
+      const mtf4hLimit = clampBacktestBarCount(
+        Math.max(80, Math.ceil(barLimit / (timeframe === '5m' ? 48 : 16)) + 60),
+        80,
+        40
       );
 
       for (const sym of cleanSymbols) {
         try {
-          const klinesResult = await adapter.fetchKlines(
+          const klinesResult = await fetchBacktestCandles(
+            adapter,
             sym,
             timeframe,
             barLimit
@@ -899,14 +958,12 @@ export class BacktestService {
                   provenance: klinesResult.provenance,
                 }),
             shouldFetchMtf
-              ? adapter
-                  .fetchKlines(sym, '1h', mtf1hLimit)
+              ? fetchBacktestCandles(adapter, sym, '1h', mtf1hLimit)
                   .then((r) => r.klines)
                   .catch(() => [] as Kline[])
               : Promise.resolve([] as Kline[]),
             shouldFetchMtf
-              ? adapter
-                  .fetchKlines(sym, '4h', mtf4hLimit)
+              ? fetchBacktestCandles(adapter, sym, '4h', mtf4hLimit)
                   .then((r) => r.klines)
                   .catch(() => [] as Kline[])
               : Promise.resolve([] as Kline[]),

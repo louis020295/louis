@@ -3194,7 +3194,7 @@ describe('12. 第一層市場雷達與第二層 SMC/ICT 分類分離與 finalTra
 });
 
 describe('早鳥起漲偵測 (Early Ignition) 與 防追高回踩區間評估 (Entry Zone / Anti-Chase)', () => {
-  it('1. computeEntryZoneAnalysis 在價格偏離 FVG/OB 超過 2x ATR 時輸出 OVEREXTENDED 並對比追價 vs 回踩 R:R，回踩區間內則輸出 IN_DISCOUNT_ZONE', () => {
+  it('1. computeEntryZoneAnalysis 在價格偏離 FVG/OB 超過 2x ATR 時輸出 OVEREXTENDED 並對比追價 vs 回踩 R:R，回踩區間內則輸出 NEAR_POI', () => {
     const fvg = {
       detected: true,
       direction: 'BULL' as const,
@@ -3248,7 +3248,7 @@ describe('早鳥起漲偵測 (Early Ignition) 與 防追高回踩區間評估 (E
       liquiditySweep: sweep,
     });
 
-    assert.equal(pullback.status, 'IN_DISCOUNT_ZONE');
+    assert.equal(pullback.status, 'NEAR_POI');
     assert.equal(pullback.distanceToZoneAtr, 0);
   });
 

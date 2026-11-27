@@ -390,6 +390,8 @@ export interface ScannedCandidate {
   intendedDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
   earlyIgnition?: EarlyIgnitionSignal | null;
   entryZoneSummary?: EntryZoneAnalysis | null;
+  premiumDiscount?: PremiumDiscountRange | null;
+  eventSequence?: SmcEventSequenceState | null;
   tradeHorizon?: TradeHorizonProfile | null;
   btcCorrelation?: BtcKlineCorrelationSummary | null;
   sector?: MarketSectorInfo;
@@ -803,11 +805,66 @@ export interface EarlyIgnitionSignal {
   riskWarningZh: string;
 }
 
+/**
+ * NEAR_POI means price is inside or tight against an FVG / order block.
+ * It is not a premium/discount reading — those labels live on PremiumDiscountRange.
+ */
 export type EntryPullbackStatus =
-  | 'IN_DISCOUNT_ZONE'
+  | 'NEAR_POI'
   | 'NEAR_PULLBACK_ZONE'
   | 'OVEREXTENDED'
   | 'NO_CLEAR_ZONE';
+
+export type DealingRangeZone =
+  | 'DISCOUNT'
+  | 'PREMIUM'
+  | 'EQUILIBRIUM'
+  | 'UNAVAILABLE';
+
+export type DealingRangeLabel =
+  | 'IN_DISCOUNT'
+  | 'IN_PREMIUM'
+  | 'IN_OTE'
+  | 'AT_EQUILIBRIUM';
+
+export interface PremiumDiscountRange {
+  timeframe?: Timeframe;
+  rangeHigh: number | null;
+  rangeLow: number | null;
+  equilibrium: number | null;
+  /** 0 = range low, 100 = range high, 50 = equilibrium. */
+  pricePositionPct: number | null;
+  zone: DealingRangeZone;
+  labels: DealingRangeLabel[];
+  inOte: boolean;
+  oteLow: number | null;
+  oteHigh: number | null;
+  /** 0.705 retracement inside the OTE band. */
+  oteSweetSpot: number | null;
+  oteDirection: 'BULL' | 'BEAR' | 'NONE';
+  swingHighIndex?: number | null;
+  swingLowIndex?: number | null;
+  swingHighTime?: number | null;
+  swingLowTime?: number | null;
+}
+
+export interface SmcEventSequenceStep {
+  key: 'LIQUIDITY_SWEEP' | 'MSS_CHOCH' | 'DISPLACEMENT' | 'FVG_OR_OB';
+  complete: boolean;
+  barIndex: number | null;
+  timestamp: number | null;
+  detail: string;
+}
+
+export interface SmcEventSequenceState {
+  direction: 'LONG' | 'SHORT' | 'NONE';
+  isComplete: boolean;
+  windowBars: number;
+  completedStepCount: number;
+  steps: SmcEventSequenceStep[];
+  /** Context only. The sequence is not a candidate gate. */
+  informational: true;
+}
 
 export interface EntryZoneAnalysis {
   status: EntryPullbackStatus;
@@ -895,6 +952,10 @@ export interface SmcAnalysisResult {
   };
   entryZoneAnalysis?: EntryZoneAnalysis | null;
   tradeHorizon?: TradeHorizonProfile | null;
+  structurePreset?: 'conservative' | 'standard' | 'aggressive';
+  premiumDiscount?: PremiumDiscountRange | null;
+  premiumDiscountByTimeframe?: Partial<Record<Timeframe, PremiumDiscountRange>>;
+  eventSequence?: SmcEventSequenceState | null;
 }
 
 export interface SymbolDetailResponse {
@@ -1195,6 +1256,8 @@ export interface BacktestTradeRecord {
   totalCostR?: number;
   netRMultiple?: number;
   fundingRateUsed?: number;
+  fundingIntervalHoursUsed?: number;
+  fundingIntervalFallback?: boolean;
   outcome: 'WIN' | 'LOSS' | 'TIMEOUT_FLAT';
   evidencesSummary: string;
   pointInTimeEvidence?: BacktestPointInTimeSignalEvidence;
@@ -6155,6 +6218,10 @@ export interface DerivativesStructureAnalysis {
     avgRate: number | null;
     deltaBps: number | null;
     annualizedPct: number | null;
+    fundingIntervalHours?: number | null;
+    fundingIntervalSource?: 'exchange' | 'observed_settlements' | 'fallback';
+    fundingIntervalFallback?: boolean;
+    fundingIntervalNoteZh?: string | null;
     squeezeBias:
       | 'SHORT_SQUEEZE_RISK'
       | 'LONG_SQUEEZE_RISK'

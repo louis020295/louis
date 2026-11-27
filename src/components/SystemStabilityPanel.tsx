@@ -1,4 +1,5 @@
 import React from 'react';
+import { formatTaipeiDateTime, formatTaipeiTime } from '../utils/taipeiTime.ts';
 import {
   PaperMonitorStatusResponse,
   SmcScanStatusResponse,
@@ -378,10 +379,7 @@ export const SystemStabilityPanel: React.FC<SystemStabilityPanelProps> = ({
               最近心跳:{' '}
               <strong className="text-slate-200">
                 {watchdogStatus?.lastHeartbeatAt
-                  ? new Date(watchdogStatus.lastHeartbeatAt).toLocaleString(
-                      'zh-TW',
-                      { hour12: false }
-                    )
+                  ? formatTaipeiDateTime(watchdogStatus.lastHeartbeatAt)
                   : '尚未觸發'}
               </strong>
             </span>
@@ -391,9 +389,7 @@ export const SystemStabilityPanel: React.FC<SystemStabilityPanelProps> = ({
                 {watchdogStatus?.autoBackupsCount ?? 0} 次
               </strong>
               {watchdogStatus?.lastAutoBackupAt
-                ? ` (${new Date(
-                    watchdogStatus.lastAutoBackupAt
-                  ).toLocaleTimeString('zh-TW', { hour12: false })})`
+                ? ` (${formatTaipeiTime(watchdogStatus.lastAutoBackupAt)})`
                 : ''}
             </span>
             <span className="text-slate-400">

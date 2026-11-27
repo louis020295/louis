@@ -48,6 +48,11 @@ import {
   evaluateSmcStructure,
   normalizeSmcRuleProfile,
 } from './server/engine/SmcRuleEngine.ts';
+import { fetchClosedCandleSeries } from './server/market/ClosedCandleSeries.ts';
+import {
+  ensureExchangeFundingMap,
+  resolveFundingInterval,
+} from './server/market/FundingInterval.ts';
 import { classifyTradeHorizon } from './server/engine/TradeHorizonClassifier.ts';
 import {
   evaluateHistoricalVolumeAnomaly,
@@ -540,10 +545,50 @@ export async function createApp(options: CreateAppOptions = {}) {
           );
           const [oiRes, k5m, k15m, k1h, k4h] = await Promise.all([
             adapter.fetchOpenInterest(t.symbol, t.lastPrice),
-            adapter.fetchKlines(t.symbol, '5m', 90),
-            adapter.fetchKlines(t.symbol, '15m', 90),
-            adapter.fetchKlines(t.symbol, '1h', 90),
-            adapter.fetchKlines(t.symbol, '4h', 90),
+            fetchClosedCandleSeries({
+              symbol: t.symbol,
+              timeframe: '5m',
+              barCount: 90,
+              exactRequestLimit: 90,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
+            fetchClosedCandleSeries({
+              symbol: t.symbol,
+              timeframe: '15m',
+              barCount: 90,
+              exactRequestLimit: 90,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
+            fetchClosedCandleSeries({
+              symbol: t.symbol,
+              timeframe: '1h',
+              barCount: 90,
+              exactRequestLimit: 90,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
+            fetchClosedCandleSeries({
+              symbol: t.symbol,
+              timeframe: '4h',
+              barCount: 90,
+              exactRequestLimit: 90,
+              fetchPage: (query) =>
+                adapter.fetchKlines(query.symbol, query.timeframe, query.limit, query.window),
+            }).then((series) => ({
+              klines: [...series.klines, ...series.forming],
+              provenance: series.provenance,
+            })),
           ]);
           demoKlinesMap.set(t.symbol, {
             '15m': k15m.klines,
@@ -1363,7 +1408,23 @@ export async function createApp(options: CreateAppOptions = {}) {
               };
             }
           }
-          return adapter.fetchKlines(symbol, tf, 90);
+          const series = await fetchClosedCandleSeries({
+            symbol,
+            timeframe: tf,
+            barCount: 90,
+            exactRequestLimit: 90,
+            fetchPage: (query) =>
+              adapter.fetchKlines(
+                query.symbol,
+                query.timeframe,
+                query.limit,
+                query.window
+              ),
+          });
+          return {
+            klines: [...series.klines, ...series.forming],
+            provenance: series.provenance,
+          };
         };
         const getCachedOrFetchOi = async () => {
           if (resolvedMode === 'live' && req.query.refresh !== 'true') {
@@ -1754,7 +1815,23 @@ export async function createApp(options: CreateAppOptions = {}) {
             };
           }
         }
-        return adapter.fetchKlines(targetSymbol, tf, 90);
+        const series = await fetchClosedCandleSeries({
+          symbol: targetSymbol,
+          timeframe: tf,
+          barCount: 90,
+          exactRequestLimit: 90,
+          fetchPage: (query) =>
+            adapter.fetchKlines(
+              query.symbol,
+              query.timeframe,
+              query.limit,
+              query.window
+            ),
+        });
+        return {
+          klines: [...series.klines, ...series.forming],
+          provenance: series.provenance,
+        };
       };
       const getCachedOrFetchTf = (tf: Timeframe) =>
         getCachedOrFetchSymbolTf(symbol, tf);
@@ -2089,6 +2166,17 @@ export async function createApp(options: CreateAppOptions = {}) {
               ? k4h.klines
               : k15m.klines;
 
+      if (adapter.fetchFundingIntervals) {
+        await ensureExchangeFundingMap(async () => {
+          const info = await adapter.fetchFundingIntervals!();
+          return info.bySymbol;
+        });
+      }
+      const fundingInterval = resolveFundingInterval({
+        symbol,
+        seriesTimestamps: (fundingHistResult?.series ?? []).map((point) => point.timestamp),
+      });
+
       const derivativesStructure = computeDerivativesStructure({
         symbol,
         timeframe: primaryTimeframe,
@@ -2099,6 +2187,10 @@ export async function createApp(options: CreateAppOptions = {}) {
         fundingSeries: fundingHistResult?.series ?? [],
         currentOiValue: oiResult.openInterestValue,
         currentFundingRate: candidate.fundingRate,
+        fundingIntervalHours: fundingInterval.fundingIntervalHours,
+        fundingIntervalFallback: fundingInterval.fallback,
+        fundingIntervalSource: fundingInterval.source,
+        fundingIntervalNoteZh: fundingInterval.noteZh,
         evaluatedAt,
       });
 

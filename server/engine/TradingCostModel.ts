@@ -1,4 +1,10 @@
 import { TradingCostConfig } from '../../src/types/market.ts';
+import {
+  DEFAULT_FUNDING_INTERVAL_HOURS,
+  fundingPeriodsForHold,
+  getCachedFundingInterval,
+  sanitizeFundingIntervalHours,
+} from '../market/FundingInterval.ts';
 
 export const DEFAULT_TRADING_COST_CONFIG: TradingCostConfig = {
   makerFeeBps: 2, // 0.02% Binance USD-M Futures VIP0 Maker
@@ -63,6 +69,14 @@ export interface TradeCostCalculationInput {
   entryOrderType?: 'MARKET' | 'LIMIT';
   exitIsLimitFill?: boolean;
   fundingRatePer8h?: number | null;
+  /**
+   * Hours between funding settlements. The rate is the per-settlement rate
+   * (historically named per 8h). Omit to use a cached symbol interval or 8h.
+   */
+  fundingIntervalHours?: number | null;
+  /** Set when the caller already knows the 8h value is a fallback. */
+  fundingIntervalFallback?: boolean;
+  symbol?: string;
   costConfig?: Partial<TradingCostConfig> | null;
 }
 
@@ -76,6 +90,8 @@ export interface TradeCostCalculationResult {
   netRMultiple: number;
   netPnlPercent: number;
   fundingRateUsed: number;
+  fundingIntervalHoursUsed: number;
+  fundingIntervalFallback: boolean;
   costConfigUsed: TradingCostConfig;
 }
 
@@ -83,7 +99,8 @@ export interface TradeCostCalculationResult {
  * Computes realistic perpetual futures trading costs in R-multiples:
  * - Maker / Taker exchange commissions on entry and exit
  * - Bid-Ask / impact slippage on market / stop-loss / timeout legs (0 slippage on limit fills)
- * - 8h prorated Funding Rate accrual (LONG pays positive rate, SHORT receives positive rate)
+ * - Funding accrual prorated by the symbol settlement interval
+ *   (LONG pays positive rate, SHORT receives positive rate). 8h is only the fallback.
  */
 export function calculateTradeTradingCosts(
   input: TradeCostCalculationInput
@@ -121,8 +138,26 @@ export function calculateTradeTradingCosts(
     Number.isFinite(input.fundingRatePer8h)
       ? Math.max(-0.02, Math.min(0.02, input.fundingRatePer8h))
       : cfg.defaultFundingRatePer8h;
+  const cachedRaw = input.symbol ? getCachedFundingInterval(input.symbol) : null;
+  // Only an exchange fundingInfo hit may change settlement away from 8h.
+  // Observed history stays on the backtest call that passed hours explicitly.
+  const cachedInterval = cachedRaw && cachedRaw.source === 'exchange' ? cachedRaw : null;
+  const explicitHours =
+    typeof input.fundingIntervalHours === 'number' &&
+    Number.isFinite(input.fundingIntervalHours) &&
+    input.fundingIntervalHours > 0;
+  const fundingIntervalHoursUsed = explicitHours
+    ? sanitizeFundingIntervalHours(input.fundingIntervalHours)
+    : cachedInterval
+      ? cachedInterval.fundingIntervalHours
+      : DEFAULT_FUNDING_INTERVAL_HOURS;
+  const fundingIntervalFallback = explicitHours
+    ? input.fundingIntervalFallback === true
+    : cachedInterval
+      ? cachedInterval.fallback
+      : true;
   const holdingMs = Math.max(0, input.exitTimeMs - input.entryTimeMs);
-  const fundingPeriods = holdingMs / (8 * 3_600_000);
+  const fundingPeriods = fundingPeriodsForHold(holdingMs, fundingIntervalHoursUsed);
   // LONG pays positive funding; SHORT receives positive funding (negative cost)
   const signedFundingRate =
     input.direction === 'LONG' ? fundingRateUsed : -fundingRateUsed;
@@ -150,6 +185,8 @@ export function calculateTradeTradingCosts(
     netRMultiple,
     netPnlPercent,
     fundingRateUsed,
+    fundingIntervalHoursUsed,
+    fundingIntervalFallback,
     costConfigUsed: { ...cfg, entryOrderType },
   };
 }

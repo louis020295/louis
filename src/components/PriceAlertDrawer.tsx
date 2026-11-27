@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { formatTaipeiTime } from '../utils/taipeiTime.ts';
 import {
   Bell,
   BellOff,
@@ -586,7 +587,7 @@ export const PriceAlertDrawer: React.FC<PriceAlertDrawerProps> = ({
                           {ev.symbol}
                         </span>
                         <span className="text-slate-400">
-                          {new Date(ev.triggeredAt).toLocaleTimeString()}
+                          {formatTaipeiTime(ev.triggeredAt)}
                         </span>
                       </div>
                       <div className="text-[11px] text-slate-200">

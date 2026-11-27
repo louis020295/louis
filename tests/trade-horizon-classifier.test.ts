@@ -5,7 +5,7 @@ import type { EntryZoneAnalysis, EarlyIgnitionSignal } from '../src/types/market
 
 function makeEntryZone(overrides: Partial<EntryZoneAnalysis> = {}): EntryZoneAnalysis {
   return {
-    status: 'IN_DISCOUNT_ZONE',
+    status: 'NEAR_POI',
     direction: 'LONG',
     anchorType: 'FVG',
     anchorLabel: '未回補多頭 FVG 折價區',
